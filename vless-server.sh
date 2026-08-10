@@ -16,7 +16,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
     exit 1
 fi
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.5.8 [服务端]
+#  多协议代理一键部署脚本 v3.5.9 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -30,15 +30,15 @@ fi
 #  
 #  
 #  作者: Zyx0rx
-#  项目地址: https://github.com/mozisen
+#  项目地址: https://github.com/mikuuu3981/surge
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.5.8"
+readonly VERSION="3.5.9"
 readonly AUTHOR="Zyx0rx"
-readonly REPO_URL="https://github.com/mozisen/surge"
-readonly SCRIPT_REPO="mozisen/surge"
-readonly SCRIPT_SOURCE_REPO="mozisen/surge"
+readonly REPO_URL="https://github.com/mikuuu3981/surge"
+readonly SCRIPT_REPO="mikuuu3981/surge"
+readonly SCRIPT_SOURCE_REPO="mikuuu3981/surge"
 SCRIPT_SOURCE_REF="${VLESS_SCRIPT_SOURCE_REF:-main}"
 if [[ ! "$SCRIPT_SOURCE_REF" =~ ^[A-Za-z0-9._/-]+$ ]]; then
     echo "错误: VLESS_SCRIPT_SOURCE_REF 格式无效" >&2
@@ -2500,6 +2500,141 @@ check_monthly_traffic_reset() {
 #  通用配置保存函数
 #═══════════════════════════════════════════════════════════════════════════════
 
+# REALITY 未鉴权回落限速
+#
+# XTLS 官方文档指出：鉴权失败的连接会直接转发到 target；当 target 位于
+# Cloudflare 等公共 CDN 后，扫描者可能借此消耗本机出口流量。使用官方的
+# limitFallbackUpload/Download 令牌桶字段进行缓解。参数必须随机化，否则
+# 固定限速本身会形成可探测特征。
+_reality_hash_hex() {
+    local value="$1" digest=""
+
+    if command -v sha256sum >/dev/null 2>&1; then
+        digest=$(printf '%s' "$value" | sha256sum | awk '{print $1}')
+    elif command -v shasum >/dev/null 2>&1; then
+        digest=$(printf '%s' "$value" | shasum -a 256 | awk '{print $1}')
+    elif command -v openssl >/dev/null 2>&1; then
+        digest=$(printf '%s' "$value" | openssl dgst -sha256 2>/dev/null | awk '{print $NF}')
+    fi
+
+    [[ "$digest" =~ ^[0-9a-fA-F]{64}$ ]] && printf '%s\n' "$digest"
+}
+
+_reality_limit_value() {
+    local seed="$1" label="$2" low="$3" high="$4"
+    local digest chunk number range
+
+    digest=$(_reality_hash_hex "${seed}:${label}")
+    if [[ -n "$digest" ]]; then
+        chunk="${digest:0:8}"
+        number=$((16#$chunk))
+    else
+        number=$(od -An -N4 -tu4 /dev/urandom 2>/dev/null | tr -d ' ')
+        [[ "$number" =~ ^[0-9]+$ ]] || number=$RANDOM
+    fi
+
+    range=$((high - low + 1))
+    printf '%s\n' "$((low + number % range))"
+}
+
+# 输出 reality_fallback_limits JSON。传入稳定 seed 可使同一实例重建配置时
+# 保持参数不变；新实例使用私钥/ShortID 等高熵材料作为 seed。
+gen_reality_fallback_limits() {
+    local seed="${1:-}"
+    [[ -n "$seed" ]] || seed=$(od -An -N16 -tx1 /dev/urandom 2>/dev/null | tr -d ' \n')
+    [[ -n "$seed" ]] || seed="${RANDOM}:$$:$(date +%s 2>/dev/null)"
+
+    local upload_after upload_rate upload_burst
+    local download_after download_rate download_burst
+    upload_after=$(_reality_limit_value "$seed" "upload-after" 6291456 14680064)
+    upload_rate=$(_reality_limit_value "$seed" "upload-rate" 524288 1572864)
+    upload_burst=$(_reality_limit_value "$seed" "upload-burst" 2097152 6291456)
+    download_after=$(_reality_limit_value "$seed" "download-after" 8388608 20971520)
+    download_rate=$(_reality_limit_value "$seed" "download-rate" 786432 2097152)
+    download_burst=$(_reality_limit_value "$seed" "download-burst" 4194304 10485760)
+
+    jq -n \
+        --argjson upload_after "$upload_after" \
+        --argjson upload_rate "$upload_rate" \
+        --argjson upload_burst "$upload_burst" \
+        --argjson download_after "$download_after" \
+        --argjson download_rate "$download_rate" \
+        --argjson download_burst "$download_burst" \
+        '{
+            upload: {
+                afterBytes: $upload_after,
+                bytesPerSec: $upload_rate,
+                burstBytesPerSec: $upload_burst
+            },
+            download: {
+                afterBytes: $download_after,
+                bytesPerSec: $download_rate,
+                burstBytesPerSec: $download_burst
+            }
+        }'
+}
+
+_reality_fallback_limits_valid() {
+    jq -e '
+        def valid_limit:
+            type == "object" and
+            (.afterBytes | type == "number") and
+            (.bytesPerSec | type == "number") and
+            (.burstBytesPerSec | type == "number") and
+            (.afterBytes >= 0) and (.bytesPerSec >= 0) and
+            (.burstBytesPerSec >= 0) and
+            ((.bytesPerSec > 0) or (.burstBytesPerSec == 0));
+        (.upload | valid_limit) and (.download | valid_limit)
+    ' >/dev/null 2>&1
+}
+
+# 为升级前已存在的 REALITY 配置补充一次限速参数。参数写回数据库，避免
+# 每次生成主配置时改变流量特征；已有合法客户端无需更新分享链接。
+db_migrate_reality_fallback_limits() {
+    [[ -f "$DB_FILE" ]] || return 0
+
+    local protocol cfg updated changed item seed limits i count
+    for protocol in vless vless-xhttp; do
+        cfg=$(db_get "xray" "$protocol" 2>/dev/null) || continue
+        updated="$cfg"
+        changed=false
+
+        if echo "$cfg" | jq -e 'type == "array"' >/dev/null 2>&1; then
+            count=$(echo "$cfg" | jq 'length')
+            for ((i=0; i<count; i++)); do
+                item=$(echo "$updated" | jq ".[$i]") || continue
+                if [[ "$protocol" == "vless" ]] &&
+                   [[ "$(echo "$item" | jq -r '.security_mode // "reality"')" == "encryption" ]]; then
+                    continue
+                fi
+                if ! echo "$item" | jq -e '.reality_fallback_limits' >/dev/null 2>&1 ||
+                   ! echo "$item" | jq -c '.reality_fallback_limits' | _reality_fallback_limits_valid; then
+                    seed=$(echo "$item" | jq -r '[.private_key // "", .short_id // "", .port // "", .sni // ""] | join("|")')
+                    limits=$(gen_reality_fallback_limits "$seed") || continue
+                    updated=$(echo "$updated" | jq --argjson limits "$limits" ".[$i].reality_fallback_limits = \$limits") || continue
+                    changed=true
+                fi
+            done
+        else
+            if [[ "$protocol" == "vless" ]] &&
+               [[ "$(echo "$cfg" | jq -r '.security_mode // "reality"')" == "encryption" ]]; then
+                continue
+            fi
+            if ! echo "$cfg" | jq -e '.reality_fallback_limits' >/dev/null 2>&1 ||
+               ! echo "$cfg" | jq -c '.reality_fallback_limits' | _reality_fallback_limits_valid; then
+                seed=$(echo "$cfg" | jq -r '[.private_key // "", .short_id // "", .port // "", .sni // ""] | join("|")')
+                limits=$(gen_reality_fallback_limits "$seed") || continue
+                updated=$(echo "$cfg" | jq --argjson limits "$limits" '.reality_fallback_limits = $limits') || continue
+                changed=true
+            fi
+        fi
+
+        if [[ "$changed" == "true" ]] && echo "$updated" | jq empty >/dev/null 2>&1; then
+            _db_apply --arg p "$protocol" --argjson cfg "$updated" '.xray[$p] = $cfg' || return 1
+        fi
+    done
+}
+
 # 简化版：直接用关联数组构建 JSON
 # 用法: build_config "uuid" "$uuid" "port" "$port" "sni" "$sni"
 build_config() {
@@ -3213,6 +3348,11 @@ gen_xray_user_routing_outbounds() {
 generate_xray_config() {
     local xray_protocols=$(get_xray_protocols)
     [[ -z "$xray_protocols" ]] && return 1
+
+    # 为旧版数据库补齐 REALITY 回落限速参数，再生成最终配置。
+    db_migrate_reality_fallback_limits || {
+        _warn "REALITY 回落限速参数迁移失败，将使用临时参数生成配置"
+    }
     
     mkdir -p "$CFG"
     
@@ -3884,6 +4024,14 @@ add_xray_inbound_v2() {
     local password=$(echo "$cfg" | jq -r '.password // empty')
     local username=$(echo "$cfg" | jq -r '.username // empty')
     local method=$(echo "$cfg" | jq -r '.method // empty')
+    local reality_fallback_limits='{}'
+
+    if [[ "$base_protocol" == "vless" || "$base_protocol" == "vless-xhttp" ]]; then
+        reality_fallback_limits=$(echo "$cfg" | jq -c '.reality_fallback_limits // empty')
+        if ! printf '%s\n' "$reality_fallback_limits" | _reality_fallback_limits_valid; then
+            reality_fallback_limits=$(gen_reality_fallback_limits "${private_key}|${short_id}|${port}|${sni}")
+        fi
+    fi
     
     [[ -z "$port" ]] && return 1
 
@@ -3997,6 +4145,7 @@ add_xray_inbound_v2() {
                     --arg dest "$reality_dest" \
                     --arg listen_addr "$listen_addr" \
                     --arg tag "$inbound_tag" \
+                    --argjson fallback_limits "$reality_fallback_limits" \
                     --argjson fallbacks "$fallbacks" \
                 '{
                     port: $port,
@@ -4016,7 +4165,9 @@ add_xray_inbound_v2() {
                             xver: 0,
                             serverNames: [$sni],
                             privateKey: $private_key,
-                            shortIds: [$short_id]
+                            shortIds: [$short_id],
+                            limitFallbackUpload: $fallback_limits.upload,
+                            limitFallbackDownload: $fallback_limits.download
                         }
                     },
                     sniffing: {enabled: true, destOverride: ["http","tls"]},
@@ -4166,6 +4317,7 @@ add_xray_inbound_v2() {
                 --arg dest "$reality_dest" \
                 --arg listen_addr "$listen_addr" \
                 --arg tag "$inbound_tag" \
+                --argjson fallback_limits "$reality_fallback_limits" \
             '{
                 port: $port,
                 listen: $listen_addr,
@@ -4181,7 +4333,9 @@ add_xray_inbound_v2() {
                         xver: 0,
                         serverNames: [$sni],
                         privateKey: $private_key,
-                        shortIds: [$short_id]
+                        shortIds: [$short_id],
+                        limitFallbackUpload: $fallback_limits.upload,
+                        limitFallbackDownload: $fallback_limits.download
                     }
                 },
                 sniffing: {enabled: true, destOverride: ["http","tls"]},
@@ -10887,10 +11041,14 @@ gen_self_cert() {
 gen_server_config() {
     local uuid="$1" port="$2" privkey="$3" pubkey="$4" sid="$5" sni="$6"
     mkdir -p "$CFG"
+
+    local fallback_limits
+    fallback_limits=$(gen_reality_fallback_limits "${privkey}|${sid}|${port}|${sni}") || return 1
     
     register_protocol "vless" "$(build_config \
         uuid "$uuid" port "$port" private_key "$privkey" \
-        public_key "$pubkey" short_id "$sid" sni "$sni" security_mode "reality")"
+        public_key "$pubkey" short_id "$sid" sni "$sni" security_mode "reality" | \
+        jq --argjson limits "$fallback_limits" '. + {reality_fallback_limits: $limits}')"
     
     _save_join_info "vless" "REALITY|%s|$port|$uuid|$pubkey|$sid|$sni" \
         gen_vless_link "%s" "$port" "$uuid" "$pubkey" "$sid" "$sni"
@@ -10915,10 +11073,14 @@ gen_vless_encryption_server_config() {
 gen_vless_xhttp_server_config() {
     local uuid="$1" port="$2" privkey="$3" pubkey="$4" sid="$5" sni="$6" path="${7:-/}"
     mkdir -p "$CFG"
+
+    local fallback_limits
+    fallback_limits=$(gen_reality_fallback_limits "${privkey}|${sid}|${port}|${sni}") || return 1
     
     register_protocol "vless-xhttp" "$(build_config \
         uuid "$uuid" port "$port" private_key "$privkey" \
-        public_key "$pubkey" short_id "$sid" sni "$sni" path "$path")"
+        public_key "$pubkey" short_id "$sid" sni "$sni" path "$path" | \
+        jq --argjson limits "$fallback_limits" '. + {reality_fallback_limits: $limits}')"
     
     _save_join_info "vless-xhttp" "REALITY-XHTTP|%s|$port|$uuid|$pubkey|$sid|$sni|$path" \
         gen_vless_xhttp_link "%s" "$port" "$uuid" "$pubkey" "$sid" "$sni" "$path"

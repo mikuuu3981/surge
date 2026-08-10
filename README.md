@@ -5,7 +5,7 @@
 vless脚本使用方法：
 
 ```bash
-wget -O vless-server.sh https://raw.githubusercontent.com/mozisen/surge/main/vless-server.sh && chmod +x vless-server.sh && bash vless-server.sh
+wget -O vless-server.sh https://raw.githubusercontent.com/mikuuu3981/surge/main/vless-server.sh && chmod +x vless-server.sh && bash vless-server.sh
 ```
 快捷命令
 ```bash
@@ -17,7 +17,7 @@ vless
 
 nft脚本使用方法：
 ```bash
-curl -L https://raw.githubusercontent.com/mozisen/surge/main/nft.sh -o nft.sh  
+curl -L https://raw.githubusercontent.com/mikuuu3981/surge/main/nft.sh -o nft.sh
 chmod +x nft.sh  
 ./nft.sh  
 ```
@@ -26,3 +26,14 @@ chmod +x nft.sh
 ```bash  
 nftm
 ```
+
+REALITY 防偷流量说明：
+
+REALITY 对鉴权失败的连接会回落到 `target`。如果伪装目标使用 Cloudflare 等公共 CDN，服务器可能被扫描后被当作 CDN 端口转发器，消耗额外出口流量。脚本会按照 XTLS 官方文档为 VLESS+REALITY 和 VLESS+REALITY+XHTTP 写入 `limitFallbackUpload` / `limitFallbackDownload` 令牌桶限速，并为每个实例随机化参数；合法 REALITY 连接不受此限速影响。
+
+这里针对的是 REALITY 的 `target` 使用 CDN 的场景；普通 Cloudflare CDN 不代理原始 TCP REALITY，需使用脚本中的 XHTTP+TLS+CDN 模式。
+
+该限速字段由 Xray 25.6.8 起支持；如果服务器保留更早的 Xray 核心，请先在脚本的核心版本管理中升级。
+
+官方说明：<https://xtls.github.io/config/transports/reality.html>
+官方实现：<https://github.com/XTLS/Xray-core/pull/4553>
