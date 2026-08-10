@@ -7384,7 +7384,7 @@ readonly SCRIPT_VERSION_CACHE_FILE="$VERSION_CACHE_DIR/.script_version"
 readonly SNELL_RELEASE_NOTES_URL="https://kb.nssurge.com/surge-knowledge-base/release-notes/snell.md"
 readonly SNELL_RELEASE_NOTES_ZH_URL="https://kb.nssurge.com/surge-knowledge-base/zh/release-notes/snell.md"
 readonly SNELL_DEFAULT_VERSION="5.0.1"
-readonly SNELL_V6_DEFAULT_VERSION="6.0.0b4"
+readonly SNELL_V6_DEFAULT_VERSION="6.0.0rc2"
 
 # 获取文件修改时间戳（跨平台兼容）
 _get_file_mtime() {
@@ -8178,6 +8178,8 @@ _snell_release_sha256() {
         5.0.1:armv7l)  echo "14489f3e857569c8835dd3598b7ea6bca5371d4290ac7cf0f6c8dfb3381c1fb2" ;;
         6.0.0b4:amd64)  echo "d66891cffc9f1b24a7b959ffbd2c4a246013f4f9e612733027b5ad106ce5f87f" ;;
         6.0.0b4:aarch64) echo "2c957ee6bb37ce4b1df2b6a23e652b75546d10bc4f0443a2928e5834ae0429af" ;;
+        6.0.0rc2:amd64)  echo "8a9c4463ca87cfa5eaa37c6af0d37ab93ea275aa12391985bb2a375ca3abd7f2" ;;
+        6.0.0rc2:aarch64) echo "a0b2915cbc77dc3baf8fa069e741c20808d8a10c3a8a93e709a0a580645c3bd7" ;;
         *) return 1 ;;
     esac
 }
@@ -9078,13 +9080,13 @@ _show_core_versions() {
         fi
     fi
 
-    # 显示 Snell v6 版本信息（当前为官方 Beta 下载通道）
+    # 显示 Snell v6 版本信息（当前为官方 RC2 下载通道）
     if [[ "$filter" == "all" ]] || [[ "$filter" == "snellv6" ]]; then
         [[ "$filter" == "all" ]] && echo ""
         local snell_v6_current
         snell_v6_current=$(_get_snell_v6_version)
 
-        echo -e "  ${W}Snell v6 ${D}(Beta)${NC}"
+        echo -e "  ${W}Snell v6 ${D}(RC2)${NC}"
         if [[ "$snell_v6_current" == "未安装" ]]; then
             echo -e "    ${W}当前版本:${NC} ${D}${snell_v6_current}${NC}"
         elif [[ "$snell_v6_current" == "未知" ]]; then
@@ -9094,7 +9096,7 @@ _show_core_versions() {
             [[ "$snell_v6_current" != "$SNELL_V6_DEFAULT_VERSION" ]] && snell_v6_status=" ${Y}[可更新]${NC}"
             echo -e "    ${W}当前版本:${NC} ${G}v${snell_v6_current}${NC}${snell_v6_status}"
         fi
-        echo -e "    ${W}推荐版本:${NC} ${M}v${SNELL_V6_DEFAULT_VERSION}${NC} ${D}(官方 Beta)${NC}"
+        echo -e "    ${W}推荐版本:${NC} ${M}v${SNELL_V6_DEFAULT_VERSION}${NC} ${D}(官方 RC2)${NC}"
     fi
 
     # 启动后台异步更新（为下次访问准备）
@@ -9423,7 +9425,7 @@ _update_core_with_channel_select() {
         _line
         echo -e "  ${W}当前版本:${NC} ${G}${current_ver}${NC}"
         echo ""
-        _item "1" "推荐 Beta 版 (v${SNELL_V6_DEFAULT_VERSION})"
+        _item "1" "推荐 RC2 版 (v${SNELL_V6_DEFAULT_VERSION})"
         _item "2" "指定版本"
         _item "0" "返回"
         _line
@@ -10738,11 +10740,11 @@ install_snell_v5() {
     return 0
 }
 
-# 安装/更新 Snell v6 (Beta)
+# 安装/更新 Snell v6 (RC2)
 # 不传版本且二进制可用时复用现有安装；显式传入版本时强制覆盖，用于核心更新。
 install_snell_v6() {
     local requested_version="${1:-}"
-    local version="${requested_version:-6.0.0b4}"
+    local version="${requested_version:-$SNELL_V6_DEFAULT_VERSION}"
     local bin="/usr/local/bin/snell-server-v6"
 
     if [[ -z "$requested_version" && -x "$bin" ]]; then
@@ -10764,7 +10766,7 @@ install_snell_v6() {
 
     [[ "$DISTRO" == "alpine" ]] && ensure_snell_alpine_runtime || [[ "$DISTRO" != "alpine" ]] || return 1
 
-    _info "安装 Snell v6 Beta v${version}..."
+    _info "安装 Snell v6 RC2 v${version}..."
     local tmp url staged expected_sha="${SNELL_V6_SHA256:-}"
     tmp=$(mktemp -d) || return 1
     url="https://dl.nssurge.com/snell/snell-server-v${version}-linux-${sarch}.zip"
@@ -11691,7 +11693,7 @@ EOF
 }
 
 # Snell v6 服务端配置
-# v6.0.0b4 支持 listen、mode、dns、dns-ip-preference 和 egress-interface。
+# Snell v6 支持 listen、mode、dns、dns-ip-preference 和 egress-interface。
 gen_snell_v6_server_config() {
     local psk="$1" port="$2" version="${3:-6}"
     local dns_pref="${4:-default}" dns_servers="${5:-}" mode="${6:-default}"
@@ -20045,7 +20047,7 @@ select_protocol() {
     _line
     _item "10" "Snell v4"
     _item "11" "Snell v5"
-    _item "12" "Snell v6 ${D}(Beta)${NC}"
+    _item "12" "Snell v6 ${D}(RC2)${NC}"
     _line
     echo -e "  ${W}其他协议${NC}"
     _line
