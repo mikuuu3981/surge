@@ -8,7 +8,7 @@ umask 077
 if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) )); then
     if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
         echo "用法: $0 [选项]"
-        echo "选项: --sync-traffic, --show-traffic, --check-expire, --setup-expire-cron, --help"
+        echo "选项: --sync-traffic, --show-traffic, --tg-bot-poll, --check-expire, --setup-expire-cron, --help"
         echo "运行功能需要 Bash 4.1 或更高版本。"
         exit 0
     fi
@@ -16,7 +16,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
     exit 1
 fi
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.5.10 [服务端]
+#  多协议代理一键部署脚本 v3.5.13 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -34,7 +34,7 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.5.10"
+readonly VERSION="3.5.13"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/mikuuu3981/surge"
 readonly SCRIPT_REPO="mikuuu3981/surge"
@@ -949,6 +949,130 @@ db_get_user_field() {
     ' "$DB_FILE" 2>/dev/null
 }
 
+# 设置用户 Telegram 绑定信息（支持单端口和多端口配置）
+db_set_user_tg_binding() {
+    local core="$1" proto="$2" name="$3" chat_id="$4" tg_username="$5" bound_at="$6"
+    [[ ! -f "$DB_FILE" ]] && return 1
+
+    _db_apply --arg c "$core" --arg p "$proto" --arg n "$name" \
+        --arg chat "$chat_id" --arg username "$tg_username" --arg at "$bound_at" '
+        .[$c][$p] as $cfg |
+        if ($cfg | type) == "array" then
+            .[$c][$p] = [$cfg[] | .users = ([.users // [] | .[] |
+                if .name == $n then
+                    .telegram_chat_id = $chat |
+                    .telegram_username = $username |
+                    .telegram_bound_at = $at |
+                    del(.telegram_bind_token_hash, .telegram_bind_expires_at)
+                else . end
+            ])]
+        else
+            .[$c][$p].users = [.[$c][$p].users // [] | .[] |
+                if .name == $n then
+                    .telegram_chat_id = $chat |
+                    .telegram_username = $username |
+                    .telegram_bound_at = $at |
+                    del(.telegram_bind_token_hash, .telegram_bind_expires_at)
+                else . end
+            ]
+        end
+    '
+}
+
+db_set_user_tg_bind_token() {
+    local core="$1" proto="$2" name="$3" token_hash="$4" expires_at="$5"
+    [[ ! -f "$DB_FILE" ]] && return 1
+
+    _db_apply --arg c "$core" --arg p "$proto" --arg n "$name" \
+        --arg hash "$token_hash" --argjson expires "$expires_at" '
+        .[$c][$p] as $cfg |
+        if ($cfg | type) == "array" then
+            .[$c][$p] = [$cfg[] | .users = ([.users // [] | .[] |
+                if .name == $n then
+                    .telegram_bind_token_hash = $hash |
+                    .telegram_bind_expires_at = $expires
+                else . end
+            ])]
+        else
+            .[$c][$p].users = [.[$c][$p].users // [] | .[] |
+                if .name == $n then
+                    .telegram_bind_token_hash = $hash |
+                    .telegram_bind_expires_at = $expires
+                else . end
+            ]
+        end
+    '
+}
+
+db_clear_user_tg_binding() {
+    local core="$1" proto="$2" name="$3"
+    [[ ! -f "$DB_FILE" ]] && return 1
+
+    _db_apply --arg c "$core" --arg p "$proto" --arg n "$name" '
+        .[$c][$p] as $cfg |
+        if ($cfg | type) == "array" then
+            .[$c][$p] = [$cfg[] | .users = ([.users // [] | .[] |
+                if .name == $n then
+                    del(.telegram_chat_id, .telegram_username, .telegram_bound_at,
+                        .telegram_bind_token_hash, .telegram_bind_expires_at)
+                else . end
+            ])]
+        else
+            .[$c][$p].users = [.[$c][$p].users // [] | .[] |
+                if .name == $n then
+                    del(.telegram_chat_id, .telegram_username, .telegram_bound_at,
+                        .telegram_bind_token_hash, .telegram_bind_expires_at)
+                else . end
+            ]
+        end
+    '
+}
+
+# 输出 core|proto|name；绑定码只保存 SHA-256，且必须仍在有效期内。
+db_find_user_by_tg_bind_hash() {
+    local token_hash="$1" now_epoch="$2"
+    [[ ! -f "$DB_FILE" ]] && return 1
+    jq -r --arg hash "$token_hash" --argjson now "$now_epoch" '
+        ["xray", "singbox"][] as $core |
+        (.[$core] // {} | to_entries[]) as $proto_entry |
+        $proto_entry.key as $proto |
+        (if ($proto_entry.value | type) == "array" then $proto_entry.value[] else $proto_entry.value end) |
+        (.users // [])[] |
+        select((.telegram_bind_token_hash // "") == $hash) |
+        select(((((.telegram_bind_expires_at // 0) | tonumber?) // 0)) >= $now) |
+        "\($core)|\($proto)|\(.name)"
+    ' "$DB_FILE" 2>/dev/null | head -n1
+}
+
+# 输出 core|proto|name；每个私聊 Chat ID 只允许绑定一个脚本用户。
+db_find_user_by_tg_chat() {
+    local chat_id="$1"
+    [[ ! -f "$DB_FILE" ]] && return 1
+    jq -r --arg chat "$chat_id" '
+        ["xray", "singbox"][] as $core |
+        (.[$core] // {} | to_entries[]) as $proto_entry |
+        $proto_entry.key as $proto |
+        (if ($proto_entry.value | type) == "array" then $proto_entry.value[] else $proto_entry.value end) |
+        (.users // [])[] |
+        select((.telegram_chat_id // "") == $chat) |
+        "\($core)|\($proto)|\(.name)"
+    ' "$DB_FILE" 2>/dev/null | head -n1
+}
+
+# 输出 core|proto|name|chat_id|telegram_username|bound_at
+db_list_tg_user_bindings() {
+    [[ ! -f "$DB_FILE" ]] && return 1
+    jq -r '
+        ["xray", "singbox"][] as $core |
+        (.[$core] // {} | to_entries[]) as $proto_entry |
+        $proto_entry.key as $proto |
+        (if ($proto_entry.value | type) == "array" then $proto_entry.value[] else $proto_entry.value end) |
+        (.users // [])[] |
+        select((.telegram_chat_id // "") != "") |
+        "\($core)|\($proto)|\(.name)|\(.telegram_chat_id)|\(.telegram_username // "")|\(.telegram_bound_at // "")"
+    ' "$DB_FILE" 2>/dev/null
+}
+
 # 列出协议的所有用户 (支持多端口数组格式)
 # 用法: db_list_users "xray" "vless"
 # 多端口时合并所有端口的用户列表，无 users 数组时返回 "default"
@@ -1397,6 +1521,12 @@ db_set_tg_config() {
 # 发送 Telegram 消息
 send_tg_message() {
     local message="$1"
+    # 当前管理界面使用 telegram.json；优先复用现有管理员通知配置。
+    # 数据库中的 .telegram 仅作为旧版本兼容回退。
+    if [[ -n "${TG_CONFIG_FILE:-}" && -f "$TG_CONFIG_FILE" && -n "$(tg_get_config "bot_token")" ]]; then
+        tg_send_message "$message"
+        return $?
+    fi
     local bot_token=$(db_get_tg_config "bot_token")
     local chat_id=$(db_get_tg_config "chat_id")
     
@@ -1411,7 +1541,7 @@ send_tg_message() {
 
 # 发送用户即将过期提醒
 send_tg_expire_warning() {
-    local name="$1" proto="$2" expire_date="$3" days_left="$4"
+    local name="$1" proto="$2" expire_date="$3" days_left="$4" core="${5:-}"
     local proto_name=$(get_protocol_name "$proto")
     local server_display=$(get_tg_server_display)
     
@@ -1423,11 +1553,18 @@ ${server_display}
 ⏰ 剩余: *${days_left}天*"
     
     send_tg_message "$message"
+    if [[ -n "$core" ]]; then
+        tg_send_bound_user_message "$core" "$proto" "$name" "⚠️ 账号即将到期
+用户：${name}
+协议：$(get_protocol_name "$proto")
+到期时间：${expire_date}
+剩余：${days_left} 天"
+    fi
 }
 
 # 发送用户已过期通知
 send_tg_expired_notice() {
-    local name="$1" proto="$2" expire_date="$3"
+    local name="$1" proto="$2" expire_date="$3" core="${4:-}"
     local proto_name=$(get_protocol_name "$proto")
     local server_display=$(get_tg_server_display)
     
@@ -1438,6 +1575,13 @@ ${server_display}
 📅 到期: $expire_date"
     
     send_tg_message "$message"
+    if [[ -n "$core" ]]; then
+        tg_send_bound_user_message "$core" "$proto" "$name" "🚫 账号已到期
+用户：${name}
+协议：$(get_protocol_name "$proto")
+到期时间：${expire_date}
+账号已自动禁用"
+    fi
 }
 
 #═══════════════════════════════════════════════════════════════════════════════
@@ -1456,7 +1600,7 @@ check_and_disable_expired_users() {
         [[ -z "$name" ]] && continue
         db_set_user_enabled "$core" "$proto" "$name" false
         ((count++))
-        [[ "$notify" == "--notify" ]] && send_tg_expired_notice "$name" "$proto" "$expire_date"
+        [[ "$notify" == "--notify" ]] && send_tg_expired_notice "$name" "$proto" "$expire_date" "$core"
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] 禁用: $name ($proto)" >> "$CFG/expire.log"
     done <<< "$expired_users"
     
@@ -1476,7 +1620,7 @@ send_expire_warnings() {
         [[ -z "$name" ]] && continue
         local last_warn=$(db_get_user_alert_state "$core" "$proto" "$name" "last_expire_warn_day")
         [[ "$last_warn" == "$days_left" ]] && continue
-        send_tg_expire_warning "$name" "$proto" "$expire_date" "$days_left"
+        send_tg_expire_warning "$name" "$proto" "$expire_date" "$days_left" "$core"
         db_set_user_alert_state "$core" "$proto" "$name" "last_expire_warn_day" "$days_left"
         ((count++))
     done <<< "$expiring_users"
@@ -1689,11 +1833,60 @@ rebuild_and_reload_singbox() {
 #═══════════════════════════════════════════════════════════════════════════════
 
 readonly TG_CONFIG_FILE="$CFG/telegram.json"
+readonly TG_CONFIG_LOCK_DIR="$CFG/.telegram.lock"
+
+_tg_config_lock_acquire() {
+    local attempt owner
+    for ((attempt=0; attempt<200; attempt++)); do
+        if mkdir "$TG_CONFIG_LOCK_DIR" 2>/dev/null; then
+            printf '%s\n' "$$" > "$TG_CONFIG_LOCK_DIR/pid"
+            return 0
+        fi
+        owner=$(cat "$TG_CONFIG_LOCK_DIR/pid" 2>/dev/null || true)
+        if [[ -n "$owner" && "$owner" =~ ^[0-9]+$ ]] && ! kill -0 "$owner" 2>/dev/null; then
+            rm -f "$TG_CONFIG_LOCK_DIR/pid" 2>/dev/null
+            rmdir "$TG_CONFIG_LOCK_DIR" 2>/dev/null || true
+            continue
+        fi
+        sleep 0.05
+    done
+    return 1
+}
+
+_tg_config_lock_release() {
+    rm -f "$TG_CONFIG_LOCK_DIR/pid" 2>/dev/null
+    rmdir "$TG_CONFIG_LOCK_DIR" 2>/dev/null || true
+}
 
 # 初始化 TG 配置
 init_tg_config() {
-    [[ -f "$TG_CONFIG_FILE" ]] && return 0
-    echo '{"enabled":false,"bot_token":"","chat_id":"","notify_quota_percent":80,"notify_daily":false,"server_name":""}' > "$TG_CONFIG_FILE"
+    local defaults='{"enabled":false,"bot_token":"","chat_id":"","notify_quota_percent":80,"notify_daily":false,"server_name":"","user_bot_enabled":false,"user_bot_update_offset":0}'
+    mkdir -p "$CFG" 2>/dev/null || return 1
+    _tg_config_lock_acquire || return 1
+    if [[ ! -f "$TG_CONFIG_FILE" ]]; then
+        printf '%s\n' "$defaults" > "$TG_CONFIG_FILE" || { _tg_config_lock_release; return 1; }
+        chmod 600 "$TG_CONFIG_FILE" 2>/dev/null || true
+        _tg_config_lock_release
+        return 0
+    fi
+
+    # 为旧配置补齐用户机器人字段，不改变现有管理员通知设置。
+    local tmp
+    tmp=$(mktemp "${TG_CONFIG_FILE}.migrate.XXXXXX") || { _tg_config_lock_release; return 1; }
+    if jq --argjson defaults "$defaults" '$defaults * .' "$TG_CONFIG_FILE" > "$tmp" 2>/dev/null; then
+        chmod 600 "$tmp" 2>/dev/null || true
+        if mv "$tmp" "$TG_CONFIG_FILE"; then
+            _tg_config_lock_release
+            return 0
+        fi
+        rm -f "$tmp"
+        _tg_config_lock_release
+        return 1
+    else
+        rm -f "$tmp"
+        _tg_config_lock_release
+        return 1
+    fi
 }
 
 # 获取 TG 模板里的服务器显示文本
@@ -1721,14 +1914,23 @@ tg_get_config() {
 tg_set_config() {
     local field="$1" value="$2"
     [[ ! -f "$TG_CONFIG_FILE" ]] && init_tg_config
+    _tg_config_lock_acquire || return 1
     
-    local tmp=$(mktemp)
+    local tmp
+    tmp=$(mktemp "${TG_CONFIG_FILE}.tmp.XXXXXX") || { _tg_config_lock_release; return 1; }
     if [[ "$value" =~ ^[0-9]+$ ]] || [[ "$value" == "true" ]] || [[ "$value" == "false" ]]; then
-        jq --arg f "$field" --argjson v "$value" '.[$f] = $v' "$TG_CONFIG_FILE" > "$tmp"
+        jq --arg f "$field" --argjson v "$value" '.[$f] = $v' "$TG_CONFIG_FILE" > "$tmp" || { rm -f "$tmp"; _tg_config_lock_release; return 1; }
     else
-        jq --arg f "$field" --arg v "$value" '.[$f] = $v' "$TG_CONFIG_FILE" > "$tmp"
+        jq --arg f "$field" --arg v "$value" '.[$f] = $v' "$TG_CONFIG_FILE" > "$tmp" || { rm -f "$tmp"; _tg_config_lock_release; return 1; }
     fi
-    mv "$tmp" "$TG_CONFIG_FILE"
+    chmod 600 "$tmp" 2>/dev/null || true
+    if mv "$tmp" "$TG_CONFIG_FILE"; then
+        _tg_config_lock_release
+        return 0
+    fi
+    rm -f "$tmp"
+    _tg_config_lock_release
+    return 1
 }
 
 # 发送 TG 消息
@@ -1749,9 +1951,269 @@ tg_send_message() {
         >/dev/null 2>&1
 }
 
+# 调用 Telegram Bot API。用户机器人与管理员通知共用 Bot Token，开关相互独立。
+tg_bot_api_request() {
+    local method="$1"
+    shift
+    local bot_token
+    bot_token=$(tg_get_config "bot_token")
+    [[ -n "$bot_token" ]] || return 1
+    curl -fsS -X POST "https://api.telegram.org/bot${bot_token}/${method}" \
+        --connect-timeout 10 --max-time 25 "$@"
+}
+
+# 用户查询回复使用纯文本，避免用户名等用户字段触发 Markdown 解析。
+tg_send_chat_message() {
+    local chat_id="$1" message="$2" response
+    [[ "$chat_id" =~ ^[0-9]+$ ]] || return 1
+    response=$(tg_bot_api_request "sendMessage" \
+        --data-urlencode "chat_id=${chat_id}" \
+        --data-urlencode "text=${message}") || return 1
+    jq -e '.ok == true' >/dev/null 2>&1 <<< "$response"
+}
+
+tg_send_bound_user_message() {
+    local core="$1" proto="$2" user="$3" message="$4" chat_id
+    [[ "$(tg_get_config "user_bot_enabled")" == "true" ]] || return 0
+    chat_id=$(db_get_user_field "$core" "$proto" "$user" "telegram_chat_id")
+    [[ -n "$chat_id" ]] || return 0
+    tg_send_chat_message "$chat_id" "$message"
+}
+
+tg_hash_bind_token() {
+    local token="$1"
+    printf '%s' "$token" | openssl dgst -sha256 2>/dev/null | awk '{print $NF}'
+}
+
+tg_generate_bind_token() {
+    openssl rand -hex 6 2>/dev/null | tr '[:lower:]' '[:upper:]'
+}
+
+tg_user_bot_help_text() {
+    cat <<'EOF'
+可用命令：
+/bind 绑定码  绑定您的代理账号
+/traffic      查询个人流量与配额
+/status       查询账号状态和到期时间
+/unbind       解除当前 Telegram 绑定
+/help         显示帮助
+
+绑定码由服务器管理员生成，24 小时内有效且只能在私聊中使用。
+EOF
+}
+
+tg_get_user_report_by_chat() {
+    local chat_id="$1" mapping core proto name
+    mapping=$(db_find_user_by_tg_chat "$chat_id")
+    [[ -n "$mapping" ]] || return 1
+    IFS='|' read -r core proto name <<< "$mapping"
+
+    local used quota enabled expire_date proto_name server_name last_sync
+    used=$(db_get_user_field "$core" "$proto" "$name" "used")
+    quota=$(db_get_user_field "$core" "$proto" "$name" "quota")
+    enabled=$(db_get_user_field "$core" "$proto" "$name" "enabled")
+    expire_date=$(db_get_user_expire_date "$core" "$proto" "$name")
+    proto_name=$(get_protocol_name "$proto")
+    server_name=$(tg_get_config "server_name")
+    last_sync=$(jq -r '.meta.last_traffic_sync // "尚未同步"' "$DB_FILE" 2>/dev/null)
+    used=${used:-0}
+    quota=${quota:-0}
+    [[ "$used" =~ ^[0-9]+$ ]] || used=0
+    [[ "$quota" =~ ^[0-9]+$ ]] || quota=0
+
+    local quota_text="无限制" remaining_text="无限制" percent_text="--"
+    if [[ "$quota" =~ ^[0-9]+$ && "$quota" -gt 0 ]]; then
+        local remaining=$((quota - used)) percent=$((used * 100 / quota))
+        (( remaining < 0 )) && remaining=0
+        quota_text=$(format_bytes "$quota")
+        remaining_text=$(format_bytes "$remaining")
+        percent_text="${percent}%"
+    fi
+
+    local status_text="正常" expire_text="永不过期"
+    [[ "$enabled" != "true" ]] && status_text="已禁用"
+    if [[ -n "$expire_date" ]]; then
+        expire_text="$expire_date"
+        if [[ "$(date '+%Y-%m-%d')" > "$expire_date" ]]; then
+            status_text="已过期"
+        fi
+    fi
+
+    [[ -z "$server_name" ]] && server_name="当前服务器"
+    cat <<EOF
+流量查询
+服务器：${server_name}
+用户：${name}
+协议：${proto_name}
+已使用：$(format_bytes "$used")
+总配额：${quota_text}
+剩余流量：${remaining_text}
+使用率：${percent_text}
+到期时间：${expire_text}
+账号状态：${status_text}
+最后同步：${last_sync}
+EOF
+}
+
+tg_user_bot_bind_chat() {
+    local chat_id="$1" tg_username="$2" token="$3"
+    token=$(printf '%s' "$token" | tr '[:lower:]' '[:upper:]')
+    if [[ ! "$token" =~ ^[A-F0-9]{12}$ ]]; then
+        tg_send_chat_message "$chat_id" "绑定码格式无效，请向管理员获取新的 12 位绑定码。"
+        return
+    fi
+
+    local current_mapping token_hash mapping core proto name
+    current_mapping=$(db_find_user_by_tg_chat "$chat_id")
+    if [[ -n "$current_mapping" ]]; then
+        tg_send_chat_message "$chat_id" "此 Telegram 已绑定账号。如需更换，请先发送 /unbind。"
+        return
+    fi
+
+    token_hash=$(tg_hash_bind_token "$token")
+    [[ -n "$token_hash" ]] || {
+        tg_send_chat_message "$chat_id" "服务器无法校验绑定码，请联系管理员。"
+        return
+    }
+    mapping=$(db_find_user_by_tg_bind_hash "$token_hash" "$(date '+%s')")
+    if [[ -z "$mapping" ]]; then
+        tg_send_chat_message "$chat_id" "绑定码无效或已过期，请向管理员重新获取。"
+        return
+    fi
+    IFS='|' read -r core proto name <<< "$mapping"
+
+    if db_set_user_tg_binding "$core" "$proto" "$name" "$chat_id" "$tg_username" "$(date '+%Y-%m-%d %H:%M:%S')"; then
+        local success_message
+        printf -v success_message '绑定成功：%s（%s）。\n发送 /traffic 查询个人流量。' "$name" "$(get_protocol_name "$proto")"
+        tg_send_chat_message "$chat_id" "$success_message"
+    else
+        tg_send_chat_message "$chat_id" "绑定失败，请联系管理员检查用户数据库。"
+    fi
+}
+
+tg_user_bot_handle_update() {
+    local update_json="$1" chat_id chat_type tg_username text command args mapping core proto name
+    chat_id=$(jq -r '.message.chat.id // empty' <<< "$update_json")
+    chat_type=$(jq -r '.message.chat.type // empty' <<< "$update_json")
+    tg_username=$(jq -r '.message.from.username // empty' <<< "$update_json")
+    text=$(jq -r '.message.text // empty' <<< "$update_json")
+    [[ -n "$chat_id" && -n "$text" ]] || return 0
+
+    if [[ "$chat_type" != "private" ]]; then
+        return 0
+    fi
+
+    command="${text%% *}"
+    command="${command%%@*}"
+    if [[ "$text" == *" "* ]]; then
+        args="${text#* }"
+        args="${args%% *}"
+    else
+        args=""
+    fi
+
+    case "$command" in
+        /bind)
+            if [[ -z "$args" ]]; then
+                tg_send_chat_message "$chat_id" "用法：/bind 绑定码"
+            else
+                tg_user_bot_bind_chat "$chat_id" "$tg_username" "$args"
+            fi
+            ;;
+        /traffic)
+            # 查询前先抓取核心中的增量。即使某台机器的 cron 曾异常，用户也能
+            # 获得最新数据；同步锁会阻止与定时任务并发 reset。
+            sync_all_user_traffic "true" >/dev/null 2>&1 || true
+            local report
+            if report=$(tg_get_user_report_by_chat "$chat_id"); then
+                tg_send_chat_message "$chat_id" "$report"
+            else
+                tg_send_chat_message "$chat_id" "尚未绑定代理账号。请发送 /bind 绑定码。"
+            fi
+            ;;
+        /status)
+            local report
+            if report=$(tg_get_user_report_by_chat "$chat_id"); then
+                tg_send_chat_message "$chat_id" "$report"
+            else
+                tg_send_chat_message "$chat_id" "尚未绑定代理账号。请发送 /bind 绑定码。"
+            fi
+            ;;
+        /unbind)
+            mapping=$(db_find_user_by_tg_chat "$chat_id")
+            if [[ -z "$mapping" ]]; then
+                tg_send_chat_message "$chat_id" "当前 Telegram 尚未绑定账号。"
+            else
+                IFS='|' read -r core proto name <<< "$mapping"
+                if db_clear_user_tg_binding "$core" "$proto" "$name"; then
+                    tg_send_chat_message "$chat_id" "已解除账号 ${name} 的 Telegram 绑定。"
+                else
+                    tg_send_chat_message "$chat_id" "解绑失败，请联系管理员。"
+                fi
+            fi
+            ;;
+        /start|/help)
+            tg_send_chat_message "$chat_id" "$(tg_user_bot_help_text)"
+            ;;
+        /*)
+            local unknown_message
+            printf -v unknown_message '未知命令。\n\n%s' "$(tg_user_bot_help_text)"
+            tg_send_chat_message "$chat_id" "$unknown_message"
+            ;;
+    esac
+}
+
+tg_poll_user_bot() {
+    init_tg_config || return 1
+    [[ "$(tg_get_config "user_bot_enabled")" == "true" ]] || return 0
+
+    local lock_dir="$CFG/tg-user-bot.lock" owner
+    if ! mkdir "$lock_dir" 2>/dev/null; then
+        owner=$(cat "$lock_dir/pid" 2>/dev/null || true)
+        if [[ -n "$owner" && "$owner" =~ ^[0-9]+$ ]] && ! kill -0 "$owner" 2>/dev/null; then
+            rm -f "$lock_dir/pid" 2>/dev/null
+            rmdir "$lock_dir" 2>/dev/null || true
+            mkdir "$lock_dir" 2>/dev/null || return 0
+        else
+            return 0
+        fi
+    fi
+    printf '%s\n' "$$" > "$lock_dir/pid"
+
+    local offset response update update_id
+    offset=$(tg_get_config "user_bot_update_offset")
+    [[ "$offset" =~ ^[0-9]+$ ]] || offset=0
+    response=$(tg_bot_api_request "getUpdates" \
+        --data-urlencode "offset=${offset}" \
+        --data-urlencode "limit=100" \
+        --data-urlencode 'allowed_updates=["message"]') || {
+        rm -f "$lock_dir/pid" 2>/dev/null
+        rmdir "$lock_dir" 2>/dev/null || true
+        return 1
+    }
+    if ! jq -e '.ok == true and (.result | type == "array")' >/dev/null 2>&1 <<< "$response"; then
+        rm -f "$lock_dir/pid" 2>/dev/null
+        rmdir "$lock_dir" 2>/dev/null || true
+        return 1
+    fi
+
+    local updates=()
+    mapfile -t updates < <(jq -c '.result[]' <<< "$response")
+    for update in "${updates[@]}"; do
+        update_id=$(jq -r '.update_id // empty' <<< "$update")
+        [[ "$update_id" =~ ^[0-9]+$ ]] || continue
+        tg_user_bot_handle_update "$update"
+        tg_set_config "user_bot_update_offset" "$((update_id + 1))"
+    done
+
+    rm -f "$lock_dir/pid" 2>/dev/null
+    rmdir "$lock_dir" 2>/dev/null || true
+    return 0
+}
+
 # 发送流量告警
 tg_send_quota_alert() {
-    local user="$1" proto="$2" used="$3" quota="$4" percent="$5"
+    local user="$1" proto="$2" used="$3" quota="$4" percent="$5" core="${6:-}"
     local server_display=$(get_tg_server_display)
     
     local message="⚠️ *流量告警*
@@ -1764,11 +2226,19 @@ ${server_display}
 使用率: ${percent}%"
     
     tg_send_message "$message"
+    if [[ -n "$core" ]]; then
+        tg_send_bound_user_message "$core" "$proto" "$user" "⚠️ 流量提醒
+用户：${user}
+协议：$(get_protocol_name "$proto")
+已使用：$(format_bytes "$used")
+总配额：$(format_bytes "$quota")
+使用率：${percent}%"
+    fi
 }
 
 # 发送超限通知
 tg_send_over_quota() {
-    local user="$1" proto="$2" used="$3" quota="$4"
+    local user="$1" proto="$2" used="$3" quota="$4" core="${5:-}"
     local server_display=$(get_tg_server_display)
     
     local message="🚫 *流量超限*
@@ -1782,6 +2252,14 @@ ${server_display}
 用户已被自动禁用"
     
     tg_send_message "$message"
+    if [[ -n "$core" ]]; then
+        tg_send_bound_user_message "$core" "$proto" "$user" "🚫 流量已超限
+用户：${user}
+协议：$(get_protocol_name "$proto")
+已使用：$(format_bytes "$used")
+总配额：$(format_bytes "$quota")
+账号已自动禁用"
+    fi
 }
 
 # 发送每日流量报告
@@ -1901,6 +2379,7 @@ readonly TRAFFIC_INTERVAL_FILE="$CFG/traffic_interval"
 readonly TRAFFIC_MONTHLY_RESET_ENABLED_FILE="$CFG/traffic_monthly_reset_enabled"
 readonly TRAFFIC_MONTHLY_RESET_DAY_FILE="$CFG/traffic_monthly_reset_day"
 readonly TRAFFIC_MONTHLY_RESET_LAST_FILE="$CFG/traffic_monthly_reset_last"
+readonly TRAFFIC_SYNC_LOCK_DIR="$CFG/.traffic-sync.lock"
 
 # 查询 Xray Stats API
 # 用法: xray_api_query "user>>>user1@vless>>>traffic>>>downlink"
@@ -2101,9 +2580,20 @@ get_user_traffic() {
     echo $((uplink + downlink))
 }
 
-# 同步所有用户流量到数据库
-# 用法: sync_all_user_traffic [reset]
-sync_all_user_traffic() {
+# 记录同步结果，便于界面和 cron 日志判断任务是否真正执行。
+mark_traffic_sync_result() {
+    local status="$1" updated="${2:-0}" sync_time
+    sync_time=$(date '+%Y-%m-%d %H:%M:%S')
+    _db_apply --arg t "$sync_time" --arg s "$status" --argjson n "$updated" \
+        '.meta.last_traffic_sync_attempt = $t |
+         .meta.last_traffic_sync_status = $s |
+         .meta.last_traffic_sync_updates = $n |
+         if $s == "ok" then .meta.last_traffic_sync = $t else . end' || true
+}
+
+# 同步实现。外层 sync_all_user_traffic() 负责加锁，避免 cron 与 TG 查询同时
+# 使用 -reset 读取核心计数器而造成流量遗漏。
+_sync_all_user_traffic_unlocked() {
     local reset="${1:-true}"  # 默认重置计数器
     
     [[ ! -f "$DB_FILE" ]] && return 1
@@ -2121,12 +2611,13 @@ sync_all_user_traffic() {
     _pgrep sing-box && has_singbox=true
 
     if [[ "$has_xray" == "false" && "$has_singbox" == "false" ]]; then
+        mark_traffic_sync_result "no_core" 0
         return 0
     fi
     
     # 使用临时文件存储 API 结果，避免内存问题
-    local tmp_stats=$(mktemp)
-    trap "rm -f '$tmp_stats'" RETURN
+    local tmp_stats
+    tmp_stats=$(mktemp) || { mark_traffic_sync_result "temp_error" 0; return 1; }
     : > "$tmp_stats"
     
     # 一次性获取所有流量统计（带重置选项）
@@ -2146,7 +2637,7 @@ sync_all_user_traffic() {
         fi
     fi
     
-    [[ ! -s "$tmp_stats" ]] && { rm -f "$tmp_stats"; return 0; }
+    [[ ! -s "$tmp_stats" ]] && { rm -f "$tmp_stats"; mark_traffic_sync_result "no_stats" 0; return 0; }
     
     local updated=0
     local need_reload=false  # 标记是否需要重载 Xray 配置
@@ -2184,7 +2675,7 @@ sync_all_user_traffic() {
                         if [[ "$exceeded_notified" != "true" ]]; then
                             db_set_user_enabled "xray" "$proto" "$user" "false"
                             db_set_user_alert_state "xray" "$proto" "$user" "quota_exceeded_notified" "true"
-                            tg_send_over_quota "$user" "$proto" "$used" "$quota"
+                            tg_send_over_quota "$user" "$proto" "$used" "$quota" "xray"
                             need_reload=true
                         fi
                     elif [[ "$percent" -ge "$notify_percent" ]]; then
@@ -2199,7 +2690,7 @@ sync_all_user_traffic() {
                             fi
                         done
                         if [[ "$should_alert" == "true" ]]; then
-                            tg_send_quota_alert "$user" "$proto" "$used" "$quota" "$percent"
+                            tg_send_quota_alert "$user" "$proto" "$used" "$quota" "$percent" "xray"
                             db_set_user_alert_state "xray" "$proto" "$user" "last_alert_percent" "$current_threshold"
                         fi
                     fi
@@ -2239,7 +2730,7 @@ sync_all_user_traffic() {
                             if [[ "$exceeded_notified" != "true" ]]; then
                                 db_set_user_enabled "singbox" "$proto" "$user" "false"
                                 db_set_user_alert_state "singbox" "$proto" "$user" "quota_exceeded_notified" "true"
-                                tg_send_over_quota "$user" "$proto" "$used" "$quota"
+                                tg_send_over_quota "$user" "$proto" "$used" "$quota" "singbox"
                             fi
                         elif [[ "$percent" -ge "$notify_percent" ]]; then
                             local last_alert=$(db_get_user_alert_state "singbox" "$proto" "$user" "last_alert_percent")
@@ -2253,7 +2744,7 @@ sync_all_user_traffic() {
                                 fi
                             done
                             if [[ "$should_alert" == "true" ]]; then
-                                tg_send_quota_alert "$user" "$proto" "$used" "$quota" "$percent"
+                                tg_send_quota_alert "$user" "$proto" "$used" "$quota" "$percent" "singbox"
                                 db_set_user_alert_state "singbox" "$proto" "$user" "last_alert_percent" "$current_threshold"
                             fi
                         fi
@@ -2270,7 +2761,37 @@ sync_all_user_traffic() {
         generate_xray_config 2>/dev/null
         svc restart vless-reality 2>/dev/null
     fi
+
+    mark_traffic_sync_result "ok" "$updated"
     
+    return 0
+}
+
+# 同步所有用户流量到数据库
+# 用法: sync_all_user_traffic [reset]
+sync_all_user_traffic() {
+    local reset="${1:-true}" owner attempt rc
+
+    for attempt in {1..10}; do
+        if mkdir "$TRAFFIC_SYNC_LOCK_DIR" 2>/dev/null; then
+            printf '%s\n' "$$" > "$TRAFFIC_SYNC_LOCK_DIR/pid"
+            _sync_all_user_traffic_unlocked "$reset"
+            rc=$?
+            rm -f "$TRAFFIC_SYNC_LOCK_DIR/pid" 2>/dev/null
+            rmdir "$TRAFFIC_SYNC_LOCK_DIR" 2>/dev/null || true
+            return "$rc"
+        fi
+
+        owner=$(cat "$TRAFFIC_SYNC_LOCK_DIR/pid" 2>/dev/null || true)
+        if [[ -n "$owner" && "$owner" =~ ^[0-9]+$ ]] && ! kill -0 "$owner" 2>/dev/null; then
+            rm -f "$TRAFFIC_SYNC_LOCK_DIR/pid" 2>/dev/null
+            rmdir "$TRAFFIC_SYNC_LOCK_DIR" 2>/dev/null || true
+            continue
+        fi
+        sleep 1
+    done
+
+    # 另一个同步任务仍在运行；它完成后数据库即为最新，避免再次 reset。
     return 0
 }
 
@@ -2374,10 +2895,55 @@ get_bash_interpreter() {
 
 build_cron_command() {
     local schedule="$1" script_path="$2" subcommand="$3" log_file="$4"
-    local bash_path
+    local bash_path env_path
     bash_path=$(get_bash_interpreter)
+    env_path=$(command -v env 2>/dev/null || true)
+    [[ -x "$env_path" ]] || env_path="/usr/bin/env"
     [[ -z "$bash_path" ]] && return 1
-    printf '%s %q %q %s >> %q 2>&1' "$schedule" "$bash_path" "$script_path" "$subcommand" "$log_file"
+    printf '%s %q PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin %q %q %s >> %q 2>&1' \
+        "$schedule" "$env_path" "$bash_path" "$script_path" "$subcommand" "$log_file"
+}
+
+traffic_cron_entry_exists() {
+    command -v crontab >/dev/null 2>&1 && crontab -l 2>/dev/null | grep -q 'sync-traffic'
+}
+
+tg_user_bot_cron_entry_exists() {
+    command -v crontab >/dev/null 2>&1 && crontab -l 2>/dev/null | grep -q 'tg-user-bot'
+}
+
+cron_service_is_active() {
+    if command -v systemctl >/dev/null 2>&1; then
+        systemctl is-active --quiet cron 2>/dev/null && return 0
+        systemctl is-active --quiet crond 2>/dev/null && return 0
+    fi
+    if command -v rc-service >/dev/null 2>&1; then
+        rc-service cronie status >/dev/null 2>&1 && return 0
+        rc-service crond status >/dev/null 2>&1 && return 0
+    fi
+    _pgrep crond && return 0
+    _pgrep cron && return 0
+    return 1
+}
+
+ensure_cron_service_running() {
+    cron_service_is_active && return 0
+
+    if command -v rc-service >/dev/null 2>&1; then
+        rc-update add cronie default >/dev/null 2>&1 || rc-update add crond default >/dev/null 2>&1 || true
+        rc-service cronie start >/dev/null 2>&1 || rc-service crond start >/dev/null 2>&1 || true
+    fi
+    if ! cron_service_is_active && command -v systemctl >/dev/null 2>&1; then
+        systemctl enable --now cron >/dev/null 2>&1 || systemctl enable --now crond >/dev/null 2>&1 || true
+    fi
+    if ! cron_service_is_active && command -v service >/dev/null 2>&1; then
+        service cron start >/dev/null 2>&1 || service crond start >/dev/null 2>&1 || true
+    fi
+    if ! cron_service_is_active && command -v crond >/dev/null 2>&1; then
+        crond >/dev/null 2>&1 || true
+    fi
+
+    cron_service_is_active
 }
 
 install_cron_entry() {
@@ -2405,6 +2971,7 @@ remove_cron_entry() {
 # 创建流量统计定时任务
 setup_traffic_cron() {
     local interval="${1:-$(get_traffic_interval)}"
+    local silent="${2:-false}"
     local script_path="/usr/local/bin/vless-server.sh"
     [[ -x "$script_path" ]] || script_path=$(readlink -f "$0")
     local bash_path log_file cron_cmd
@@ -2414,20 +2981,17 @@ setup_traffic_cron() {
     log_file="$CFG/traffic-sync.log"
     cron_cmd="$(build_cron_command "*/$interval * * * *" "$script_path" "--sync-traffic" "$log_file") # sync-traffic"
 
-    # 确保 cron 服务已启动
-    if [[ "$DISTRO" == "alpine" ]]; then
-        rc-service cronie start >/dev/null 2>&1 || rc-service crond start >/dev/null 2>&1 || true
-        rc-update add cronie default >/dev/null 2>&1 || rc-update add crond default >/dev/null 2>&1 || true
-    elif command -v systemctl >/dev/null 2>&1; then
-        systemctl enable cron >/dev/null 2>&1 || systemctl enable crond >/dev/null 2>&1 || true
-        systemctl start cron >/dev/null 2>&1 || systemctl start crond >/dev/null 2>&1 || true
-    fi
-
     if install_cron_entry "sync-traffic" "$cron_cmd"; then
         set_traffic_interval "$interval"
-        _ok "已添加流量统计定时任务 (每${interval}分钟)"
-        echo -e "  ${D}日志: $log_file${NC}"
-        echo -e "  ${D}解释器: $bash_path${NC}"
+        if ! ensure_cron_service_running; then
+            [[ "$silent" == "true" ]] || _err "定时规则已写入，但 cron 服务未运行"
+            return 1
+        fi
+        if [[ "$silent" != "true" ]]; then
+            _ok "已添加流量统计定时任务 (每${interval}分钟)"
+            echo -e "  ${D}日志: $log_file${NC}"
+            echo -e "  ${D}解释器: $bash_path${NC}"
+        fi
     else
         _err "流量统计定时任务写入失败"
         echo -e "  ${Y}提示: 可手动执行 ${C}$script_path --sync-traffic${NC} 查看报错${NC}"
@@ -2439,6 +3003,48 @@ setup_traffic_cron() {
 remove_traffic_cron() {
     remove_cron_entry "sync-traffic"
     _ok "已移除流量统计定时任务"
+}
+
+setup_tg_user_bot_cron() {
+    local silent="${1:-false}"
+    local script_path="/usr/local/bin/vless-server.sh"
+    [[ -x "$script_path" ]] || script_path=$(readlink -f "$0")
+    local bash_path log_file cron_cmd
+    bash_path=$(get_bash_interpreter)
+    [[ -x "$script_path" ]] || { _err "脚本不存在或不可执行: $script_path"; return 1; }
+    [[ -n "$bash_path" ]] || { _err "未找到 bash，无法启动用户机器人"; return 1; }
+    log_file="$CFG/tg-user-bot.log"
+    cron_cmd="$(build_cron_command "* * * * *" "$script_path" "--tg-bot-poll" "$log_file") # tg-user-bot"
+
+    if install_cron_entry "tg-user-bot" "$cron_cmd"; then
+        if ! ensure_cron_service_running; then
+            [[ "$silent" == "true" ]] || _err "机器人规则已写入，但 cron 服务未运行"
+            return 1
+        fi
+        if [[ "$silent" != "true" ]]; then
+            _ok "用户机器人轮询已启用（最长约 1 分钟响应）"
+            echo -e "  ${D}日志: $log_file${NC}"
+        fi
+        return 0
+    fi
+    _err "用户机器人定时任务写入失败"
+    return 1
+}
+
+remove_tg_user_bot_cron() {
+    remove_cron_entry "tg-user-bot"
+}
+
+# 升级旧预览版后自动重写 cron 命令（补齐 PATH）并修复守护进程。
+repair_scheduled_jobs() {
+    if traffic_cron_entry_exists; then
+        setup_traffic_cron "$(get_traffic_interval)" "true" || \
+            _log "WARN" "流量同步定时任务自动修复失败"
+    fi
+    if [[ "$(tg_get_config "user_bot_enabled")" == "true" ]]; then
+        setup_tg_user_bot_cron "true" || \
+            _log "WARN" "TG 用户机器人定时任务自动修复失败"
+    fi
 }
 
 get_traffic_monthly_reset_enabled() {
@@ -2653,8 +3259,9 @@ build_config() {
         fi
     done
     
-    # 自动添加 IP
-    local ipv4=$(get_ipv4) ipv6=$(get_ipv6)
+    # 自动添加客户端连接地址；无公网时保存内网地址，避免后续生成空节点。
+    local ipv4 ipv6
+    IFS='|' read -r ipv4 ipv6 <<< "$(get_connection_addresses)"
     args+=(--arg "ipv4" "$ipv4" --arg "ipv6" "$ipv6")
     keys+=("ipv4" "ipv6")
     
@@ -2695,9 +3302,11 @@ _save_join_info() {
     done
     : >"$join_file"
 
+    local ipv4 ipv6
+    IFS='|' read -r ipv4 ipv6 <<< "$(get_connection_addresses)"
     local label ip ipfmt data code link
     for label in V4 V6; do
-        ip=$([[ "$label" == V4 ]] && get_ipv4 || get_ipv6)
+        ip=$([[ "$label" == V4 ]] && printf '%s' "$ipv4" || printf '%s' "$ipv6")
         [[ -z "$ip" ]] && continue
         ipfmt=$ip; [[ "$label" == V6 ]] && ipfmt="[$ip]"
 
@@ -5047,6 +5656,66 @@ get_ipv6() {
     echo "$result"
 }
 
+# 获取本机接口地址。公网 IP 探测失败时仅用于提示和局域网配置，不能替代
+# 公网地址参与域名解析校验。
+get_local_ipv4() {
+    local result=""
+    if command -v ip >/dev/null 2>&1; then
+        result=$(ip -o -4 addr show scope global 2>/dev/null | awk '{sub(/\/.*/, "", $4); if ($4 != "127.0.0.1") {print $4; exit}}')
+    fi
+    if [[ -z "$result" ]] && command -v hostname >/dev/null 2>&1; then
+        result=$(hostname -I 2>/dev/null | tr ' ' '\n' | awk '/^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && $0 != "127.0.0.1" {print; exit}')
+    fi
+    echo "$result"
+}
+
+get_local_ipv6() {
+    local result=""
+    if command -v ip >/dev/null 2>&1; then
+        result=$(ip -o -6 addr show scope global 2>/dev/null | awk '{sub(/\/.*/, "", $4); if ($4 !~ /^fe80:/) {print $4; exit}}')
+    fi
+    if [[ -z "$result" ]] && command -v hostname >/dev/null 2>&1; then
+        result=$(hostname -I 2>/dev/null | tr ' ' '\n' | awk '/:/ && $0 !~ /^fe80:/ {print; exit}')
+    fi
+    echo "$result"
+}
+
+# 获取用于客户端配置和分享链接的地址。只要存在任一公网地址，就保持原有
+# 公网优先逻辑；仅在公网 IPv4/IPv6 都不可用时才回落到本机接口地址。
+# 输出格式: ipv4|ipv6
+get_connection_addresses() {
+    local ipv4 ipv6
+    ipv4=$(get_ipv4)
+    ipv6=$(get_ipv6)
+    if [[ -z "$ipv4" && -z "$ipv6" ]]; then
+        ipv4=$(get_local_ipv4)
+        ipv6=$(get_local_ipv6)
+    fi
+    printf '%s|%s\n' "$ipv4" "$ipv6"
+}
+
+# 公网地址不是安装代理核心的必要条件。无公网服务器仍可通过内网、NAT
+# 端口映射或隧道使用，因此这里只提示网络环境，永不阻断安装。
+show_install_network_environment() {
+    local public_ipv4 public_ipv6 local_ipv4 local_ipv6
+    public_ipv4=$(get_ipv4)
+    public_ipv6=$(get_ipv6)
+
+    echo -e "  公网 IPv4: ${public_ipv4:-${R}无${NC}}"
+    echo -e "  公网 IPv6: ${public_ipv6:-${R}无${NC}}"
+    if [[ -n "$public_ipv4" || -n "$public_ipv6" ]]; then
+        return 0
+    fi
+
+    local_ipv4=$(get_local_ipv4)
+    local_ipv6=$(get_local_ipv6)
+    _warn "未检测到公网 IP，将继续安装"
+    echo -e "  内网 IPv4: ${local_ipv4:-${D}无${NC}}"
+    echo -e "  内网 IPv6: ${local_ipv6:-${D}无${NC}}"
+    echo -e "  ${D}安装完成后，请使用内网地址、NAT 端口映射地址、域名或隧道地址配置客户端。${NC}"
+    return 0
+}
+
 # 获取 IP 地理位置代码 (如 HK, JP, US, SG)
 get_ip_country() {
     local ip="${1:-}"
@@ -6168,10 +6837,25 @@ gen_ss_legacy_link() {
 
 gen_snell_link() {
     local ip="$1" port="$2" psk="$3" version="${4:-4}" country="${5:-}"
+    local mode="${6:-}"
     local ip_suffix=$(get_ip_suffix "$ip")
     local name="${country:+${country}-}Snell-v${version}${ip_suffix:+-${ip_suffix}}"
     # Snell 没有标准URI格式，使用自定义格式
-    printf '%s\n' "snell://${psk}@${ip}:${port}?version=${version}#${name}"
+    local query="version=${version}"
+    if [[ "$version" == "6" ]]; then
+        mode="${mode:-default}"
+        query+="&mode=${mode}"
+    fi
+    printf '%s\n' "snell://${psk}@${ip}:${port}?${query}#${name}"
+}
+
+# 生成 Surge Snell 节点行。Snell v6 的 mode 属于协议握手参数，必须与
+# 服务端配置完全一致；v4/v5 不输出该字段。
+gen_snell_surge_line() {
+    local name="$1" ip="$2" port="$3" psk="$4" version="${5:-4}"
+    local mode="${6:-default}" tfo="${7:-true}" mode_arg=""
+    [[ "$version" == "6" ]] && mode_arg=", mode=${mode}"
+    printf '%s\n' "${name} = snell, ${ip}, ${port}, psk=${psk}, version=${version}${mode_arg}, reuse=true, tfo=${tfo}"
 }
 
 gen_tuic_link() {
@@ -7384,7 +8068,10 @@ readonly SCRIPT_VERSION_CACHE_FILE="$VERSION_CACHE_DIR/.script_version"
 readonly SNELL_RELEASE_NOTES_URL="https://kb.nssurge.com/surge-knowledge-base/release-notes/snell.md"
 readonly SNELL_RELEASE_NOTES_ZH_URL="https://kb.nssurge.com/surge-knowledge-base/zh/release-notes/snell.md"
 readonly SNELL_DEFAULT_VERSION="5.0.1"
-readonly SNELL_V6_DEFAULT_VERSION="6.0.0rc2"
+readonly SNELL_V6_REPO="passeway/Snell"
+# GitHub API/缓存不可用时的安全回退版本；正常情况下动态读取官方最新预发布版。
+readonly SNELL_V6_DEFAULT_VERSION="6.0.0rc"
+readonly SNELL_V6_INSTALLED_VERSION_FILE="$CFG/.snell-v6-installed-version"
 
 # 获取文件修改时间戳（跨平台兼容）
 _get_file_mtime() {
@@ -7998,6 +8685,83 @@ _get_latest_prerelease_version() {
     echo "$version"
 }
 
+_is_snell_v6_version() {
+    [[ "$1" =~ ^6\.[0-9]+\.[0-9]+([A-Za-z][A-Za-z0-9._-]*)?$ ]]
+}
+
+# 一次请求同时缓存 Snell v6 稳定版和预发布版。必须限定 v6 标签，避免把同一
+# 仓库中的 Snell v5 稳定版误认为 v6 推荐版本。
+_refresh_snell_v6_version_cache() {
+    local result stable_version prerelease_version
+    local stable_cache="$VERSION_CACHE_DIR/passeway_Snell_v6_stable"
+    local prerelease_cache="$VERSION_CACHE_DIR/passeway_Snell_v6_prerelease"
+
+    _init_version_cache
+    result=$(curl -fsSL --connect-timeout 5 --max-time 10 \
+        "https://api.github.com/repos/${SNELL_V6_REPO}/releases?per_page=${GITHUB_API_PER_PAGE}" 2>/dev/null) || return 1
+    printf '%s' "$result" | jq -e 'type == "array"' >/dev/null 2>&1 || return 1
+
+    stable_version=$(printf '%s' "$result" | jq -r '
+        [.[] | select(.draft == false and .prerelease == false and (.tag_name | test("^v?6\\.")))][0].tag_name // empty
+    ' 2>/dev/null | sed 's/^v//' | head -n 1)
+    prerelease_version=$(printf '%s' "$result" | jq -r '
+        [.[] | select(.draft == false and .prerelease == true and (.tag_name | test("^v?6\\.")))][0].tag_name // empty
+    ' 2>/dev/null | sed 's/^v//' | head -n 1)
+
+    _is_snell_v6_version "$stable_version" || stable_version="无"
+    _is_snell_v6_version "$prerelease_version" || prerelease_version="无"
+    printf '%s\n' "$stable_version" > "$stable_cache" 2>/dev/null || true
+    printf '%s\n' "$prerelease_version" > "$prerelease_cache" 2>/dev/null || true
+}
+
+_get_snell_v6_channel_version() {
+    local channel="$1" use_cache="${2:-true}" force="${3:-false}"
+    local cache_file=""
+    case "$channel" in
+        stable) cache_file="$VERSION_CACHE_DIR/passeway_Snell_v6_stable" ;;
+        prerelease) cache_file="$VERSION_CACHE_DIR/passeway_Snell_v6_prerelease" ;;
+        *) return 1 ;;
+    esac
+
+    _init_version_cache
+    if [[ "$force" != "true" && "$use_cache" == "true" ]] && _is_cache_fresh "$cache_file"; then
+        cat "$cache_file" 2>/dev/null
+        return 0
+    fi
+    if _refresh_snell_v6_version_cache; then
+        cat "$cache_file" 2>/dev/null
+        return 0
+    fi
+    # 网络失败时允许使用过期缓存；没有缓存则由推荐版本函数使用固定 RC 回退。
+    [[ -f "$cache_file" ]] && cat "$cache_file" 2>/dev/null
+}
+
+_get_snell_v6_stable_version() {
+    _get_snell_v6_channel_version stable "${1:-true}" "${2:-false}"
+}
+
+_get_snell_v6_prerelease_version() {
+    _get_snell_v6_channel_version prerelease "${1:-true}" "${2:-false}"
+}
+
+# 推荐版本优先使用 v6 稳定版；尚无 v6 稳定版时才使用预发布版和固定回退。
+_get_snell_v6_latest_version() {
+    local use_cache="${1:-true}" force="${2:-false}"
+    local stable_version prerelease_version
+
+    stable_version=$(_get_snell_v6_stable_version "$use_cache" "$force" 2>/dev/null || true)
+    if _is_snell_v6_version "$stable_version"; then
+        echo "$stable_version"
+        return 0
+    fi
+    prerelease_version=$(_get_snell_v6_prerelease_version "$use_cache" "$force" 2>/dev/null || true)
+    if _is_snell_v6_version "$prerelease_version"; then
+        echo "$prerelease_version"
+    else
+        echo "$SNELL_V6_DEFAULT_VERSION"
+    fi
+}
+
 # 获取最近版本列表
 _get_release_versions() {
     local repo="$1" limit="${2:-10}" mode="${3:-stable}"
@@ -8168,20 +8932,37 @@ _sha256_file() {
 # 对脚本支持的固定版本按版本和架构内置校验值，避免把旁车 404 误判为
 # ZIP 下载失败，同时继续拒绝任何内容不匹配的安装包。
 _snell_release_sha256() {
-    local version="$1" arch="$2"
+    local version="$1" arch="$2" pinned="" asset_name="" digest=""
     case "${version}:${arch}" in
-        4.1.1:amd64)  echo "cc2271b79c7506888b34e651e8741b3aa7fc7d5f60aa65ef8bb096f3313a193b" ;;
-        4.1.1:aarch64) echo "38d4cdc03dcdb3608af8594df83e1795265167fafc5d802f815148908902d758" ;;
-        4.1.1:armv7l)  echo "d00b98ed803be4039f0f0630b810932cd3d3d87ee3e6ed224106fdc63347d8e6" ;;
-        5.0.1:amd64)  echo "9bea1c2b9e35b73b31634856c04d18c393072b9e5dcde6a32781d8b8f908c539" ;;
-        5.0.1:aarch64) echo "2f178bf5ac468ce1a130454efa40a0603fbbe4e47ecc4880a989f4abc7f824cf" ;;
-        5.0.1:armv7l)  echo "14489f3e857569c8835dd3598b7ea6bca5371d4290ac7cf0f6c8dfb3381c1fb2" ;;
-        6.0.0b4:amd64)  echo "d66891cffc9f1b24a7b959ffbd2c4a246013f4f9e612733027b5ad106ce5f87f" ;;
-        6.0.0b4:aarch64) echo "2c957ee6bb37ce4b1df2b6a23e652b75546d10bc4f0443a2928e5834ae0429af" ;;
-        6.0.0rc2:amd64)  echo "8a9c4463ca87cfa5eaa37c6af0d37ab93ea275aa12391985bb2a375ca3abd7f2" ;;
-        6.0.0rc2:aarch64) echo "a0b2915cbc77dc3baf8fa069e741c20808d8a10c3a8a93e709a0a580645c3bd7" ;;
-        *) return 1 ;;
+        4.1.1:amd64)  pinned="cc2271b79c7506888b34e651e8741b3aa7fc7d5f60aa65ef8bb096f3313a193b" ;;
+        4.1.1:aarch64) pinned="38d4cdc03dcdb3608af8594df83e1795265167fafc5d802f815148908902d758" ;;
+        4.1.1:armv7l)  pinned="d00b98ed803be4039f0f0630b810932cd3d3d87ee3e6ed224106fdc63347d8e6" ;;
+        5.0.1:amd64)  pinned="9bea1c2b9e35b73b31634856c04d18c393072b9e5dcde6a32781d8b8f908c539" ;;
+        5.0.1:aarch64) pinned="2f178bf5ac468ce1a130454efa40a0603fbbe4e47ecc4880a989f4abc7f824cf" ;;
+        5.0.1:armv7l)  pinned="14489f3e857569c8835dd3598b7ea6bca5371d4290ac7cf0f6c8dfb3381c1fb2" ;;
+        6.0.0b4:amd64)  pinned="d66891cffc9f1b24a7b959ffbd2c4a246013f4f9e612733027b5ad106ce5f87f" ;;
+        6.0.0b4:aarch64) pinned="2c957ee6bb37ce4b1df2b6a23e652b75546d10bc4f0443a2928e5834ae0429af" ;;
+        6.0.0rc:amd64)  pinned="21c4aa6b4a208236f33e9923603acd8a26534a02104aed40496ddf77949dfb4b" ;;
+        6.0.0rc:aarch64) pinned="2b47d111d648648cf6845886433a7a93404ffe8d68a8e447058de6f7eca0d1a7" ;;
     esac
+
+    if [[ -n "$pinned" ]]; then
+        echo "$pinned"
+        return 0
+    fi
+
+    # Snell v6 后续版本优先使用官方 GitHub Release 的资产摘要，避免每次发布都
+    # 因缺少内置哈希而无法安装。下载站文件必须与同名 GitHub 资产完全一致。
+    [[ "$version" =~ ^6\.[0-9]+\.[0-9]+([A-Za-z][A-Za-z0-9._-]*)?$ ]] || return 1
+    [[ "$arch" == "amd64" || "$arch" == "aarch64" ]] || return 1
+    asset_name="snell-server-v${version}-linux-${arch}.zip"
+    digest=$(curl -fsSL --connect-timeout 10 --max-time 30 \
+        "https://api.github.com/repos/${SNELL_V6_REPO}/releases/tags/v${version}" 2>/dev/null |
+        jq -r --arg name "$asset_name" '.assets[]? | select(.name == $name) | .digest // empty' 2>/dev/null |
+        head -n 1)
+    digest="${digest#sha256:}"
+    [[ "$digest" =~ ^[0-9a-fA-F]{64}$ ]] || return 1
+    echo "$digest" | tr '[:upper:]' '[:lower:]'
 }
 
 # GitHub 的旧 Release 资产可能没有 digest 字段，发布页也未必提供 checksum
@@ -8479,13 +9260,60 @@ _get_snell_v5_version() {
 }
 
 # Snell v6 版本获取
+_save_snell_v6_installed_version() {
+    local version="$1" tmp=""
+    _is_snell_v6_version "$version" || return 1
+    mkdir -p "$CFG" 2>/dev/null || return 1
+    tmp=$(mktemp "${CFG}/.snell-v6-version.XXXXXX") || return 1
+    if printf '%s\n' "$version" > "$tmp" && chmod 600 "$tmp" &&
+       mv "$tmp" "$SNELL_V6_INSTALLED_VERSION_FILE"; then
+        return 0
+    fi
+    rm -f "$tmp"
+    return 1
+}
+
+_snell_v6_base_version() {
+    printf '%s\n' "$1" | sed -E 's/[A-Za-z][A-Za-z0-9._-]*$//'
+}
+
 _get_snell_v6_version() {
-    local version="未知"
+    local version="未知" detected="" saved="" saved_base=""
     if check_cmd snell-server-v6; then
         local output
         output=$(snell-server-v6 --v 2>&1 || snell-server-v6 --version 2>&1 || true)
-        version=$(printf '%s\n' "$output" | head -n 2 | grep -oE '6\.[0-9]+\.[0-9]+([A-Za-z][A-Za-z0-9._-]*)?' | head -n 1)
-        [[ -z "$version" ]] && version="未知"
+        detected=$(printf '%s\n' "$output" | head -n 2 | grep -oE '6\.[0-9]+\.[0-9]+([A-Za-z][A-Za-z0-9._-]*)?' | head -n 1)
+        if ! _is_snell_v6_version "$detected"; then
+            echo "未知"
+            return 0
+        fi
+
+        # RC 二进制的 --v 输出可能只有 6.0.0，因此优先使用安装时保存的完整发布标签。
+        saved=$(head -n 1 "$SNELL_V6_INSTALLED_VERSION_FILE" 2>/dev/null || true)
+        if _is_snell_v6_version "$saved"; then
+            saved_base=$(_snell_v6_base_version "$saved")
+            if [[ "$detected" == "$saved" || "$detected" == "$saved_base" ]]; then
+                echo "$saved"
+                return 0
+            fi
+        fi
+
+        # 兼容热修复前已安装的 RC：用官方通道把二进制报告的基础版本还原为
+        # 完整标签，并立即写入元数据，后续即使发布同基础版本的稳定版也不会误判。
+        local stable_version prerelease_version candidate
+        stable_version=$(_get_snell_v6_stable_version "true" 2>/dev/null || true)
+        prerelease_version=$(_get_snell_v6_prerelease_version "true" 2>/dev/null || true)
+        if _is_snell_v6_version "$stable_version" && [[ "$detected" == "$(_snell_v6_base_version "$stable_version")" ]]; then
+            candidate="$stable_version"
+        elif _is_snell_v6_version "$prerelease_version" && [[ "$detected" == "$(_snell_v6_base_version "$prerelease_version")" ]]; then
+            candidate="$prerelease_version"
+        elif [[ "$detected" == "$(_snell_v6_base_version "$SNELL_V6_DEFAULT_VERSION")" ]]; then
+            candidate="$SNELL_V6_DEFAULT_VERSION"
+        else
+            candidate="$detected"
+        fi
+        _save_snell_v6_installed_version "$candidate" 2>/dev/null || true
+        version="$candidate"
     else
         version="未安装"
     fi
@@ -8891,6 +9719,7 @@ _update_core_versions_async() {
             _get_latest_prerelease_version "XTLS/Xray-core" "false" >/dev/null 2>&1
             _get_latest_prerelease_version "SagerNet/sing-box" "false" >/dev/null 2>&1
             _get_latest_prerelease_version "surge-networks/snell" "false" >/dev/null 2>&1
+            _refresh_snell_v6_version_cache >/dev/null 2>&1
         ) &
     ) &
 }
@@ -8903,6 +9732,7 @@ _refresh_core_versions_now() {
     _get_latest_prerelease_version "SagerNet/sing-box" "false" "true" >/dev/null 2>&1
     _get_latest_version "surge-networks/snell" "false" "true" >/dev/null 2>&1
     _get_latest_prerelease_version "surge-networks/snell" "false" "true" >/dev/null 2>&1
+    _refresh_snell_v6_version_cache >/dev/null 2>&1
     local xray_current singbox_current
     xray_current=$(_get_core_version "xray")
     singbox_current=$(_get_core_version "sing-box")
@@ -9080,23 +9910,38 @@ _show_core_versions() {
         fi
     fi
 
-    # 显示 Snell v6 版本信息（当前为官方 RC2 下载通道）
+    # 显示 Snell v6 稳定版和预发布版；推荐版本优先稳定版。
     if [[ "$filter" == "all" ]] || [[ "$filter" == "snellv6" ]]; then
         [[ "$filter" == "all" ]] && echo ""
-        local snell_v6_current
+        local snell_v6_current snell_v6_stable snell_v6_prerelease snell_v6_latest
         snell_v6_current=$(_get_snell_v6_version)
+        snell_v6_stable=$(_get_snell_v6_stable_version "true")
+        snell_v6_prerelease=$(_get_snell_v6_prerelease_version "true")
+        snell_v6_latest=$(_get_snell_v6_latest_version "true")
 
-        echo -e "  ${W}Snell v6 ${D}(RC2)${NC}"
+        echo -e "  ${W}Snell v6${NC}"
         if [[ "$snell_v6_current" == "未安装" ]]; then
             echo -e "    ${W}当前版本:${NC} ${D}${snell_v6_current}${NC}"
         elif [[ "$snell_v6_current" == "未知" ]]; then
             echo -e "    ${W}当前版本:${NC} ${D}${snell_v6_current}${NC}"
         else
             local snell_v6_status=""
-            [[ "$snell_v6_current" != "$SNELL_V6_DEFAULT_VERSION" ]] && snell_v6_status=" ${Y}[可更新]${NC}"
+            [[ "$snell_v6_current" != "$snell_v6_latest" ]] && snell_v6_status=" ${Y}[可更新]${NC}"
             echo -e "    ${W}当前版本:${NC} ${G}v${snell_v6_current}${NC}${snell_v6_status}"
         fi
-        echo -e "    ${W}推荐版本:${NC} ${M}v${SNELL_V6_DEFAULT_VERSION}${NC} ${D}(官方 RC2)${NC}"
+        if _is_snell_v6_version "$snell_v6_stable"; then
+            echo -e "    ${W}稳定版本:${NC} ${C}v${snell_v6_stable}${NC}"
+        else
+            echo -e "    ${W}稳定版本:${NC} ${D}无${NC}"
+        fi
+        if _is_snell_v6_version "$snell_v6_prerelease"; then
+            echo -e "    ${W}预发布版本:${NC} ${M}v${snell_v6_prerelease}${NC}"
+        else
+            echo -e "    ${W}预发布版本:${NC} ${D}无${NC}"
+        fi
+        local snell_v6_channel_label="预发布版"
+        [[ "$snell_v6_latest" == "$snell_v6_stable" ]] && snell_v6_channel_label="稳定版"
+        echo -e "    ${W}推荐版本:${NC} ${G}v${snell_v6_latest}${NC} ${D}(${snell_v6_channel_label})${NC}"
     fi
 
     # 启动后台异步更新（为下次访问准备）
@@ -9114,6 +9959,8 @@ _show_core_versions() {
         _update_version_cache_async "surge-networks/snell"
         _update_prerelease_cache_async "surge-networks/snell"
     fi
+
+    # Snell v6 已在上方一次请求同时更新两个通道，无需分别重复请求。
 }
 
 update_xray_core() {
@@ -9273,9 +10120,12 @@ update_snell_v5_core() {
 }
 
 update_snell_v6_core() {
-    local version="${1:-$SNELL_V6_DEFAULT_VERSION}"
+    local version="${1:-}"
+    [[ -z "$version" ]] && version=$(_get_snell_v6_latest_version "true")
+    local channel="prerelease"
+    [[ "$version" =~ ^6\.[0-9]+\.[0-9]+$ ]] && channel="stable"
     _check_core_update_deps || return 1
-    _confirm_core_update_version "Snell v6" "beta" "$version" || return 1
+    _confirm_core_update_version "Snell v6" "$channel" "$version" || return 1
 
     if [[ ! "$version" =~ ^6\.[0-9]+\.[0-9]+([A-Za-z][A-Za-z0-9._-]*)?$ ]]; then
         _err "无效的 Snell v6 版本号：$version"
@@ -9321,10 +10171,12 @@ update_snell_v6_core_custom() {
     _line
     _show_core_versions "snellv6"
     _line
-    echo -e "  ${D}示例版本: ${SNELL_V6_DEFAULT_VERSION}${NC}"
-    read -rp "  请输入 Snell v6 版本号 [默认 ${SNELL_V6_DEFAULT_VERSION}，0 返回]: " version
+    local latest_version version
+    latest_version=$(_get_snell_v6_latest_version "true")
+    echo -e "  ${D}示例版本: ${latest_version}${NC}"
+    read -rp "  请输入 Snell v6 版本号 [默认 ${latest_version}，0 返回]: " version
     [[ "$version" == "0" ]] && return 0
-    version="${version:-$SNELL_V6_DEFAULT_VERSION}"
+    version="${version:-$latest_version}"
     update_snell_v6_core "$version"
 }
 
@@ -9420,19 +10272,41 @@ _update_core_with_channel_select() {
     fi
 
     if [[ "$core_name" == "Snell v6" ]]; then
+        local snell_v6_stable snell_v6_prerelease snell_v6_recommended
+        snell_v6_stable=$(_get_snell_v6_stable_version "true")
+        snell_v6_prerelease=$(_get_snell_v6_prerelease_version "true")
+        snell_v6_recommended=$(_get_snell_v6_latest_version "true")
         _header
         echo -e "  ${W}${core_name} 版本选择${NC}"
         _line
         echo -e "  ${W}当前版本:${NC} ${G}${current_ver}${NC}"
         echo ""
-        _item "1" "推荐 RC2 版 (v${SNELL_V6_DEFAULT_VERSION})"
-        _item "2" "指定版本"
+        if _is_snell_v6_version "$snell_v6_stable"; then
+            _item "1" "稳定版 (v${snell_v6_stable}) ${G}[推荐]${NC}"
+        else
+            _item "1" "稳定版 ${D}(暂无 v6 稳定版)${NC}"
+        fi
+        if _is_snell_v6_version "$snell_v6_prerelease"; then
+            local prerelease_recommended=""
+            [[ "$snell_v6_recommended" == "$snell_v6_prerelease" ]] && prerelease_recommended=" ${G}[推荐]${NC}"
+            _item "2" "预发布版 (v${snell_v6_prerelease})${prerelease_recommended}"
+        else
+            _item "2" "预发布版 ${D}(暂不可获取)${NC}"
+        fi
+        _item "3" "指定版本"
         _item "0" "返回"
         _line
         read -rp "  请选择: " channel_choice
         case "$channel_choice" in
-            1) update_snell_v6_core "$SNELL_V6_DEFAULT_VERSION" ;;
-            2) update_snell_v6_core_custom ;;
+            1)
+                _is_snell_v6_version "$snell_v6_stable" || { _warn "当前没有可用的 Snell v6 稳定版"; return 1; }
+                update_snell_v6_core "$snell_v6_stable"
+                ;;
+            2)
+                _is_snell_v6_version "$snell_v6_prerelease" || { _warn "当前无法获取 Snell v6 预发布版"; return 1; }
+                update_snell_v6_core "$snell_v6_prerelease"
+                ;;
+            3) update_snell_v6_core_custom ;;
             0) return 0 ;;
             *) _err "无效选择"; return 1 ;;
         esac
@@ -9533,7 +10407,7 @@ update_core_menu() {
             1) _update_core_with_channel_select "Xray" "XTLS/Xray-core" "xray" "vless-reality" "install_xray" ;;
             2) _update_core_with_channel_select "Sing-box" "SagerNet/sing-box" "sing-box" "vless-singbox" "install_singbox" ;;
             3) _update_core_with_channel_select "Snell v5" "surge-networks/snell" "snell-server-v5" "vless-snell-v5" "install_snell_v5" ;;
-            4) _update_core_with_channel_select "Snell v6" "nssurge/snell-v6" "snell-server-v6" "vless-snell-v6" "install_snell_v6" ;;
+            4) _update_core_with_channel_select "Snell v6" "$SNELL_V6_REPO" "snell-server-v6" "vless-snell-v6" "install_snell_v6" ;;
             5) _refresh_core_versions_now ;;
             0) break ;;
             *) _err "无效选择" ;;
@@ -10740,11 +11614,12 @@ install_snell_v5() {
     return 0
 }
 
-# 安装/更新 Snell v6 (RC2)
+# 安装/更新 Snell v6（稳定版优先，无稳定版时使用官方预发布版）
 # 不传版本且二进制可用时复用现有安装；显式传入版本时强制覆盖，用于核心更新。
 install_snell_v6() {
     local requested_version="${1:-}"
-    local version="${requested_version:-$SNELL_V6_DEFAULT_VERSION}"
+    local version="${requested_version:-}"
+    [[ -z "$version" ]] && version=$(_get_snell_v6_latest_version "true")
     local bin="/usr/local/bin/snell-server-v6"
 
     if [[ -z "$requested_version" && -x "$bin" ]]; then
@@ -10766,7 +11641,9 @@ install_snell_v6() {
 
     [[ "$DISTRO" == "alpine" ]] && ensure_snell_alpine_runtime || [[ "$DISTRO" != "alpine" ]] || return 1
 
-    _info "安装 Snell v6 RC2 v${version}..."
+    local release_label="预发布版"
+    [[ "$version" =~ ^6\.[0-9]+\.[0-9]+$ ]] && release_label="稳定版"
+    _info "安装 Snell v6 ${release_label} v${version}..."
     local tmp url staged expected_sha="${SNELL_V6_SHA256:-}"
     tmp=$(mktemp -d) || return 1
     url="https://dl.nssurge.com/snell/snell-server-v${version}-linux-${sarch}.zip"
@@ -10807,6 +11684,9 @@ install_snell_v6() {
     rm -rf "$tmp"
 
     [[ -x "$bin" ]] || { _err "Snell v6 安装验证失败"; return 1; }
+    if ! _save_snell_v6_installed_version "$version"; then
+        _warn "Snell v6 已安装，但无法保存完整版本标签；版本显示可能不准确"
+    fi
     _ok "Snell v6 v${version} 已安装"
 }
 
@@ -11523,7 +12403,8 @@ gen_snell_shadowtls_server_config() {
     local psk="$1" port="$2" sni="${3:-www.microsoft.com}" stls_password="$4" version="${5:-4}" custom_backend_port="${6:-}"
     mkdir -p "$CFG"
     
-    local ipv4=$(get_ipv4) ipv6=$(get_ipv6)
+    local ipv4 ipv6
+    IFS='|' read -r ipv4 ipv6 <<< "$(get_connection_addresses)"
     local protocol_name="snell-shadowtls"
     local snell_bin="snell-server"
     local snell_conf="snell-shadowtls.conf"
@@ -11621,7 +12502,8 @@ gen_socks_server_config() {
     register_protocol "socks" "$config_json"
 
     # SOCKS5 的 join 信息
-    local ipv4=$(get_ipv4) ipv6=$(get_ipv6)
+    local ipv4 ipv6
+    IFS='|' read -r ipv4 ipv6 <<< "$(get_connection_addresses)"
     local tls_suffix=""
     [[ "$use_tls" == "true" ]] && tls_suffix="-TLS"
 
@@ -11693,7 +12575,7 @@ EOF
 }
 
 # Snell v6 服务端配置
-# Snell v6 支持 listen、mode、dns、dns-ip-preference 和 egress-interface。
+# v6.0.0rc 支持 listen、mode、dns、dns-ip-preference 和 egress-interface。
 gen_snell_v6_server_config() {
     local psk="$1" port="$2" version="${3:-6}"
     local dns_pref="${4:-default}" dns_servers="${5:-}" mode="${6:-default}"
@@ -11731,8 +12613,8 @@ gen_snell_v6_server_config() {
     register_protocol "snell-v6" "$(build_config \
         psk "$psk" port "$port" version "$version" \
         dns "$dns_servers" dns_ip_preference "$dns_pref" mode "$mode" tfo "$tfo")"
-    _save_join_info "snell-v6" "SNELL-V6|%s|$port|$psk|$version" \
-        gen_snell_link "%s" "$port" "$psk" "$version" \
+    _save_join_info "snell-v6" "SNELL-V6|%s|$port|$psk|$version|$mode" \
+        gen_snell_link "%s" "$port" "$psk" "$version" "" "$mode" \
         --extra "MODE=$mode" "DNS=${dns_servers:-system}" \
         "DNS_IP_PREFERENCE=$dns_pref" "TFO=$tfo"
     cp "$CFG/snell-v6.join" "$CFG/join.txt" 2>/dev/null
@@ -18429,8 +19311,8 @@ show_all_share_links() {
     local has_links=false
     
     # 获取 IP 地址
-    local ipv4=$(get_ipv4)
-    local ipv6=$(get_ipv6)
+    local ipv4 ipv6
+    IFS='|' read -r ipv4 ipv6 <<< "$(get_connection_addresses)"
     local country_code=$(get_ip_country "$ipv4")
     [[ -z "$country_code" ]] && country_code=$(get_ip_country "$ipv6")
     
@@ -18475,6 +19357,7 @@ show_all_share_links() {
             local method=$(echo "$cfg" | jq -r '.method // empty')
             local psk=$(echo "$cfg" | jq -r '.psk // empty')
             local version=$(echo "$cfg" | jq -r '.version // empty')
+            local snell_mode=$(echo "$cfg" | jq -r '.mode // "default"')
             local domain=$(echo "$cfg" | jq -r '.domain // empty')
             local stls_password=$(echo "$cfg" | jq -r '.stls_password // empty')
             
@@ -18512,7 +19395,7 @@ show_all_share_links() {
                     trojan-ws) link=$(gen_trojan_ws_link "$ipv4" "$display_port" "$password" "$sni" "$path" "$country_code") ;;
                     snell) link=$(gen_snell_link "$ipv4" "$display_port" "$psk" "$version" "$country_code") ;;
                     snell-v5) link=$(gen_snell_v5_link "$ipv4" "$display_port" "$psk" "$version" "$country_code") ;;
-                    snell-v6) link=$(gen_snell_link "$ipv4" "$display_port" "$psk" "${version:-6}" "$country_code") ;;
+                    snell-v6) link=$(gen_snell_link "$ipv4" "$display_port" "$psk" "${version:-6}" "$country_code" "$snell_mode") ;;
                     tuic) link=$(gen_tuic_link "$ipv4" "$display_port" "$uuid" "$password" "$sni" "$country_code") ;;
                     anytls) link=$(gen_anytls_link "$ipv4" "$display_port" "$password" "$sni" "$country_code") ;;
                     naive) link=$(gen_naive_link "$domain" "$display_port" "$username" "$password" "$country_code") ;;
@@ -18564,7 +19447,7 @@ show_all_share_links() {
                     trojan-ws) link=$(gen_trojan_ws_link "$ip6" "$display_port" "$password" "$sni" "$path" "$country_code") ;;
                     snell) link=$(gen_snell_link "$ip6" "$display_port" "$psk" "$version" "$country_code") ;;
                     snell-v5) link=$(gen_snell_v5_link "$ip6" "$display_port" "$psk" "$version" "$country_code") ;;
-                    snell-v6) link=$(gen_snell_link "$ip6" "$display_port" "$psk" "${version:-6}" "$country_code") ;;
+                    snell-v6) link=$(gen_snell_link "$ip6" "$display_port" "$psk" "${version:-6}" "$country_code" "$snell_mode") ;;
                     tuic) link=$(gen_tuic_link "$ip6" "$display_port" "$uuid" "$password" "$sni" "$country_code") ;;
                     anytls) link=$(gen_anytls_link "$ip6" "$display_port" "$password" "$sni" "$country_code") ;;
                     naive) ;; # NaïveProxy 使用域名，不需要 IPv6 链接
@@ -18692,9 +19575,10 @@ show_single_protocol_info() {
     local snell_mode=$(echo "$cfg" | jq -r '.mode // empty')
     local snell_tfo=$(echo "$cfg" | jq -r '.tfo // empty')
     
-    # 重新获取 IP（数据库中的可能是旧的）
-    [[ -z "$ipv4" ]] && ipv4=$(get_ipv4)
-    [[ -z "$ipv6" ]] && ipv6=$(get_ipv6)
+    # 重新获取连接地址（数据库中的可能是旧的或由无公网旧版本写成空值）
+    if [[ -z "$ipv4" && -z "$ipv6" ]]; then
+        IFS='|' read -r ipv4 ipv6 <<< "$(get_connection_addresses)"
+    fi
     
     # 检测是否为回落子协议（WS 在有 TLS 主协议时使用主协议端口）
     # 注意：Reality 不支持 WS 回落，只有 Vision/Trojan 可以
@@ -18737,8 +19621,15 @@ show_single_protocol_info() {
     [[ -z "$country_code" ]] && country_code=$(get_ip_country "$ipv6")
     
     # 确定用于配置显示的 IP 地址：优先 IPv4，纯 IPv6 环境使用 IPv6（带方括号）
-    local config_ip="$ipv4"
-    [[ -z "$config_ip" ]] && config_ip="[$ipv6]"
+    local config_ip=""
+    if [[ -n "$ipv4" ]]; then
+        config_ip="$ipv4"
+    elif [[ -n "$ipv6" ]]; then
+        config_ip="[$ipv6]"
+    else
+        config_ip="请填写服务器地址"
+        _warn "未检测到可用的连接地址，客户端配置中的服务器地址需要手动填写"
+    fi
     
     case "$protocol" in
         vless)
@@ -18974,7 +19865,7 @@ show_single_protocol_info() {
             fi
             echo ""
             echo -e "  ${Y}Surge 配置 (Snell 为 Surge 专属协议):${NC}"
-            echo -e "  ${C}${country_code}-Snell = snell, ${config_ip}, ${display_port}, psk=${psk}, version=${version}, reuse=true, tfo=${snell_tfo:-true}${NC}"
+            echo -e "  ${C}$(gen_snell_surge_line "${country_code}-Snell" "$config_ip" "$display_port" "$psk" "$version" "${snell_mode:-default}" "${snell_tfo:-true}")${NC}"
             ;;
         tuic)
             echo -e "  UUID: ${G}$uuid${NC}"
@@ -19110,8 +20001,8 @@ show_single_protocol_info() {
                 join_code=$(echo "SNELL-V5|${ip_addr}|${link_port}|${psk}|${version}" | base64 -w 0)
                 ;;
             snell-v6)
-                link=$(gen_snell_link "$ip_addr" "$link_port" "$psk" "${version:-6}" "$country_code")
-                join_code=$(echo "SNELL-V6|${ip_addr}|${link_port}|${psk}|${version:-6}" | base64 -w 0)
+                link=$(gen_snell_link "$ip_addr" "$link_port" "$psk" "${version:-6}" "$country_code" "${snell_mode:-default}")
+                join_code=$(echo "SNELL-V6|${ip_addr}|${link_port}|${psk}|${version:-6}|${snell_mode:-default}" | base64 -w 0)
                 ;;
             snell-shadowtls|snell-v5-shadowtls)
                 local stls_ver="${version:-4}"
@@ -19733,7 +20624,7 @@ uninstall_specific_protocol() {
         case "$selected_protocol" in
             snell) rm -f "$CFG/snell.conf" ;;
             snell-v5) rm -f "$CFG/snell-v5.conf" ;;
-            snell-v6) rm -f "$CFG/snell-v6.conf" ;;
+            snell-v6) rm -f "$CFG/snell-v6.conf" "$SNELL_V6_INSTALLED_VERSION_FILE" ;;
             snell-shadowtls) rm -f "$CFG/snell-shadowtls.conf" ;;
             snell-v5-shadowtls) rm -f "$CFG/snell-v5-shadowtls.conf" ;;
             ss2022-shadowtls) rm -f "$CFG/ss2022-shadowtls-backend.json" ;;
@@ -19930,6 +20821,11 @@ do_uninstall() {
     
     # 强力清理残留进程
     force_cleanup
+
+    # 清理脚本创建的定时任务，避免卸载后继续调用已删除的脚本。
+    remove_cron_entry "tg-user-bot"
+    remove_cron_entry "sync-traffic"
+    remove_cron_entry "check-expire"
     
     _info "删除服务文件..."
     if [[ "$DISTRO" == "alpine" ]]; then
@@ -20047,7 +20943,7 @@ select_protocol() {
     _line
     _item "10" "Snell v4"
     _item "11" "Snell v5"
-    _item "12" "Snell v6 ${D}(RC2)${NC}"
+    _item "12" "Snell v6"
     _line
     echo -e "  ${W}其他协议${NC}"
     _line
@@ -20157,7 +21053,7 @@ do_install_server() {
             case "$protocol" in
                 snell) rm -f "$CFG/snell.conf" ;;
                 snell-v5) rm -f "$CFG/snell-v5.conf" ;;
-                snell-v6) rm -f "$CFG/snell-v6.conf" ;;
+                snell-v6) rm -f "$CFG/snell-v6.conf" "$SNELL_V6_INSTALLED_VERSION_FILE" ;;
                 snell-shadowtls) rm -f "$CFG/snell-shadowtls.conf" ;;
                 snell-v5-shadowtls) rm -f "$CFG/snell-v5-shadowtls.conf" ;;
                 ss2022-shadowtls) rm -f "$CFG/ss2022-shadowtls-backend.json" ;;
@@ -20200,10 +21096,7 @@ do_install_server() {
     ensure_dual_stack_listen
 
     _info "检测网络环境..."
-    local ipv4=$(get_ipv4) ipv6=$(get_ipv6)
-    echo -e "  IPv4: ${ipv4:-${R}无${NC}}"
-    echo -e "  IPv6: ${ipv6:-${R}无${NC}}"
-    [[ -z "$ipv4" && -z "$ipv6" ]] && { _err "无法获取公网IP"; _pause; return 1; }
+    show_install_network_environment
     echo ""
 
     # === 主协议冲突检测 ===
@@ -23070,8 +23963,8 @@ _load_sub_info() {
 gen_v2ray_sub() {
     local installed=$(get_installed_protocols)
     local links=""
-    local ipv4=$(get_ipv4)
-    local ipv6=$(get_ipv6)
+    local ipv4 ipv6
+    IFS='|' read -r ipv4 ipv6 <<< "$(get_connection_addresses)"
     
     # 获取地区代码
     local country_code=$(get_ip_country "$ipv4")
@@ -23195,8 +24088,8 @@ gen_v2ray_sub() {
 # 生成 Clash 订阅内容
 gen_clash_sub() {
     local installed=$(get_installed_protocols)
-    local ipv4=$(get_ipv4)
-    local ipv6=$(get_ipv6)
+    local ipv4 ipv6
+    IFS='|' read -r ipv4 ipv6 <<< "$(get_connection_addresses)"
     local proxies=""
     local proxy_names=""
     
@@ -23446,8 +24339,8 @@ EOF
 # 生成 Surge 订阅内容
 gen_surge_sub() {
     local installed=$(get_installed_protocols)
-    local ipv4=$(get_ipv4)
-    local ipv6=$(get_ipv6)
+    local ipv4 ipv6
+    IFS='|' read -r ipv4 ipv6 <<< "$(get_connection_addresses)"
     local proxies=""
     local proxy_names=""
     
@@ -23494,6 +24387,8 @@ gen_surge_sub() {
             local method=$(echo "$cfg" | jq -r '.method // empty')
             local psk=$(echo "$cfg" | jq -r '.psk // empty')
             local version=$(echo "$cfg" | jq -r '.version // empty')
+            local snell_mode=$(echo "$cfg" | jq -r '.mode // "default"')
+            local snell_tfo=$(echo "$cfg" | jq -r '.tfo // "true"')
             
             local name="${country_code}-$(get_protocol_name $protocol)-${ip_suffix}"
             local proxy=""
@@ -23520,6 +24415,10 @@ gen_surge_sub() {
                 snell|snell-v5|snell-shadowtls|snell-v5-shadowtls)
                     # Snell 和 Snell+ShadowTLS 都使用相同的 Surge 配置格式
                     [[ -n "$server_ip" ]] && proxy="$name = snell, $server_ip, $port, psk=$psk, version=${version:-4}"
+                    ;;
+                snell-v6)
+                    # Snell v6 服务端与 Surge 客户端的 mode 必须完全一致。
+                    [[ -n "$server_ip" ]] && proxy=$(gen_snell_surge_line "$name" "$server_ip" "$port" "$psk" "${version:-6}" "${snell_mode:-default}" "${snell_tfo:-true}")
                     ;;
             esac
             
@@ -23693,11 +24592,19 @@ show_sub_links() {
     # 清除变量避免污染
     local sub_uuid="" sub_port="" sub_domain="" sub_https=""
     _load_sub_info "$CFG/sub.info" || { _err "订阅配置格式无效"; return 1; }
-    local ipv4=$(get_ipv4)
+    local ipv4 ipv6
+    IFS='|' read -r ipv4 ipv6 <<< "$(get_connection_addresses)"
     local protocol="http"
     [[ "$sub_https" == "true" ]] && protocol="https"
-    
-    local base_url="${protocol}://${sub_domain:-$ipv4}:${sub_port}/sub/${sub_uuid}"
+
+    local sub_host="$sub_domain"
+    if [[ -z "$sub_host" && -n "$ipv4" ]]; then
+        sub_host="$ipv4"
+    elif [[ -z "$sub_host" && -n "$ipv6" ]]; then
+        sub_host="[$ipv6]"
+    fi
+    [[ -z "$sub_host" ]] && sub_host="请填写服务器地址"
+    local base_url="${protocol}://${sub_host}:${sub_port}/sub/${sub_uuid}"
     
     _line
     echo -e "  ${W}订阅链接${NC}"
@@ -23883,7 +24790,11 @@ setup_subscription_interactive() {
     # 获取订阅 UUID
     local sub_uuid=$(get_sub_uuid)
     local sub_dir="$CFG/subscription/$sub_uuid"
-    local server_name="${sub_domain:-$(get_ipv4)}"
+    local connection_ipv4 connection_ipv6
+    IFS='|' read -r connection_ipv4 connection_ipv6 <<< "$(get_connection_addresses)"
+    local server_name="$sub_domain"
+    [[ -z "$server_name" ]] && server_name="${connection_ipv4:-$connection_ipv6}"
+    [[ -z "$server_name" ]] && server_name="localhost"
     
     # 配置 Nginx - 根据系统选择正确的配置目录
     local nginx_conf_dir="/etc/nginx/conf.d"
@@ -25768,8 +26679,8 @@ _gen_user_share_link() {
     local domain=$(echo "$cfg" | jq -r '.domain // empty')
     
     # 获取 IP 地址
-    local ipv4=$(get_ipv4)
-    local ipv6=$(get_ipv6)
+    local ipv4 ipv6
+    IFS='|' read -r ipv4 ipv6 <<< "$(get_connection_addresses)"
     local country_code=$(get_ip_country "$ipv4")
     [[ -z "$country_code" ]] && country_code=$(get_ip_country "$ipv6")
     
@@ -26783,6 +27694,223 @@ _regenerate_config() {
     fi
 }
 
+# 选择可绑定 Telegram 的受管用户；只有数据库 users 数组中的账号可绑定。
+_select_tg_bind_user() {
+    _select_protocol_for_users || return 1
+    local core="$SELECTED_CORE" proto="$SELECTED_PROTO" users user
+    users=$(db_list_users "$core" "$proto")
+    [[ -n "$users" ]] || { _err "该协议没有可绑定用户"; return 1; }
+
+    echo ""
+    _line
+    echo -e "  ${W}选择绑定用户 - $(get_protocol_name "$proto")${NC}"
+    _line
+    local i=1 user_array=()
+    while IFS= read -r user; do
+        [[ -z "$user" ]] && continue
+        [[ -n "$(db_get_user "$core" "$proto" "$user")" ]] || continue
+        local chat_id
+        chat_id=$(db_get_user_field "$core" "$proto" "$user" "telegram_chat_id")
+        if [[ -n "$chat_id" ]]; then
+            _item "$i" "$user ${D}(已绑定: $chat_id)${NC}"
+        else
+            _item "$i" "$user ${D}(未绑定)${NC}"
+        fi
+        user_array+=("$user")
+        ((i++))
+    done <<< "$users"
+    if [[ ${#user_array[@]} -eq 0 ]]; then
+        _err "该协议没有受管用户；请先在用户管理中添加用户"
+        return 1
+    fi
+    _item "0" "返回"
+    _line
+
+    local choice max=${#user_array[@]}
+    read -rp "  选择用户 [0-$max]: " choice
+    [[ "$choice" == "0" ]] && return 1
+    [[ "$choice" =~ ^[0-9]+$ && "$choice" -ge 1 && "$choice" -le "$max" ]] || {
+        _err "无效选择"
+        return 1
+    }
+    TG_SELECTED_CORE="$core"
+    TG_SELECTED_PROTO="$proto"
+    TG_SELECTED_USER="${user_array[$((choice-1))]}"
+    return 0
+}
+
+_tg_generate_user_bind_code() {
+    _select_tg_bind_user || return
+    local token token_hash expires_at
+    token=$(tg_generate_bind_token)
+    [[ "$token" =~ ^[A-F0-9]{12}$ ]] || { _err "生成绑定码失败"; return; }
+    token_hash=$(tg_hash_bind_token "$token")
+    [[ -n "$token_hash" ]] || { _err "计算绑定码摘要失败"; return; }
+    expires_at=$(( $(date '+%s') + 86400 ))
+
+    if db_set_user_tg_bind_token "$TG_SELECTED_CORE" "$TG_SELECTED_PROTO" "$TG_SELECTED_USER" "$token_hash" "$expires_at"; then
+        echo ""
+        _line
+        _ok "已为用户 $TG_SELECTED_USER 生成一次性绑定码"
+        echo -e "  绑定命令: ${G}/bind ${token}${NC}"
+        echo -e "  ${D}有效期 24 小时；重新生成会使旧绑定码失效${NC}"
+        _line
+    else
+        _err "保存绑定码失败"
+    fi
+}
+
+_tg_show_user_bindings() {
+    local bindings
+    bindings=$(db_list_tg_user_bindings)
+    echo ""
+    _line
+    echo -e "  ${W}Telegram 用户绑定${NC}"
+    _line
+    if [[ -z "$bindings" ]]; then
+        echo -e "  ${D}暂无绑定${NC}"
+        return
+    fi
+    local core proto name chat_id username bound_at index=1
+    while IFS='|' read -r core proto name chat_id username bound_at; do
+        [[ -z "$name" ]] && continue
+        printf "  ${G}%d)${NC} %s / %s / %s\n" "$index" "$(get_protocol_name "$proto")" "$name" "$chat_id"
+        [[ -n "$username" ]] && echo -e "     ${D}@${username}，绑定时间: ${bound_at:-未知}${NC}"
+        ((index++))
+    done <<< "$bindings"
+}
+
+_tg_unbind_user() {
+    local bindings
+    bindings=$(db_list_tg_user_bindings)
+    [[ -n "$bindings" ]] || { _warn "暂无已绑定用户"; return; }
+    local entries=() core proto name chat_id username bound_at index=1
+    echo ""
+    _line
+    echo -e "  ${W}解除 Telegram 用户绑定${NC}"
+    _line
+    while IFS='|' read -r core proto name chat_id username bound_at; do
+        [[ -z "$name" ]] && continue
+        _item "$index" "$(get_protocol_name "$proto") / $name ${D}($chat_id)${NC}"
+        entries+=("$core|$proto|$name")
+        ((index++))
+    done <<< "$bindings"
+    _item "0" "返回"
+    _line
+
+    local choice max=${#entries[@]} selected
+    read -rp "  选择用户 [0-$max]: " choice
+    [[ "$choice" == "0" ]] && return
+    [[ "$choice" =~ ^[0-9]+$ && "$choice" -ge 1 && "$choice" -le "$max" ]] || {
+        _err "无效选择"
+        return
+    }
+    selected="${entries[$((choice-1))]}"
+    IFS='|' read -r core proto name <<< "$selected"
+    if db_clear_user_tg_binding "$core" "$proto" "$name"; then
+        _ok "已解除用户 $name 的 Telegram 绑定"
+    else
+        _err "解绑失败"
+    fi
+}
+
+_configure_tg_user_bot() {
+    init_tg_config
+    while true; do
+        local enabled bot_token bot_status cron_status binding_count
+        enabled=$(tg_get_config "user_bot_enabled")
+        bot_token=$(tg_get_config "bot_token")
+        bot_status="${R}○ 未启用${NC}"
+        [[ "$enabled" == "true" ]] && bot_status="${G}● 已启用${NC}"
+        cron_status="${R}○ 未运行${NC}"
+        if tg_user_bot_cron_entry_exists; then
+            if cron_service_is_active; then
+                cron_status="${G}● 每分钟轮询${NC}"
+            else
+                cron_status="${Y}● 规则存在，但 cron 未运行${NC}"
+            fi
+        fi
+        binding_count=$(db_list_tg_user_bindings | awk 'NF{n++} END{print n+0}')
+
+        _header
+        echo -e "  ${W}TG 用户查询机器人${NC}"
+        _dline
+        echo -e "  用户机器人: $bot_status"
+        echo -e "  轮询任务: $cron_status"
+        echo -e "  已绑定用户: ${G}$binding_count${NC}"
+        echo -e "  Bot Token: ${bot_token:+${G}复用管理员配置${NC}}${bot_token:-${D}未配置${NC}}"
+        [[ "$enabled" != "true" ]] && echo -e "  ${D}提示: 启用后使用 getUpdates 轮询，并移除该 Bot 的现有 webhook${NC}"
+        _line
+        if [[ "$enabled" == "true" ]]; then
+            _item "1" "禁用用户机器人"
+        else
+            _item "1" "启用用户机器人"
+        fi
+        _item "2" "为用户生成绑定码"
+        _item "3" "查看绑定关系"
+        _item "4" "解除用户绑定"
+        _item "5" "立即处理机器人消息"
+        _item "6" "查看机器人命令"
+        _item "0" "返回"
+        _line
+
+        local choice response bot_username
+        read -rp "  请选择: " choice
+        case "$choice" in
+            1)
+                if [[ "$enabled" == "true" ]]; then
+                    tg_set_config "user_bot_enabled" "false"
+                    remove_tg_user_bot_cron
+                    _ok "用户机器人已禁用；现有绑定关系已保留"
+                else
+                    if [[ -z "$bot_token" ]]; then
+                        _err "请先在上级 TG 通知配置中设置 Bot Token"
+                    else
+                        _info "验证 Telegram Bot Token..."
+                        response=$(tg_bot_api_request "getMe")
+                        if ! jq -e '.ok == true' >/dev/null 2>&1 <<< "$response"; then
+                            _err "Bot Token 验证失败"
+                        else
+                            bot_username=$(jq -r '.result.username // empty' <<< "$response")
+                            # getUpdates 与 webhook 不能同时使用；启用时切换到轮询模式。
+                            tg_bot_api_request "deleteWebhook" --data-urlencode "drop_pending_updates=false" >/dev/null 2>&1 || true
+                            tg_bot_api_request "setMyCommands" --data-urlencode 'commands=[{"command":"traffic","description":"查询个人流量"},{"command":"status","description":"查询账号状态"},{"command":"bind","description":"绑定代理账号"},{"command":"unbind","description":"解除绑定"},{"command":"help","description":"查看帮助"}]' >/dev/null 2>&1 || true
+                            tg_set_config "user_bot_enabled" "true"
+                            if setup_tg_user_bot_cron; then
+                                _ok "用户机器人已启用${bot_username:+: @${bot_username}}"
+                                if ! crontab -l 2>/dev/null | grep -q "sync-traffic"; then
+                                    _info "启用流量同步任务，供用户查询最新累计流量..."
+                                    setup_traffic_cron "$(get_traffic_interval)" || \
+                                        _warn "流量同步任务启用失败，机器人将显示数据库中的已有统计"
+                                fi
+                            else
+                                tg_set_config "user_bot_enabled" "false"
+                            fi
+                        fi
+                    fi
+                fi
+                _pause
+                ;;
+            2) _tg_generate_user_bind_code; _pause ;;
+            3) _tg_show_user_bindings; _pause ;;
+            4) _tg_unbind_user; _pause ;;
+            5)
+                if [[ "$enabled" != "true" ]]; then
+                    _err "请先启用用户机器人"
+                elif tg_poll_user_bot; then
+                    _ok "机器人消息处理完成"
+                else
+                    _err "机器人消息处理失败，请检查 $CFG/tg-user-bot.log"
+                fi
+                _pause
+                ;;
+            6) echo ""; tg_user_bot_help_text; _pause ;;
+            0) return ;;
+            *) _err "无效选择" ;;
+        esac
+    done
+}
+
 # 配置 TG 通知
 _configure_tg_notify() {
     init_tg_config
@@ -26794,6 +27922,7 @@ _configure_tg_notify() {
         local chat_id=$(tg_get_config "chat_id")
         local server_name=$(tg_get_config "server_name")
         local daily_enabled=$(tg_get_config "notify_daily")
+        local user_bot_enabled=$(tg_get_config "user_bot_enabled")
         local report_hour=$(tg_get_config "daily_report_hour")
         local report_minute=$(tg_get_config "daily_report_minute")
         report_hour=${report_hour:-9}
@@ -26809,6 +27938,8 @@ _configure_tg_notify() {
         
         local daily_status="${D}○ 关闭${NC}"
         [[ "$daily_enabled" == "true" ]] && daily_status="${G}● 每天 ${report_time}${NC}"
+        local user_bot_status="${D}○ 关闭${NC}"
+        [[ "$user_bot_enabled" == "true" ]] && user_bot_status="${G}● 已启用${NC}"
         
         # 检查定时任务状态
         local cron_status="${R}○ 未启用${NC}"
@@ -26820,6 +27951,7 @@ _configure_tg_notify() {
         echo -e "  TG 通知: $status"
         echo -e "  流量检测: $cron_status"
         echo -e "  每日报告: $daily_status"
+        echo -e "  用户查询机器人: $user_bot_status"
         echo -e "  Bot Token: ${bot_token:+${G}已配置${NC}}${bot_token:-${D}未配置${NC}}"
         echo -e "  Chat ID: ${chat_id:+${G}$chat_id${NC}}${chat_id:-${D}未配置${NC}}"
         echo -e "  服务器名: ${server_name:+${G}$server_name${NC}}${server_name:-${D}未设置${NC}}"
@@ -26836,6 +27968,7 @@ _configure_tg_notify() {
         fi
         _item "5" "设置检测间隔"
         _item "6" "每日报告设置"
+        _item "8" "用户查询机器人"
         _item "0" "返回"
         _line
         
@@ -27022,6 +28155,9 @@ _configure_tg_notify() {
                     fi
                 fi
                 _pause
+                ;;
+            8)
+                _configure_tg_user_bot
                 ;;
             0) return ;;
             *) _err "无效选择" ;;
@@ -27233,8 +28369,12 @@ _configure_traffic_stats() {
         # 检查定时任务状态
         local cron_status="${R}○ 未启用${NC}"
         local current_interval=$(get_traffic_interval)
-        if crontab -l 2>/dev/null | grep -q "sync-traffic"; then
-            cron_status="${G}● 已启用 (每${current_interval}分钟)${NC}"
+        if traffic_cron_entry_exists; then
+            if cron_service_is_active; then
+                cron_status="${G}● 已启用 (每${current_interval}分钟)${NC}"
+            else
+                cron_status="${Y}● 规则存在，但 cron 未运行${NC}"
+            fi
         fi
         
         local notify_percent=$(tg_get_config "notify_quota_percent")
@@ -27246,6 +28386,17 @@ _configure_traffic_stats() {
         
         echo -e "  自动同步: $cron_status"
         echo -e "  检测间隔: ${G}${current_interval} 分钟${NC}"
+        local last_sync sync_result sync_result_text
+        last_sync=$(jq -r '.meta.last_traffic_sync_attempt // .meta.last_traffic_sync // "尚未同步"' "$DB_FILE" 2>/dev/null)
+        sync_result=$(jq -r '.meta.last_traffic_sync_status // "unknown"' "$DB_FILE" 2>/dev/null)
+        case "$sync_result" in
+            ok) sync_result_text="正常" ;;
+            no_core) sync_result_text="核心未运行" ;;
+            no_stats) sync_result_text="未读取到统计" ;;
+            temp_error) sync_result_text="临时文件错误" ;;
+            *) sync_result_text="暂无状态" ;;
+        esac
+        echo -e "  最后执行: ${G}${last_sync}${NC} (${sync_result_text})"
         echo -e "  告警阈值: ${G}${notify_percent}%${NC}"
         echo -e "  月重置流量: ${monthly_reset_status}"
         _line
@@ -28013,6 +29164,65 @@ manage_port_forwarding() {
     done
 }
 
+run_nftables_port_forwarding() {
+    _header
+    echo -e "  ${W}nftables 端口转发${NC}"
+    _line
+
+    local script_url="https://raw.githubusercontent.com/${SCRIPT_SOURCE_REPO}/${SCRIPT_SOURCE_REF}/nft.sh"
+    local script_path="./nft.sh"
+    local staged=""
+    staged=$(mktemp "${TMPDIR:-/tmp}/nft-forward.XXXXXX") || {
+        _err "无法创建 nftables 脚本临时文件"
+        return 1
+    }
+
+    _info "下载 nftables 端口转发脚本..."
+    if ! curl -fL --connect-timeout 10 --max-time 120 --retry 2 \
+        "$script_url" -o "$staged"; then
+        rm -f "$staged"
+        _err "nft.sh 下载失败"
+        return 1
+    fi
+    if [[ ! -s "$staged" ]]; then
+        rm -f "$staged"
+        _err "下载的 nft.sh 为空，已拒绝执行"
+        return 1
+    fi
+    if ! _verify_github_blob "$SCRIPT_SOURCE_REPO" "$SCRIPT_SOURCE_REF" "nft.sh" "$staged"; then
+        rm -f "$staged"
+        _err "nft.sh 与 GitHub 仓库内容校验不一致，已拒绝执行"
+        return 1
+    fi
+    if ! mv -f "$staged" "$script_path" || ! chmod +x "$script_path"; then
+        rm -f "$staged"
+        _err "nft.sh 保存或授权失败"
+        return 1
+    fi
+
+    _ok "nft.sh 下载并校验完成"
+    "$script_path"
+}
+
+manage_port_forwarding_backends() {
+    while true; do
+        _header
+        echo -e "  ${W}端口转发${NC}"
+        _line
+        _item "1" "Realm 转发"
+        _item "2" "nftables 转发"
+        _item "0" "返回"
+        _line
+        read -rp "  请选择: " choice
+        case "$choice" in
+            1) manage_port_forwarding ;;
+            2) run_nftables_port_forwarding; _pause ;;
+            0) return ;;
+            *) _err "无效选择" ;;
+        esac
+    done
+}
+
 #═══════════════════════════════════════════════════════════════════════════════
 # 脚本更新与主入口
 #═══════════════════════════════════════════════════════════════════════════════
@@ -28110,6 +29320,9 @@ main_menu() {
     # 自动更新系统脚本 (确保 vless 命令始终是最新版本)
     _auto_update_system_script
 
+    # 兼容旧定时规则：补齐 cron PATH，并确认守护进程确实运行。
+    repair_scheduled_jobs
+
     # 初始化版本缓存目录
     _init_version_cache
 
@@ -28197,6 +29410,10 @@ main_menu() {
         else
             _item "1" "安装协议"
             echo -e "  ${D}───────────────────────────────────────────${NC}"
+            _item "9" "CF Tunnel(Argo)"
+            _item "10" "端口转发"
+            _item "11" "BBR 网络优化"
+            echo -e "  ${D}───────────────────────────────────────────${NC}"
             local script_update_item="检查脚本更新"
             [[ -n "$script_update_ver" ]] && script_update_item="检查脚本更新 ${Y}[有更新 v${script_update_ver}]${NC}"
             _item "12" "$script_update_item"
@@ -28218,7 +29435,7 @@ main_menu() {
                 7) manage_protocol_services; skip_pause=true ;;
                 8) manage_routing; skip_pause=true ;;
                 9) manage_cloudflare_tunnel; skip_pause=true ;;
-                10) manage_port_forwarding; skip_pause=true ;;
+                10) manage_port_forwarding_backends; skip_pause=true ;;
                 11) enable_bbr; skip_pause=true ;;
                 12) show_logs; skip_pause=true ;;
                 13) do_update ;;
@@ -28229,6 +29446,9 @@ main_menu() {
         else
             case $choice in
                 1) do_install_server; skip_pause=true ;;
+                9) manage_cloudflare_tunnel; skip_pause=true ;;
+                10) manage_port_forwarding_backends; skip_pause=true ;;
+                11) enable_bbr; skip_pause=true ;;
                 12) do_update ;;
                 0) exit 0 ;;
                 *) _err "无效选择"; skip_pause=true ;;
@@ -28244,8 +29464,15 @@ case "${1:-}" in
         # 静默模式：用于定时任务
         check_root
         init_db
-        sync_all_user_traffic "true"
-        exit 0
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] 开始同步流量数据"
+        if sync_all_user_traffic "true"; then
+            sync_status=$(jq -r '.meta.last_traffic_sync_status // "unknown"' "$DB_FILE" 2>/dev/null)
+            sync_updates=$(jq -r '.meta.last_traffic_sync_updates // 0' "$DB_FILE" 2>/dev/null)
+            echo "[$(date '+%Y-%m-%d %H:%M:%S')] 同步结束: status=${sync_status}, updates=${sync_updates}"
+            exit 0
+        fi
+        echo "[$(date '+%Y-%m-%d %H:%M:%S')] 同步失败" >&2
+        exit 1
         ;;
     --show-traffic)
         # 显示流量统计
@@ -28253,6 +29480,14 @@ case "${1:-}" in
         init_db
         get_all_traffic_stats
         exit 0
+        ;;
+    --tg-bot-poll)
+        # 处理 Telegram 用户机器人消息（由 cron 每分钟调用）
+        check_root
+        init_db
+        init_tg_config
+        tg_poll_user_bot
+        exit $?
         ;;
     --check-expire)
         # 检查并禁用过期用户，发送提醒
@@ -28289,6 +29524,7 @@ case "${1:-}" in
         echo "选项:"
         echo "  --sync-traffic       同步流量数据到数据库 (用于定时任务)"
         echo "  --show-traffic       显示实时流量统计"
+        echo "  --tg-bot-poll        处理 Telegram 用户机器人消息 (用于定时任务)"
         echo "  --check-expire       检查并禁用过期用户 (用于定时任务)"
         echo "  --setup-expire-cron  安装过期检查定时任务"
         echo "  --help, -h           显示帮助信息"
