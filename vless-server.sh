@@ -8069,8 +8069,8 @@ readonly SNELL_RELEASE_NOTES_URL="https://kb.nssurge.com/surge-knowledge-base/re
 readonly SNELL_RELEASE_NOTES_ZH_URL="https://kb.nssurge.com/surge-knowledge-base/zh/release-notes/snell.md"
 readonly SNELL_DEFAULT_VERSION="5.0.1"
 readonly SNELL_V6_REPO="passeway/Snell"
-# GitHub API/缓存不可用时的安全回退版本；正常情况下动态读取官方最新预发布版。
-readonly SNELL_V6_DEFAULT_VERSION="6.0.0rc"
+# GitHub 镜像尚未收录 RC2 时，至少使用 Surge 官方发布说明中的 RC2。
+readonly SNELL_V6_DEFAULT_VERSION="6.0.0rc2"
 readonly SNELL_V6_INSTALLED_VERSION_FILE="$CFG/.snell-v6-installed-version"
 
 # 获取文件修改时间戳（跨平台兼容）
@@ -8741,10 +8741,18 @@ _get_snell_v6_stable_version() {
 }
 
 _get_snell_v6_prerelease_version() {
-    _get_snell_v6_channel_version prerelease "${1:-true}" "${2:-false}"
+    local detected
+    detected=$(_get_snell_v6_channel_version prerelease "${1:-true}" "${2:-false}" 2>/dev/null || true)
+
+    # passeway/Snell 当前只收录到 6.0.0rc，而 Surge 官方发布说明已提供 RC2。
+    # 不让镜像中的旧 Beta/RC 覆盖本项目已验证的 RC2；未来 RC3 等新版本仍可透传。
+    case "$detected" in
+        ""|无|6.0.0b*|6.0.0rc|6.0.0rc1) echo "$SNELL_V6_DEFAULT_VERSION" ;;
+        *) echo "$detected" ;;
+    esac
 }
 
-# 推荐版本优先使用 v6 稳定版；尚无 v6 稳定版时才使用预发布版和固定回退。
+# 推荐版本优先使用 v6 稳定版；尚无 v6 稳定版时使用 RC2 或更新的预发布版。
 _get_snell_v6_latest_version() {
     local use_cache="${1:-true}" force="${2:-false}"
     local stable_version prerelease_version
@@ -8944,6 +8952,8 @@ _snell_release_sha256() {
         6.0.0b4:aarch64) pinned="2c957ee6bb37ce4b1df2b6a23e652b75546d10bc4f0443a2928e5834ae0429af" ;;
         6.0.0rc:amd64)  pinned="21c4aa6b4a208236f33e9923603acd8a26534a02104aed40496ddf77949dfb4b" ;;
         6.0.0rc:aarch64) pinned="2b47d111d648648cf6845886433a7a93404ffe8d68a8e447058de6f7eca0d1a7" ;;
+        6.0.0rc2:amd64)  pinned="8a9c4463ca87cfa5eaa37c6af0d37ab93ea275aa12391985bb2a375ca3abd7f2" ;;
+        6.0.0rc2:aarch64) pinned="a0b2915cbc77dc3baf8fa069e741c20808d8a10c3a8a93e709a0a580645c3bd7" ;;
     esac
 
     if [[ -n "$pinned" ]]; then
