@@ -573,6 +573,12 @@ gen_password() {
     head -c 32 /dev/urandom 2>/dev/null | base64 | tr -dc 'a-zA-Z0-9' | head -c "$length"
 }
 
+# 可安全用于 URI、Snell/Caddy 配置和 JSON 字段的凭据字符集。
+_is_safe_credential() {
+    local value="$1"
+    [[ -n "$value" && "$value" =~ ^[a-zA-Z0-9._~!@%+=,-]+$ ]]
+}
+
 # 询问密码（支持自定义或自动生成）
 # 用法: ask_password [长度] [提示文本]
 ask_password() {
@@ -587,9 +593,8 @@ ask_password() {
             password=$(gen_password "$length")
             break
         fi
-        # 该安全字符集可直接用于 URI、Snell/Caddy 配置和 JSON 字段，
         # 排除空白、引号、反斜杠及 shell/config 分隔符。
-        if [[ "$password" =~ ^[a-zA-Z0-9._~!@%+=,-]+$ ]]; then
+        if _is_safe_credential "$password"; then
             break
         fi
         _err "${prompt}只能包含字母、数字及 . _ ~ ! @ % + = , -"
@@ -10704,6 +10709,171 @@ _build_singbox_ruleset_defs() {
         defs=$(echo "$defs" | jq --arg tag "$tag" --arg path "$path" '. + [{type: "local", tag: $tag, format: "binary", path: $path}]')
     done
     echo "$defs"
+}
+
+# 校验 Mihomo 管理的单条 Snell 配置。
+_validate_mihomo_record() {
+    local protocol="$1" record="$2" expected_version psk sni stls_password
+    case "$protocol" in
+        snell|snell-shadowtls) expected_version=4 ;;
+        snell-v5|snell-v5-shadowtls) expected_version=5 ;;
+        *) return 1 ;;
+    esac
+    printf '%s\n' "$record" | jq -e --argjson version "$expected_version" '
+        type == "object" and .version == $version and
+        (.port | type) == "number" and (.port | floor) == .port and
+        .port >= 1 and .port <= 65535 and
+        (.psk | type) == "string" and (.psk | length) > 0
+    ' >/dev/null 2>&1 || return 1
+    psk=$(printf '%s\n' "$record" | jq -r '.psk') || return 1
+    _is_safe_credential "$psk" || return 1
+
+    if [[ "$protocol" == *-shadowtls ]]; then
+        printf '%s\n' "$record" | jq -e '
+            (.sni | type) == "string" and (.sni | length) > 0 and
+            (.stls_password | type) == "string" and (.stls_password | length) > 0
+        ' >/dev/null 2>&1 || return 1
+        sni=$(printf '%s\n' "$record" | jq -r '.sni') || return 1
+        stls_password=$(printf '%s\n' "$record" | jq -r '.stls_password') || return 1
+        _is_valid_dns_name "$sni" || return 1
+        _is_safe_credential "$stls_password" || return 1
+    fi
+}
+
+# 将一条数据库记录转换为 Mihomo listener。
+_build_mihomo_listener() {
+    local protocol="$1" record="$2" listen_addr="$3"
+    local port psk version name sni stls_password
+    port=$(printf '%s\n' "$record" | jq -r '.port') || return 1
+    psk=$(printf '%s\n' "$record" | jq -r '.psk') || return 1
+    version=$(printf '%s\n' "$record" | jq -r '.version') || return 1
+
+    case "$protocol" in
+        snell) name="snell-v4-${port}" ;;
+        snell-v5) name="snell-v5-${port}" ;;
+        snell-shadowtls) name="snell-v4-stls-${port}" ;;
+        snell-v5-shadowtls) name="snell-v5-stls-${port}" ;;
+        *) return 1 ;;
+    esac
+
+    if [[ "$protocol" == *-shadowtls ]]; then
+        sni=$(printf '%s\n' "$record" | jq -r '.sni') || return 1
+        stls_password=$(printf '%s\n' "$record" | jq -r '.stls_password') || return 1
+        jq -n \
+            --arg name "$name" \
+            --arg listen "$listen_addr" \
+            --arg psk "$psk" \
+            --arg sni "$sni" \
+            --arg stls_password "$stls_password" \
+            --argjson port "$port" \
+            --argjson version "$version" \
+            '{
+                name: $name,
+                type: "snell",
+                listen: $listen,
+                port: $port,
+                psk: $psk,
+                version: $version,
+                udp: true,
+                "shadow-tls": {
+                    enable: true,
+                    version: 3,
+                    users: [{name: $name, password: $stls_password}],
+                    handshake: {dest: ($sni + ":443")}
+                }
+            }'
+    else
+        jq -n \
+            --arg name "$name" \
+            --arg listen "$listen_addr" \
+            --arg psk "$psk" \
+            --argjson port "$port" \
+            --argjson version "$version" \
+            '{
+                name: $name,
+                type: "snell",
+                listen: $listen,
+                port: $port,
+                psk: $psk,
+                version: $version,
+                udp: true
+            }'
+    fi
+}
+
+# 输出所有 Mihomo listener 端口，每行一个。
+mihomo_list_ports() {
+    local db_file="${1:-$DB_FILE}"
+    [[ -f "$db_file" ]] || return 1
+    jq -r '
+        (.mihomo // {}) as $mihomo |
+        ["snell", "snell-v5", "snell-shadowtls", "snell-v5-shadowtls"][] as $protocol |
+        ($mihomo[$protocol] // empty) |
+        if type == "array" then .[] else . end |
+        .port // empty
+    ' "$db_file" 2>/dev/null
+}
+
+# 从数据库重建 Mihomo 的完整配置；JSON 同时是有效 YAML。
+generate_mihomo_config() {
+    local db_file="${1:-$DB_FILE}" output_file="${2:-$MIHOMO_CONFIG}"
+    local listen_addr log_level listeners protocol records record listener port config tmp
+    local success_count=0
+    local -A seen_ports=()
+
+    [[ -f "$db_file" ]] || return 1
+    jq empty "$db_file" >/dev/null 2>&1 || return 1
+    listen_addr=$(_listen_addr) || return 1
+    log_level=$(jq -r '.meta.mihomo_log_level // "warning"' "$db_file") || return 1
+    case "$log_level" in
+        warning|debug) ;;
+        *) log_level="warning" ;;
+    esac
+
+    listeners='[]'
+    for protocol in snell snell-v5 snell-shadowtls snell-v5-shadowtls; do
+        records=$(jq -c --arg protocol "$protocol" '
+            .mihomo[$protocol] // empty |
+            if type == "array" then .[] else . end
+        ' "$db_file") || return 1
+        while IFS= read -r record; do
+            [[ -n "$record" ]] || continue
+            _validate_mihomo_record "$protocol" "$record" || return 1
+            port=$(printf '%s\n' "$record" | jq -r '.port') || return 1
+            [[ -z "${seen_ports[$port]:-}" ]] || return 1
+            seen_ports[$port]=1
+            listener=$(_build_mihomo_listener "$protocol" "$record" "$listen_addr") || return 1
+            listeners=$(jq -n --argjson current "$listeners" --argjson item "$listener" '$current + [$item]') || return 1
+            success_count=$((success_count + 1))
+        done <<< "$records"
+    done
+    [[ "$success_count" -gt 0 ]] || return 1
+
+    config=$(jq -n --arg log_level "$log_level" --argjson listeners "$listeners" '{
+        mode: "rule",
+        "log-level": $log_level,
+        ipv6: true,
+        listeners: $listeners,
+        rules: ["MATCH,DIRECT"]
+    }') || return 1
+
+    mkdir -p "$(dirname "$output_file")" || return 1
+    tmp=$(mktemp "${output_file}.tmp.XXXXXX") || return 1
+    if ! printf '%s\n' "$config" >"$tmp" ||
+       ! chmod 600 "$tmp" ||
+       ! jq empty "$tmp" >/dev/null 2>&1 ||
+       ! mv "$tmp" "$output_file"; then
+        rm -f "$tmp"
+        return 1
+    fi
+}
+
+validate_mihomo_config() {
+    local config_file="${1:-$MIHOMO_CONFIG}"
+    local binary="${2:-$MIHOMO_BIN}"
+    jq empty "$config_file" >/dev/null 2>&1 || return 1
+    [[ -x "$binary" ]] || return 1
+    "$binary" -t -f "$config_file" >/dev/null 2>&1
 }
 
 # 生成 Sing-box 统一配置 (Hy2 + TUIC 共用一个进程)
