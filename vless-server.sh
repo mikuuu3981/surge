@@ -10,9 +10,15 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
         echo "用法: $0 [选项]"
         echo "选项: --sync-traffic, --show-traffic, --tg-bot-poll, --check-expire, --setup-expire-cron, --help"
         echo "运行功能需要 Bash 4.1 或更高版本。"
+        if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+            return 0
+        fi
         exit 0
     fi
     echo "错误: 本脚本需要 Bash 4.1 或更高版本（当前: ${BASH_VERSION:-unknown}）" >&2
+    if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+        return 1
+    fi
     exit 1
 fi
 #═══════════════════════════════════════════════════════════════════════════════
@@ -47,7 +53,16 @@ fi
 readonly SCRIPT_SOURCE_REF
 readonly SCRIPT_SOURCE_PATH="vless-server.sh"
 readonly SCRIPT_RAW_URL="https://raw.githubusercontent.com/${SCRIPT_SOURCE_REPO}/${SCRIPT_SOURCE_REF}/${SCRIPT_SOURCE_PATH}"
-readonly CFG="/etc/vless-reality"
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+    CFG="${VLESS_TEST_CFG:-/etc/vless-reality}"
+    MIHOMO_BIN="${VLESS_TEST_MIHOMO_BIN:-/usr/local/bin/vless-mihomo}"
+else
+    CFG="/etc/vless-reality"
+    MIHOMO_BIN="/usr/local/bin/vless-mihomo"
+fi
+readonly CFG MIHOMO_BIN
+readonly MIHOMO_CONFIG="$CFG/mihomo.yaml"
+readonly MIHOMO_MIGRATION_MARKER="$CFG/.mihomo-snell-migrated-v1"
 readonly ACME_DEFAULT_EMAIL="acme@vaio.com"
 
 # curl 超时常量
@@ -156,17 +171,31 @@ init_db() {
     # 允许 Nginx 按随机订阅路径穿越目录，但禁止普通用户列出目录内容。
     chmod 711 "$CFG" 2>/dev/null || true
     _db_lock_acquire || return 1
+    local now tmp
     if [[ -f "$DB_FILE" ]]; then
         chmod 600 "$DB_FILE" 2>/dev/null || true
+        if jq -e '(.xray | type) == "object" and (.singbox | type) == "object" and (.mihomo | type) == "object"' \
+          "$DB_FILE" >/dev/null 2>&1; then
+            _db_lock_release
+            return 0
+        fi
+        tmp=$(mktemp "${DB_FILE}.upgrade.XXXXXX") || { _db_lock_release; return 1; }
+        if jq '.xray = (if (.xray | type) == "object" then .xray else {} end) |
+               .singbox = (if (.singbox | type) == "object" then .singbox else {} end) |
+               .mihomo = (if (.mihomo | type) == "object" then .mihomo else {} end)' \
+          "$DB_FILE" >"$tmp" 2>/dev/null && chmod 600 "$tmp" && mv "$tmp" "$DB_FILE"; then
+            _db_lock_release
+            return 0
+        fi
+        rm -f "$tmp"
         _db_lock_release
-        return 0
+        return 1
     fi
-    local now tmp
     # Alpine busybox date 不支持 -Iseconds，使用兼容格式
     now=$(date '+%Y-%m-%dT%H:%M:%S%z' 2>/dev/null || date '+%Y-%m-%dT%H:%M:%S')
     tmp=$(mktemp "${DB_FILE}.init.XXXXXX") || { _db_lock_release; return 1; }
     if jq -n --arg v "4.0.0" --arg t "$now" \
-      '{version:$v,xray:{},singbox:{},meta:{created:$t,updated:$t}}' >"$tmp" 2>/dev/null; then
+      '{version:$v,xray:{},singbox:{},mihomo:{},meta:{created:$t,updated:$t}}' >"$tmp" 2>/dev/null; then
         if chmod 600 "$tmp" && mv "$tmp" "$DB_FILE"; then
             _db_lock_release
             return 0
@@ -176,7 +205,7 @@ init_db() {
         return 1
     fi
     # jq 失败时使用简单方式创建
-    if printf '%s\n' '{"version":"4.0.0","xray":{},"singbox":{},"meta":{}}' >"$tmp" &&
+    if printf '%s\n' '{"version":"4.0.0","xray":{},"singbox":{},"mihomo":{},"meta":{}}' >"$tmp" &&
        chmod 600 "$tmp" && mv "$tmp" "$DB_FILE"; then
         _db_lock_release
         return 0
@@ -410,7 +439,11 @@ db_list_protocols() {
 # 获取所有已安装协议
 db_get_all_protocols() {
     [[ ! -f "$DB_FILE" ]] && return 1
-    { jq -r '.xray | keys[]' "$DB_FILE" 2>/dev/null; jq -r '.singbox | keys[]' "$DB_FILE" 2>/dev/null; } | sort -u
+    {
+        jq -r '(.xray // {}) | keys[]' "$DB_FILE" 2>/dev/null
+        jq -r '(.singbox // {}) | keys[]' "$DB_FILE" 2>/dev/null
+        jq -r '(.mihomo // {}) | keys[]' "$DB_FILE" 2>/dev/null
+    } | sort -u
 }
 
 #═══════════════════════════════════════════════════════════════════════════════
@@ -3717,8 +3750,23 @@ SINGBOX_V2RAY_API_PORT="10086"
 XRAY_PROTOCOLS="vless vless-xhttp vless-xhttp-cdn vless-ws vless-ws-notls vmess-ws vless-vision trojan trojan-ws socks ss2022 ss-legacy"
 # Sing-box 管理的协议 (原独立协议，现统一由 Sing-box 处理)
 SINGBOX_PROTOCOLS="hy2 tuic anytls"
-# 仍需独立进程的协议 (Snell 等闭源协议)
-STANDALONE_PROTOCOLS="snell snell-v5 snell-v6 snell-shadowtls snell-v5-shadowtls ss2022-shadowtls naive"
+# Mihomo 统一管理的 Snell v4/v5 协议
+MIHOMO_PROTOCOLS="snell snell-v5 snell-shadowtls snell-v5-shadowtls"
+# 仍需独立进程的协议
+STANDALONE_PROTOCOLS="snell-v6 ss2022-shadowtls naive"
+
+protocol_core() {
+    local protocol="$1"
+    if [[ " $MIHOMO_PROTOCOLS " == *" $protocol "* ]]; then
+        echo mihomo
+    elif [[ " $SINGBOX_PROTOCOLS " == *" $protocol "* ]]; then
+        echo singbox
+    elif [[ " $STANDALONE_PROTOCOLS " == *" $protocol "* ]]; then
+        echo standalone
+    else
+        echo xray
+    fi
+}
 
 #═══════════════════════════════════════════════════════════════════════════════
 #  表驱动元数据 (协议/服务/进程/启动命令)
@@ -3789,11 +3837,10 @@ register_protocol() {
     local protocol="$1"
     local config_json="$2"
     
-    # 确定核心类型
-    local core="xray"
-    if [[ " $SINGBOX_PROTOCOLS " == *" $protocol "* ]]; then
-        core="singbox"
-    fi
+    # 确定核心类型；独立协议继续沿用 xray 数据库命名空间。
+    local core
+    core=$(protocol_core "$protocol")
+    [[ "$core" == "standalone" ]] && core="xray"
     
     # 获取端口
     local port
@@ -3822,11 +3869,16 @@ register_protocol() {
 }
 
 unregister_protocol() {
-    local protocol=$1
-    
-    # 从数据库删除
-    db_del "xray" "$protocol" 2>/dev/null
-    db_del "singbox" "$protocol" 2>/dev/null
+    local protocol="$1" core
+    core=$(protocol_core "$protocol")
+
+    # 独立协议继续存放在 xray；Mihomo 协议同时清理迁移前的旧记录。
+    if [[ "$core" == "standalone" ]]; then
+        db_del "xray" "$protocol" 2>/dev/null
+    else
+        db_del "$core" "$protocol" 2>/dev/null
+        [[ "$core" == "mihomo" ]] && db_del "xray" "$protocol" 2>/dev/null
+    fi
 }
 
 get_installed_protocols() {
@@ -3837,10 +3889,13 @@ get_installed_protocols() {
 }
 
 is_protocol_installed() {
-    local protocol=$1
-    # 检查数据库
-    db_exists "xray" "$protocol" && return 0
-    db_exists "singbox" "$protocol" && return 0
+    local protocol="$1" core
+    core=$(protocol_core "$protocol")
+    [[ "$core" == "standalone" ]] && core="xray"
+
+    db_exists "$core" "$protocol" && return 0
+    # 自动迁移实现前，继续识别旧 xray 命名空间中的 Snell 记录。
+    [[ "$core" == "mihomo" ]] && db_exists "xray" "$protocol" && return 0
     return 1
 }
 
@@ -3854,15 +3909,10 @@ filter_installed() { # filter_installed "proto1 proto2 ..."
 
 get_xray_protocols()       { filter_installed "$XRAY_PROTOCOLS"; }
 get_singbox_protocols()    { filter_installed "$SINGBOX_PROTOCOLS"; }
-get_standalone_protocols() {
-    # 独立协议使用 db_exists 逐个检测，避免 grep 匹配问题
-    local p
-    for p in $STANDALONE_PROTOCOLS; do
-        if db_exists "xray" "$p" || db_exists "singbox" "$p"; then
-            echo "$p"
-        fi
-    done
+get_mihomo_protocols() {
+    filter_installed "$MIHOMO_PROTOCOLS"
 }
+get_standalone_protocols() { filter_installed "$STANDALONE_PROTOCOLS"; }
 
 # 生成用户级路由规则
 # 遍历所有用户，为有自定义routing的用户生成Xray routing rules
@@ -6026,11 +6076,10 @@ ask_port() {
             fi
         fi
         
-        # 确定当前协议的核心类型
-        local current_core="xray"
-        if [[ " $SINGBOX_PROTOCOLS " == *" $protocol "* ]]; then
-            current_core="singbox"
-        fi
+        # 确定当前协议的数据库核心类型
+        local current_core
+        current_core=$(protocol_core "$protocol")
+        [[ "$current_core" == "standalone" ]] && current_core="xray"
         
         # 检查端口冲突（跨协议检测）
         if ! check_port_conflict "$custom_port" "$protocol" "$current_core"; then
@@ -6165,29 +6214,20 @@ handle_existing_protocol() {
 # 返回: 0=未占用, 1=已占用
 check_port_conflict() {
     local check_port="$1" current_protocol="$2" current_core="$3"
-    
-    # 检查 xray 协议
-    for proto in $(db_list_protocols "xray"); do
-        [[ "$proto" == "$current_protocol" && "$current_core" == "xray" ]] && continue
-        
-        local ports=$(db_list_ports "xray" "$proto")
-        if echo "$ports" | grep -q "^${check_port}$"; then
-            echo -e "${RED}错误: 端口 $check_port 已被协议 $proto 占用${NC}"
-            return 1
-        fi
+    local core proto ports
+
+    for core in xray singbox mihomo; do
+        for proto in $(db_list_protocols "$core"); do
+            [[ "$proto" == "$current_protocol" && "$current_core" == "$core" ]] && continue
+
+            ports=$(db_list_ports "$core" "$proto")
+            if echo "$ports" | grep -q "^${check_port}$"; then
+                echo -e "${RED}错误: 端口 $check_port 已被协议 $proto 占用${NC}"
+                return 1
+            fi
+        done
     done
-    
-    # 检查 singbox 协议
-    for proto in $(db_list_protocols "singbox"); do
-        [[ "$proto" == "$current_protocol" && "$current_core" == "singbox" ]] && continue
-        
-        local ports=$(db_list_ports "singbox" "$proto")
-        if echo "$ports" | grep -q "^${check_port}$"; then
-            echo -e "${RED}错误: 端口 $check_port 已被协议 $proto 占用${NC}"
-            return 1
-        fi
-    done
-    
+
     return 0
 }
 
@@ -12889,22 +12929,19 @@ create_service() {
 
     [[ -z "$service_name" ]] && { _err "未知协议: $protocol"; return 1; }
 
-    # 检查配置是否存在（支持 xray 和 singbox 核心）
-    _need_cfg() { 
-        local proto="$1" name="$2"
-        db_exists "xray" "$proto" || db_exists "singbox" "$proto" || { _err "$name 配置不存在"; return 1; }
+    # 检查配置是否存在
+    _need_cfg() {
+        local proto="$1" name="$2" core
+        core=$(_get_proto_core "$proto")
+        db_exists "$core" "$proto" || { _err "$name 配置不存在"; return 1; }
     }
     
-    # 获取协议配置所在的核心
-    # 与 register_protocol 保持一致：SINGBOX_PROTOCOLS 以外的协议都保存在 xray 核心
+    # 获取协议配置所在的数据库核心
     _get_proto_core() {
-        local proto="$1"
-        # 只有 hy2/tuic 保存在 singbox 核心，其他协议（包括所有 shadowtls）都在 xray
-        if [[ " $SINGBOX_PROTOCOLS " == *" $proto "* ]]; then
-            echo "singbox"
-        else
-            echo "xray"
-        fi
+        local proto="$1" core
+        core=$(protocol_core "$proto")
+        [[ "$core" == "standalone" ]] && core="xray"
+        echo "$core"
     }
 
     case "$kind" in
@@ -20365,11 +20402,10 @@ show_services_status() {
 select_port_to_uninstall() {
     local protocol="$1"
     
-    # 确定核心类型
-    local core="xray"
-    if [[ " $SINGBOX_PROTOCOLS " == *" $protocol "* ]]; then
-        core="singbox"
-    fi
+    # 确定数据库核心类型
+    local core
+    core=$(protocol_core "$protocol")
+    [[ "$core" == "standalone" ]] && core="xray"
     
     # 获取端口列表
     local ports=$(db_list_ports "$core" "$protocol")
@@ -20452,12 +20488,8 @@ uninstall_specific_protocol() {
     select_port_to_uninstall "$selected_protocol" || return 1
     
     # 确定核心类型
-    local core="xray"
-    if [[ " $SINGBOX_PROTOCOLS " == *" $selected_protocol "* ]]; then
-        core="singbox"
-    elif [[ " $STANDALONE_PROTOCOLS " == *" $selected_protocol "* ]]; then
-        core="standalone"
-    fi
+    local core
+    core=$(protocol_core "$selected_protocol")
     
     echo -e "  将卸载: ${R}$(get_protocol_name $selected_protocol)${NC}"
     read -rp "  确认卸载? [y/N]: " confirm
@@ -21025,12 +21057,8 @@ do_install_server() {
     [[ -z "$protocol" ]] && return 1
     
     # 确定核心类型
-    local core="xray"
-    if [[ " $SINGBOX_PROTOCOLS " == *" $protocol "* ]]; then
-        core="singbox"
-    elif [[ " $STANDALONE_PROTOCOLS " == *" $protocol "* ]]; then
-        core="standalone"
-    fi
+    local core
+    core=$(protocol_core "$protocol")
     
     # 检查该协议是否已安装
     if is_protocol_installed "$protocol"; then
@@ -29469,7 +29497,8 @@ main_menu() {
 }
 
 # 命令行参数处理
-case "${1:-}" in
+dispatch_cli() {
+    case "${1:-}" in
     --sync-traffic)
         # 静默模式：用于定时任务
         check_root
@@ -29551,4 +29580,9 @@ case "${1:-}" in
         echo "使用 --help 查看帮助"
         exit 1
         ;;
-esac
+    esac
+}
+
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    dispatch_cli "$@"
+fi
