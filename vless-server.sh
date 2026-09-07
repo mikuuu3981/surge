@@ -8121,6 +8121,8 @@ readonly SCRIPT_VERSION_CACHE_FILE="$VERSION_CACHE_DIR/.script_version"
 readonly SNELL_RELEASE_NOTES_URL="https://kb.nssurge.com/surge-knowledge-base/release-notes/snell.md"
 readonly SNELL_RELEASE_NOTES_ZH_URL="https://kb.nssurge.com/surge-knowledge-base/zh/release-notes/snell.md"
 readonly SNELL_DEFAULT_VERSION="5.0.1"
+readonly MIHOMO_REPO="MetaCubeX/mihomo"
+readonly MIHOMO_MIN_VERSION="1.19.28"
 readonly SNELL_V6_REPO="passeway/Snell"
 # GitHub 镜像尚未收录 RC2 时，至少使用 Surge 官方发布说明中的 RC2。
 readonly SNELL_V6_DEFAULT_VERSION="6.0.0rc2"
@@ -8552,25 +8554,36 @@ _update_prerelease_cache_async() {
 # 后台异步更新所有版本缓存（稳定版+测试版，一次请求）
 _update_all_versions_async() {
     local repo="$1"
-    local stable_cache="$VERSION_CACHE_DIR/$(echo "$repo" | tr '/' '_')"
-    local prerelease_cache="$VERSION_CACHE_DIR/$(echo "$repo" | tr '/' '_')_prerelease"
+    local repo_safe
+    repo_safe=$(echo "$repo" | tr '/' '_')
+    local stable_cache="$VERSION_CACHE_DIR/$repo_safe"
+    local prerelease_cache="$VERSION_CACHE_DIR/${repo_safe}_prerelease"
+    local unavailable_file="$VERSION_CACHE_DIR/${repo_safe}_unavailable"
     if _is_cache_fresh "$stable_cache" && _is_cache_fresh "$prerelease_cache"; then
         return 0
     fi
     (
         # 一次请求获取最近10个版本（足够覆盖最新稳定版和测试版）
-        local releases
-        releases=$(curl -sL --connect-timeout 5 --max-time 10 "https://api.github.com/repos/$repo/releases?per_page=10" 2>/dev/null)
+        local response http_code releases stable_version prerelease_version
+        response=$(curl -sL --connect-timeout 5 --max-time 10 -w "\n%{http_code}" \
+            "https://api.github.com/repos/$repo/releases?per_page=10" 2>/dev/null)
+        http_code=$(printf '%s' "$response" | tail -n 1)
+        releases=$(printf '%s' "$response" | sed '$d')
+        if [[ "$http_code" == "404" ]]; then
+            echo "not_found" > "$unavailable_file" 2>/dev/null || true
+            return 0
+        fi
         if [[ -n "$releases" ]]; then
             # 提取稳定版（第一个非prerelease）
-            local stable_version
-            stable_version=$(echo "$releases" | jq -r '[.[] | select(.prerelease == false)][0].tag_name // empty' 2>/dev/null | sed 's/^v//')
+            stable_version=$(printf '%s' "$releases" | jq -r '[.[] | select(.prerelease == false)][0].tag_name // empty' 2>/dev/null | sed 's/^v//')
             [[ -n "$stable_version" ]] && echo "$stable_version" > "$stable_cache" 2>/dev/null
 
             # 提取测试版（第一个prerelease）
-            local prerelease_version
-            prerelease_version=$(echo "$releases" | jq -r '[.[] | select(.prerelease == true)][0].tag_name // empty' 2>/dev/null | sed 's/^v//')
+            prerelease_version=$(printf '%s' "$releases" | jq -r '[.[] | select(.prerelease == true)][0].tag_name // empty' 2>/dev/null | sed 's/^v//')
             [[ -n "$prerelease_version" ]] && echo "$prerelease_version" > "$prerelease_cache" 2>/dev/null
+            if [[ -n "$stable_version" || -n "$prerelease_version" ]]; then
+                rm -f "$unavailable_file" 2>/dev/null || true
+            fi
         fi
     ) &
 }
@@ -8632,6 +8645,7 @@ _get_latest_version() {
 _check_version_updates_async() {
     local xray_ver="$1"
     local singbox_ver="$2"
+    local mihomo_ver="${3:-未安装}"
     local update_flag_file="$VERSION_CACHE_DIR/.update_available"
 
     # 清除旧的更新标记
@@ -8639,7 +8653,7 @@ _check_version_updates_async() {
 
     (
         local has_update=false
-        local xray_cached="" singbox_cached=""
+        local xray_cached="" singbox_cached="" mihomo_cached=""
 
         # 优先从缓存获取最新版本号（立即可用）
         if [[ "$xray_ver" != "未安装" ]] && [[ "$xray_ver" != "未知" ]]; then
@@ -8658,6 +8672,14 @@ _check_version_updates_async() {
             fi
         fi
 
+        if [[ "$mihomo_ver" != "未安装" ]] && [[ "$mihomo_ver" != "未知" ]]; then
+            mihomo_cached=$(_get_cached_version "$MIHOMO_REPO" 2>/dev/null)
+            if [[ -n "$mihomo_cached" ]] && [[ "$mihomo_ver" != "$mihomo_cached" ]]; then
+                has_update=true
+                echo "mihomo:$mihomo_cached" >> "$update_flag_file"
+            fi
+        fi
+
         # 如果缓存中有更新，立即标记完成（极速显示）
         if [[ "$has_update" == "true" ]]; then
             touch "${update_flag_file}.done"
@@ -8669,6 +8691,9 @@ _check_version_updates_async() {
         fi
         if [[ "$singbox_ver" != "未安装" ]] && [[ "$singbox_ver" != "未知" ]]; then
             _update_version_cache_async "SagerNet/sing-box"
+        fi
+        if [[ "$mihomo_ver" != "未安装" ]] && [[ "$mihomo_ver" != "未知" ]]; then
+            _update_version_cache_async "$MIHOMO_REPO"
         fi
     ) &
 }
@@ -9133,9 +9158,14 @@ _install_binary() {
     local channel="${5:-stable}" force="${6:-false}" version_override="${7:-}"
     local exists=false action="安装" channel_label="稳定版"
     
-    if check_cmd "$name"; then
+    if [[ "$install_kind" == "mihomo" ]]; then
+        [[ -x "$MIHOMO_BIN" ]] && exists=true
+    elif check_cmd "$name"; then
         exists=true
-        [[ "$force" != "true" ]] && { _ok "$name 已安装"; return 0; }
+    fi
+    if [[ "$exists" == "true" && "$force" != "true" ]]; then
+        _ok "$name 已安装"
+        return 0
     fi
     
     [[ "$exists" == "true" ]] && action="更新"
@@ -9187,9 +9217,9 @@ _install_binary() {
     # 使用固定占位符安全地构建 URL。
     local url="${url_pattern//\$version/$version}"
     url="${url//\$\{version\}/$version}"
-    url="${url//\$\{xarch\}/$xarch}"
-    url="${url//\$\{sarch\}/$sarch}"
-    url="${url//\$\{aarch\}/$aarch}"
+    [[ "$url" == *'${xarch}'* ]] && url="${url//\$\{xarch\}/$xarch}"
+    [[ "$url" == *'${sarch}'* ]] && url="${url//\$\{sarch\}/$sarch}"
+    [[ "$url" == *'${aarch}'* ]] && url="${url//\$\{aarch\}/$aarch}"
 
     # 下载并验证
     if ! curl -fsSL --connect-timeout 60 --retry 2 -o "$tmp/pkg" -- "$url"; then
@@ -9199,10 +9229,12 @@ _install_binary() {
     fi
 
     if ! _verify_github_release_asset "$repo" "$version" "$url" "$tmp/pkg"; then
-        if [[ "${ALLOW_UNVERIFIED_DOWNLOADS:-0}" != "1" ]]; then
+        if [[ "$install_kind" == "mihomo" || "${ALLOW_UNVERIFIED_DOWNLOADS:-0}" != "1" ]]; then
             rm -rf "$tmp"
             _err "$name 下载包无法通过发布方 SHA-256 校验，已拒绝安装"
-            _warn "仅在你已自行核验来源时，才可临时设置 ALLOW_UNVERIFIED_DOWNLOADS=1"
+            if [[ "$install_kind" != "mihomo" ]]; then
+                _warn "仅在你已自行核验来源时，才可临时设置 ALLOW_UNVERIFIED_DOWNLOADS=1"
+            fi
             return 1
         fi
         _warn "已按显式设置跳过 $name 的完整性校验"
@@ -9226,6 +9258,12 @@ _install_binary() {
             singbox_bin=$(find "$tmp" -name sing-box -type f -print -quit) &&
             [[ -n "$singbox_bin" ]] &&
             install -m 755 "$singbox_bin" /usr/local/bin/sing-box &&
+            install_ok=true
+            ;;
+        mihomo)
+            gzip -dc "$tmp/pkg" >"$tmp/vless-mihomo" &&
+            chmod 755 "$tmp/vless-mihomo" &&
+            install -m 755 "$tmp/vless-mihomo" "$MIHOMO_BIN" &&
             install_ok=true
             ;;
         anytls)
@@ -9287,8 +9325,42 @@ install_singbox() {
         "$channel" "$force" "$version_override"
 }
 
+install_mihomo() {
+    local channel="${1:-stable}"
+    local force="${2:-false}"
+    local version="${3:-}"
+
+    if [[ -z "$version" ]]; then
+        if [[ "$channel" == "prerelease" || "$channel" == "test" || "$channel" == "beta" ]]; then
+            version=$(_get_latest_prerelease_version "$MIHOMO_REPO" "true" 2>/dev/null || true)
+            [[ -z "$version" ]] && version=$(_force_get_cached_prerelease_version "$MIHOMO_REPO" 2>/dev/null || true)
+        else
+            version=$(_get_latest_version "$MIHOMO_REPO" "true" 2>/dev/null || true)
+            [[ -z "$version" ]] && version=$(_force_get_cached_version "$MIHOMO_REPO" 2>/dev/null || true)
+        fi
+    fi
+    version="${version#v}"
+    if [[ -z "$version" ]]; then
+        _err "获取 Mihomo 版本失败"
+        return 1
+    fi
+    if ! _is_mihomo_supported_version "$version"; then
+        _err "Mihomo 版本 v${version} 不受支持（最低稳定功能集为 v${MIHOMO_MIN_VERSION}）"
+        return 1
+    fi
+
+    local asset_name
+    asset_name=$(_mihomo_asset_name "$(uname -m)" "$version") || {
+        _err "不支持的架构"
+        return 1
+    }
+    local url="https://github.com/${MIHOMO_REPO}/releases/download/v${version}/${asset_name}"
+    _install_binary "vless-mihomo" "$MIHOMO_REPO" "$url" mihomo \
+        "$channel" "$force" "$version"
+}
+
 #═══════════════════════════════════════════════════════════════════════════════
-# 核心更新 (Xray/Sing-box)
+# 核心更新 (Xray/Sing-box/Mihomo)
 #═══════════════════════════════════════════════════════════════════════════════
 
 _core_channel_label() {
@@ -9299,6 +9371,45 @@ _core_channel_label() {
         "") echo "指定版本" ;;
         *) echo "全部版本" ;;
     esac
+}
+
+_get_mihomo_version() {
+    if [[ ! -x "$MIHOMO_BIN" ]]; then
+        echo "未安装"
+        return 0
+    fi
+
+    local output version
+    output=$("$MIHOMO_BIN" -v 2>&1) || {
+        echo "未知"
+        return 0
+    }
+    version=$(printf '%s\n' "$output" | grep -oE 'v?[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z._-]+)?' | head -n 1)
+    version="${version#v}"
+    [[ -n "$version" ]] && echo "$version" || echo "未知"
+}
+
+_is_mihomo_supported_version() {
+    local version="${1#v}" base prerelease
+    [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z][0-9A-Za-z._-]*)?$ ]] || return 1
+    base="${version%%-*}"
+    prerelease="${version#"$base"}"
+    if [[ "$base" == "$MIHOMO_MIN_VERSION" ]]; then
+        [[ -z "$prerelease" ]]
+        return
+    fi
+    _version_gt "$base" "$MIHOMO_MIN_VERSION"
+}
+
+_mihomo_asset_name() {
+    local machine="$1" version="${2#v}" arch
+    case "$machine" in
+        x86_64) arch="amd64-compatible" ;;
+        aarch64) arch="arm64" ;;
+        armv7l) arch="armv7" ;;
+        *) return 1 ;;
+    esac
+    printf 'mihomo-linux-%s-v%s.gz\n' "$arch" "$version"
 }
 
 # Snell v5 版本获取
@@ -9405,6 +9516,9 @@ _get_core_version() {
                 version="未安装"
             fi
             ;;
+        mihomo|vless-mihomo)
+            version=$(_get_mihomo_version)
+            ;;
         snell-server-v5)
             version=$(_get_snell_v5_version)
             ;;
@@ -9458,7 +9572,10 @@ _get_version_status() {
 
 _get_core_version_with_status() {
     local core="$1"
-    local repo="$2"
+    local repo="${2:-}"
+    case "$core" in
+        mihomo|vless-mihomo) repo="${repo:-$MIHOMO_REPO}" ;;
+    esac
     local current latest_stable latest_prerelease prerelease_cache status
 
     current=$(_get_core_version "$core")
@@ -9506,6 +9623,10 @@ _confirm_core_update() {
 
 _confirm_core_update_version() {
     local core="$1" channel="$2" version="$3"
+    if [[ "$core" == "Mihomo" ]] && ! _is_mihomo_supported_version "$version"; then
+        _err "Mihomo 版本 v${version} 不受支持（最低稳定功能集为 v${MIHOMO_MIN_VERSION}）"
+        return 1
+    fi
     local channel_label=$(_core_channel_label "$channel")
     local risk_desc=""
     local label=""
@@ -9546,6 +9667,7 @@ _select_version_from_list() {
     case "$name" in
         Xray) check_cmd xray && current_ver=$(xray version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1) ;;
         Sing-box) check_cmd sing-box && current_ver=$(sing-box version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?' | head -n 1) ;;
+        Mihomo) current_ver=$(_get_mihomo_version) ;;
         "Snell v5") current_ver=$(_get_snell_v5_version) ;;
         "Snell v6") current_ver=$(_get_snell_v6_version) ;;
     esac
@@ -9617,10 +9739,19 @@ _get_core_backup_dir() {
     return 1
 }
 
+_core_binary_path() {
+    local binary_name="$1"
+    case "$binary_name" in
+        vless-mihomo) printf '%s\n' "$MIHOMO_BIN" ;;
+        *) printf '/usr/local/bin/%s\n' "$binary_name" ;;
+    esac
+}
+
 # 备份核心二进制文件
 _backup_core_binary() {
     local binary_name="$1"
-    local binary_path="/usr/local/bin/$binary_name"
+    local binary_path
+    binary_path=$(_core_binary_path "$binary_name")
     [[ ! -f "$binary_path" ]] && return 0
 
     local backup_dir
@@ -9634,6 +9765,7 @@ _backup_core_binary() {
     case "$binary_name" in
         xray) current_ver=$(xray version 2>/dev/null | head -n 1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1) ;;
         sing-box) current_ver=$(sing-box version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?' | head -n 1) ;;
+        vless-mihomo) current_ver=$(_get_mihomo_version) ;;
         snell-server-v5) current_ver=$(_get_snell_v5_version) ;;
         snell-server-v6) current_ver=$(_get_snell_v6_version) ;;
     esac
@@ -9658,7 +9790,8 @@ _rollback_core_binary() {
     local binary_name="$1" backup_file="$2"
     [[ ! -f "$backup_file" ]] && { _err "备份文件不存在: $backup_file"; return 1; }
 
-    local binary_path="/usr/local/bin/$binary_name"
+    local binary_path
+    binary_path=$(_core_binary_path "$binary_name")
     if cp "$backup_file" "$binary_path" 2>/dev/null; then
         chmod 755 "$binary_path"
         _ok "已回滚至备份版本"
@@ -9669,14 +9802,19 @@ _rollback_core_binary() {
 }
 
 _update_core_to_version() {
-    local core="$1" channel="$2" version="$3" service="$4" install_func="$5"
+    local core="$1" channel="$2" version="${3#v}" service="$4" install_func="$5"
     _check_core_update_deps || return 1
+    if [[ "$core" == "Mihomo" ]] && ! _is_mihomo_supported_version "$version"; then
+        _err "Mihomo 版本 v${version} 不受支持（最低稳定功能集为 v${MIHOMO_MIN_VERSION}）"
+        return 1
+    fi
     _confirm_core_update_version "$core" "$channel" "$version" || return 1
 
     local binary_name
     case "$core" in
         Xray) binary_name="xray" ;;
         Sing-box) binary_name="sing-box" ;;
+        Mihomo) binary_name="vless-mihomo" ;;
         "Snell v5") binary_name="snell-server-v5" ;;
         *) _err "未知核心: $core"; return 1 ;;
     esac
@@ -9717,6 +9855,7 @@ _update_core_to_version() {
         case "$core" in
             Xray) _show_changelog_summary "XTLS/Xray-core" "$version" 8 ;;
             Sing-box) _show_changelog_summary "SagerNet/sing-box" "$version" 8 ;;
+            Mihomo) _show_changelog_summary "$MIHOMO_REPO" "$version" 8 ;;
             "Snell v5") _show_changelog_summary "surge-networks/snell" "$version" 8 ;;
         esac
 
@@ -9733,7 +9872,7 @@ _update_core_to_version() {
     if [[ -n "$backup_file" ]]; then
         _warn "尝试回滚到之前版本..."
         if ! _rollback_core_binary "$binary_name" "$backup_file"; then
-            _err "回滚失败，请手动恢复: cp $backup_file /usr/local/bin/$binary_name"
+            _err "回滚失败，请手动恢复: cp $backup_file $(_core_binary_path "$binary_name")"
         fi
     fi
 
@@ -9754,18 +9893,18 @@ _update_core_versions_async() {
     local version_info_file="$VERSION_CACHE_DIR/.core_version_info"
 
     (
-        local xray_latest="" singbox_latest="" snell_latest=""
+        local xray_latest="" singbox_latest="" mihomo_latest=""
 
         # 优先从缓存获取稳定版
         xray_latest=$(_get_cached_version "XTLS/Xray-core" 2>/dev/null)
         singbox_latest=$(_get_cached_version "SagerNet/sing-box" 2>/dev/null)
-        snell_latest=$(_get_cached_version "surge-networks/snell" 2>/dev/null)
+        mihomo_latest=$(_get_cached_version "$MIHOMO_REPO" 2>/dev/null)
 
         # 写入版本信息
         {
             echo "xray_latest=$xray_latest"
             echo "singbox_latest=$singbox_latest"
-            echo "snell_latest=$snell_latest"
+            echo "mihomo_latest=$mihomo_latest"
         } > "$version_info_file" 2>/dev/null
 
         # 标记完成
@@ -9774,14 +9913,14 @@ _update_core_versions_async() {
         # 后台异步更新稳定版缓存
         _update_version_cache_async "XTLS/Xray-core"
         _update_version_cache_async "SagerNet/sing-box"
-        _update_version_cache_async "surge-networks/snell"
+        _update_version_cache_async "$MIHOMO_REPO"
 
         # 后台异步更新测试版缓存（使用专用函数）
         # 注意：这些函数内部已经有缓存机制，这里只是触发后台更新
         (
             _get_latest_prerelease_version "XTLS/Xray-core" "false" >/dev/null 2>&1
             _get_latest_prerelease_version "SagerNet/sing-box" "false" >/dev/null 2>&1
-            _get_latest_prerelease_version "surge-networks/snell" "false" >/dev/null 2>&1
+            _get_latest_prerelease_version "$MIHOMO_REPO" "false" >/dev/null 2>&1
             _refresh_snell_v6_version_cache >/dev/null 2>&1
         ) &
     ) &
@@ -9793,13 +9932,14 @@ _refresh_core_versions_now() {
     _get_latest_prerelease_version "XTLS/Xray-core" "false" "true" >/dev/null 2>&1
     _get_latest_version "SagerNet/sing-box" "false" "true" >/dev/null 2>&1
     _get_latest_prerelease_version "SagerNet/sing-box" "false" "true" >/dev/null 2>&1
-    _get_latest_version "surge-networks/snell" "false" "true" >/dev/null 2>&1
-    _get_latest_prerelease_version "surge-networks/snell" "false" "true" >/dev/null 2>&1
+    _get_latest_version "$MIHOMO_REPO" "false" "true" >/dev/null 2>&1
+    _get_latest_prerelease_version "$MIHOMO_REPO" "false" "true" >/dev/null 2>&1
     _refresh_snell_v6_version_cache >/dev/null 2>&1
-    local xray_current singbox_current
+    local xray_current singbox_current mihomo_current
     xray_current=$(_get_core_version "xray")
     singbox_current=$(_get_core_version "sing-box")
-    _check_version_updates_async "$xray_current" "$singbox_current"
+    mihomo_current=$(_get_core_version "mihomo")
+    _check_version_updates_async "$xray_current" "$singbox_current" "$mihomo_current"
     _version_check_started=1
     _ok "版本信息已更新"
 }
@@ -9930,46 +10070,46 @@ _show_core_versions() {
             echo -e "    ${W}预发布版本:${NC} ${D}${singbox_prerelease}${NC}"
         fi
 
-        # 如果还要显示 Snell v5，添加空行分隔
+        # 如果还要显示 Mihomo，添加空行分隔
         [[ "$filter" == "all" ]] && echo ""
     fi
 
-    # 显示 Snell v5 版本信息
-    if [[ "$filter" == "all" ]] || [[ "$filter" == "snellv5" ]]; then
-        local snell_current
-        snell_current=$(_get_snell_v5_version)
-        
-        local snell_latest snell_prerelease
-        snell_latest=$(_get_cached_version "surge-networks/snell" 2>/dev/null)
-        [[ -z "$snell_latest" ]] && snell_latest="$SNELL_DEFAULT_VERSION"
-        ! _is_plain_version "$snell_latest" && snell_latest="$SNELL_DEFAULT_VERSION"
-        
-        local snell_prerelease_cache="$VERSION_CACHE_DIR/surge-networks_snell_prerelease"
-        if [[ -f "$snell_prerelease_cache" ]]; then
-            local cache_time
-            cache_time=$(_get_file_mtime "$snell_prerelease_cache")
-            if [[ -n "$cache_time" ]]; then
-                local current_time=$(date +%s)
-                local age=$((current_time - cache_time))
-                if [[ $age -lt $VERSION_CACHE_TTL ]]; then
-                    snell_prerelease=$(cat "$snell_prerelease_cache" 2>/dev/null)
-                fi
-            fi
+    # 显示 Mihomo 版本信息
+    if [[ "$filter" == "all" ]] || [[ "$filter" == "mihomo" ]]; then
+        local mihomo_current mihomo_latest mihomo_prerelease
+        mihomo_current=$(_get_core_version "mihomo")
+        mihomo_latest=$(_get_cached_version_with_fallback "$MIHOMO_REPO")
+        [[ -z "$mihomo_latest" ]] && mihomo_latest="获取中..."
+        mihomo_prerelease=$(_get_cached_prerelease_with_fallback "$MIHOMO_REPO")
+        [[ -z "$mihomo_prerelease" ]] && mihomo_prerelease="获取中..."
+
+        local mihomo_unavailable="$VERSION_CACHE_DIR/MetaCubeX_mihomo_unavailable"
+        if [[ -f "$mihomo_unavailable" ]]; then
+            [[ "$mihomo_latest" == "获取中..." ]] && mihomo_latest="不可获取"
+            [[ "$mihomo_prerelease" == "获取中..." ]] && mihomo_prerelease="不可获取"
         fi
-        [[ -z "$snell_prerelease" ]] && snell_prerelease="无"
-        
-        echo -e "  ${W}Snell v5${NC}"
-        if [[ "$snell_current" == "未安装" ]]; then
-            echo -e "    ${W}当前版本:${NC} ${D}${snell_current}${NC}"
+
+        local mihomo_prerelease_hint
+        mihomo_prerelease_hint=$(_prerelease_hint "$mihomo_prerelease" "$mihomo_latest")
+
+        echo -e "  ${W}Mihomo${NC}"
+        if [[ "$mihomo_current" == "未安装" || "$mihomo_current" == "未知" ]]; then
+            echo -e "    ${W}当前版本:${NC} ${D}${mihomo_current}${NC}"
         else
-            local snell_status=$(_get_version_status "$snell_current" "$snell_latest" "$snell_prerelease")
-            echo -e "    ${W}当前版本:${NC} ${G}v${snell_current}${NC}${snell_status}"
+            local mihomo_status=$(_get_version_status "$mihomo_current" "$mihomo_latest" "$mihomo_prerelease")
+            echo -e "    ${W}当前版本:${NC} ${G}v${mihomo_current}${NC}${mihomo_status}"
         fi
-        
-        if ! _is_version_unknown "$snell_latest"; then
-            echo -e "    ${NC}${W}稳定版本:${NC} ${C}v${snell_latest}${NC}"
+
+        if ! _is_version_unknown "$mihomo_latest"; then
+            echo -e "    ${NC}${W}稳定版本:${NC} ${C}v${mihomo_latest}${NC}"
         else
-            echo -e "    ${NC}${W}稳定版本:${NC} ${D}${snell_latest}${NC}"
+            echo -e "    ${NC}${W}稳定版本:${NC} ${D}${mihomo_latest}${NC}"
+        fi
+
+        if ! _is_version_unknown "$mihomo_prerelease"; then
+            echo -e "    ${W}预发布版本:${NC} ${M}v${mihomo_prerelease}${NC}${D}${mihomo_prerelease_hint}${NC}"
+        else
+            echo -e "    ${W}预发布版本:${NC} ${D}${mihomo_prerelease}${NC}"
         fi
     fi
 
@@ -10018,9 +10158,9 @@ _show_core_versions() {
         _update_prerelease_cache_async "SagerNet/sing-box"
     fi
 
-    if [[ "$filter" == "all" ]] || [[ "$filter" == "snellv5" ]]; then
-        _update_version_cache_async "surge-networks/snell"
-        _update_prerelease_cache_async "surge-networks/snell"
+    if [[ "$filter" == "all" ]] || [[ "$filter" == "mihomo" ]]; then
+        _update_version_cache_async "$MIHOMO_REPO"
+        _update_prerelease_cache_async "$MIHOMO_REPO"
     fi
 
     # Snell v6 已在上方一次请求同时更新两个通道，无需分别重复请求。
@@ -10128,6 +10268,24 @@ update_singbox_core() {
         fi
     fi
     return 1
+}
+
+update_mihomo_core() {
+    local channel="${1:-stable}"
+    local version=""
+    if [[ "$channel" == "prerelease" || "$channel" == "test" || "$channel" == "beta" ]]; then
+        version=$(_get_latest_prerelease_version "$MIHOMO_REPO" "true" 2>/dev/null || true)
+        [[ -z "$version" ]] && version=$(_force_get_cached_prerelease_version "$MIHOMO_REPO" 2>/dev/null || true)
+    else
+        version=$(_get_latest_version "$MIHOMO_REPO" "true" 2>/dev/null || true)
+        [[ -z "$version" ]] && version=$(_force_get_cached_version "$MIHOMO_REPO" 2>/dev/null || true)
+    fi
+    version="${version#v}"
+    if ! _is_mihomo_supported_version "$version"; then
+        _err "无法获取受支持的 Mihomo ${channel}版本（最低稳定功能集为 v${MIHOMO_MIN_VERSION}）"
+        return 1
+    fi
+    _update_core_to_version "Mihomo" "$channel" "$version" "vless-mihomo" "install_mihomo"
 }
 
 update_snell_v5_core() {
@@ -10285,6 +10443,32 @@ update_singbox_core_custom() {
     _update_core_to_version "Sing-box" "" "$version" "vless-singbox" "install_singbox"
 }
 
+update_mihomo_core_custom() {
+    _header
+    echo -e "  ${W}Mihomo 安装指定版本${NC}"
+    _line
+    _show_core_versions "mihomo"
+    _line
+
+    if [[ ! -x "$MIHOMO_BIN" ]]; then
+        _warn "未检测到 Mihomo，将执行安装"
+    fi
+
+    local version
+    version=$(_select_version_from_list "$MIHOMO_REPO" "all" "Mihomo" 10)
+    local select_rc=$?
+    if [[ $select_rc -ne 0 ]]; then
+        [[ $select_rc -eq 2 ]] && { _SKIP_PAUSE_ONCE=1; return 0; }
+        return 1
+    fi
+    version="${version#v}"
+    if ! _is_mihomo_supported_version "$version"; then
+        _err "Mihomo 版本 v${version} 不受支持（最低稳定功能集为 v${MIHOMO_MIN_VERSION}）"
+        return 1
+    fi
+    _update_core_to_version "Mihomo" "" "$version" "vless-mihomo" "install_mihomo"
+}
+
 update_snell_v5_core_custom() {
     _header
     echo -e "  ${W}Snell v5 安装指定版本${NC}"
@@ -10424,6 +10608,7 @@ _update_core_with_channel_select() {
             case "$core_name" in
                 Xray) update_xray_core_custom ;;
                 Sing-box) update_singbox_core_custom ;;
+                Mihomo) update_mihomo_core_custom ;;
                 *) _err "不支持的核心"; return 1 ;;
             esac
             return 0
@@ -10436,6 +10621,7 @@ _update_core_with_channel_select() {
     case "$core_name" in
         Xray) update_xray_core "$channel" ;;
         Sing-box) update_singbox_core "$channel" ;;
+        Mihomo) update_mihomo_core "$channel" ;;
         "Snell v5") update_snell_v5_core "$channel" ;;
     esac
 }
@@ -10443,23 +10629,23 @@ _update_core_with_channel_select() {
 update_core_menu() {
     while true; do
         _header
-        echo -e "  ${W}核心版本管理 (Xray/Sing-box/Snell v5/Snell v6)${NC}"
+        echo -e "  ${W}核心版本管理 (Xray/Sing-box/Mihomo/Snell v6)${NC}"
         _line
         _show_core_versions
         _line
         
         local xray_label="更新 Xray"
         local singbox_label="更新 Sing-box"
-        local snellv5_label="更新 Snell v5"
+        local mihomo_label="更新 Mihomo"
         local snellv6_label="更新 Snell v6"
         check_cmd xray || xray_label="安装 Xray"
         check_cmd sing-box || singbox_label="安装 Sing-box"
-        check_cmd snell-server-v5 || snellv5_label="安装 Snell v5"
+        [[ -x "$MIHOMO_BIN" ]] || mihomo_label="安装 Mihomo"
         check_cmd snell-server-v6 || snellv6_label="安装 Snell v6"
         
         _item "1" "$xray_label"
         _item "2" "$singbox_label"
-        _item "3" "$snellv5_label"
+        _item "3" "$mihomo_label"
         _item "4" "$snellv6_label"
         _item "5" "重新获取版本"
         _item "0" "返回"
@@ -10469,7 +10655,7 @@ update_core_menu() {
         case "$choice" in
             1) _update_core_with_channel_select "Xray" "XTLS/Xray-core" "xray" "vless-reality" "install_xray" ;;
             2) _update_core_with_channel_select "Sing-box" "SagerNet/sing-box" "sing-box" "vless-singbox" "install_singbox" ;;
-            3) _update_core_with_channel_select "Snell v5" "surge-networks/snell" "snell-server-v5" "vless-snell-v5" "install_snell_v5" ;;
+            3) _update_core_with_channel_select "Mihomo" "$MIHOMO_REPO" "vless-mihomo" "vless-mihomo" "install_mihomo" ;;
             4) _update_core_with_channel_select "Snell v6" "$SNELL_V6_REPO" "snell-server-v6" "vless-snell-v6" "install_snell_v6" ;;
             5) _refresh_core_versions_now ;;
             0) break ;;
@@ -29543,6 +29729,7 @@ main_menu() {
     # 使用统一函数，一次请求同时获取稳定版和测试版（减少API请求次数）
     _update_all_versions_async "XTLS/Xray-core"
     _update_all_versions_async "SagerNet/sing-box"
+    _update_all_versions_async "$MIHOMO_REPO"
     _check_script_update_async
 
     # 自动同步隧道配置
@@ -29569,9 +29756,10 @@ main_menu() {
         _init_version_cache
 
         # 获取核心版本及状态（使用公共方法）
-        local xray_ver_with_status singbox_ver_with_status
+        local xray_ver_with_status singbox_ver_with_status mihomo_ver_with_status
         xray_ver_with_status=$(_get_core_version_with_status "xray" "XTLS/Xray-core")
         singbox_ver_with_status=$(_get_core_version_with_status "sing-box" "SagerNet/sing-box")
+        mihomo_ver_with_status=$(_get_core_version_with_status "mihomo" "$MIHOMO_REPO")
         local script_update_ver=""
         if _has_script_update; then
             script_update_ver=$(_get_script_update_info)
@@ -29579,16 +29767,17 @@ main_menu() {
 
         # 启动异步版本检查（后台，仅首次进入时触发）
         if [[ -z "$_version_check_started" ]]; then
-            local xray_current singbox_current
+            local xray_current singbox_current mihomo_current
             xray_current=$(_get_core_version "xray")
             singbox_current=$(_get_core_version "sing-box")
-            _check_version_updates_async "$xray_current" "$singbox_current"
+            mihomo_current=$(_get_core_version "mihomo")
+            _check_version_updates_async "$xray_current" "$singbox_current" "$mihomo_current"
             _version_check_started=1
         fi
 
         # 显示版本信息（已包含状态标识）
         echo -e "  ${D}系统: ${os_version} | ${kernel_version}${NC}"
-        echo -e "  ${D}核心: Xray ${xray_ver_with_status} | Sing-box ${singbox_ver_with_status}${NC}"
+        echo -e "  ${D}核心: Xray ${xray_ver_with_status} | Sing-box ${singbox_ver_with_status} | Mihomo ${mihomo_ver_with_status}${NC}"
         if [[ -n "$script_update_ver" ]]; then
             echo -e "  ${Y}提示: 脚本有新版本 v${script_update_ver}，可在菜单选择「检查脚本更新」${NC}"
         fi
@@ -29602,7 +29791,7 @@ main_menu() {
         if [[ -n "$installed" ]]; then
             # 多协议服务端菜单
             _item "1" "安装新协议 (多协议共存)"
-            _item "2" "核心版本管理 (Xray/Sing-box/Snell v5/Snell v6)"
+            _item "2" "核心版本管理 (Xray/Sing-box/Mihomo/Snell v6)"
             _item "3" "卸载指定协议"
             _item "4" "用户管理 (多用户/流量/通知)"
             echo -e "  ${D}───────────────────────────────────────────${NC}"

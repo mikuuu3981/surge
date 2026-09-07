@@ -27,6 +27,37 @@ cleanup_fixture() {
     rm -rf "${TEST_TMP:-}"
 }
 
+write_mihomo_gzip_fixture() {
+    local source_file="$TEST_TMP/mihomo-fixture"
+    cat >"$source_file" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' 'Mihomo Meta v1.19.28 linux amd64'
+EOF
+    chmod 700 "$source_file"
+    gzip -c "$source_file" >"$TEST_TMP/mihomo-fixture.gz"
+}
+
+stub_mihomo_download() {
+    local output="" url=""
+    while (($#)); do
+        case "$1" in
+            -o)
+                output="$2"
+                shift 2
+                ;;
+            --)
+                shift
+                url="${1:-}"
+                shift
+                ;;
+            *) shift ;;
+        esac
+    done
+    [[ -n "$output" && -n "$url" ]] || return 1
+    cp "$TEST_TMP/mihomo-fixture.gz" "$output"
+    printf '%s\n' "$url" >"$TEST_TMP/download-url"
+}
+
 write_single_mihomo_record() {
     local protocol="$1" record="$2"
     jq -n --arg protocol "$protocol" --argjson record "$record" '{
@@ -51,6 +82,251 @@ test_source_does_not_run_cli() (
     trap cleanup_fixture EXIT
     source "$SCRIPT"
     declare -F main_menu >/dev/null
+)
+
+test_mihomo_supported_versions() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+
+    _is_mihomo_supported_version 1.19.28 || return 1
+    ! _is_mihomo_supported_version 1.19.27 || return 1
+    ! _is_mihomo_supported_version 1.19.28-alpha || return 1
+    _is_mihomo_supported_version 1.19.29-alpha || return 1
+)
+
+test_mihomo_asset_names() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+
+    [[ "$(_mihomo_asset_name x86_64 1.19.28)" == "mihomo-linux-amd64-compatible-v1.19.28.gz" ]] || return 1
+    [[ "$(_mihomo_asset_name aarch64 1.19.28)" == "mihomo-linux-arm64-v1.19.28.gz" ]] || return 1
+    [[ "$(_mihomo_asset_name armv7l 1.19.28)" == "mihomo-linux-armv7-v1.19.28.gz" ]] || return 1
+    ! _mihomo_asset_name mips 1.19.28 || return 1
+)
+
+test_get_mihomo_version_from_managed_binary() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    cat >"$VLESS_TEST_MIHOMO_BIN" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' 'Mihomo Meta v1.19.28 linux amd64'
+EOF
+    chmod 700 "$VLESS_TEST_MIHOMO_BIN"
+    source "$SCRIPT"
+
+    [[ "$(_get_mihomo_version)" == "1.19.28" ]] || return 1
+    [[ "$(_get_core_version mihomo)" == "1.19.28" ]]
+)
+
+test_mihomo_backup_uses_managed_binary_path() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    cat >"$VLESS_TEST_MIHOMO_BIN" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' 'Mihomo Meta v1.19.28 linux amd64'
+EOF
+    chmod 700 "$VLESS_TEST_MIHOMO_BIN"
+    source "$SCRIPT"
+    _get_core_backup_dir() {
+        mkdir -p "$TEST_TMP/backups"
+        printf '%s\n' "$TEST_TMP/backups"
+    }
+    _info() { :; }
+
+    local backup_file
+    backup_file=$(_backup_core_binary vless-mihomo) || return 1
+    [[ -f "$backup_file" ]] || return 1
+    [[ "$(basename "$backup_file")" == vless-mihomo_1.19.28_* ]] || return 1
+    cmp -s "$VLESS_TEST_MIHOMO_BIN" "$backup_file"
+)
+
+test_mihomo_update_rejects_unsupported_version_before_confirmation() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    _check_core_update_deps() { return 0; }
+    _confirm_core_update_version() {
+        touch "$TEST_TMP/confirmed"
+        return 0
+    }
+    _test_never_install_mihomo() {
+        touch "$TEST_TMP/installed"
+        return 0
+    }
+
+    if _update_core_to_version "Mihomo" "" "1.19.27" "vless-mihomo" "_test_never_install_mihomo" >/dev/null 2>&1; then
+        return 1
+    fi
+    [[ ! -e "$TEST_TMP/confirmed" ]] || return 1
+    [[ ! -e "$TEST_TMP/installed" ]]
+)
+
+test_update_mihomo_core_uses_selected_channel_version() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    declare -F update_mihomo_core >/dev/null || return 1
+    _get_latest_version() {
+        [[ "$1" == "MetaCubeX/mihomo" ]] || return 1
+        printf '%s\n' '1.19.28'
+    }
+    _update_core_to_version() {
+        printf '%s\n' "$1|$2|$3|$4|$5" >"$TEST_TMP/update-args"
+    }
+
+    update_mihomo_core stable || return 1
+    [[ "$(<"$TEST_TMP/update-args")" == "Mihomo|stable|1.19.28|vless-mihomo|install_mihomo" ]]
+)
+
+test_update_mihomo_core_custom_rejects_unsupported_version() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    declare -F update_mihomo_core_custom >/dev/null || return 1
+    _header() { :; }
+    _line() { :; }
+    _show_core_versions() { :; }
+    _select_version_from_list() { printf '%s\n' '1.19.27'; }
+    _update_core_to_version() {
+        touch "$TEST_TMP/update-attempted"
+        return 0
+    }
+
+    if update_mihomo_core_custom >/dev/null 2>&1; then
+        return 1
+    fi
+    [[ ! -e "$TEST_TMP/update-attempted" ]]
+)
+
+test_mihomo_async_warming_caches_both_channels() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    mkdir -p "$VERSION_CACHE_DIR"
+    curl() {
+        printf '%s\n' '[{"tag_name":"v1.19.28","prerelease":false},{"tag_name":"v1.19.29-alpha","prerelease":true}]' '200'
+    }
+
+    _update_all_versions_async "$MIHOMO_REPO"
+    wait
+    [[ "$(<"$VERSION_CACHE_DIR/MetaCubeX_mihomo")" == "1.19.28" ]] || return 1
+    [[ "$(<"$VERSION_CACHE_DIR/MetaCubeX_mihomo_prerelease")" == "1.19.29-alpha" ]] || return 1
+    [[ ! -e "$VERSION_CACHE_DIR/MetaCubeX_mihomo_unavailable" ]]
+)
+
+test_mihomo_async_warming_marks_unavailable_repository() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    mkdir -p "$VERSION_CACHE_DIR"
+    curl() {
+        printf '%s\n' '{"message":"Not Found"}' '404'
+    }
+
+    _update_all_versions_async "$MIHOMO_REPO"
+    wait
+    [[ "$(<"$VERSION_CACHE_DIR/MetaCubeX_mihomo_unavailable")" == "not_found" ]]
+)
+
+test_show_core_versions_includes_mihomo_channels() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    cat >"$VLESS_TEST_MIHOMO_BIN" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' 'Mihomo Meta v1.19.28 linux amd64'
+EOF
+    chmod 700 "$VLESS_TEST_MIHOMO_BIN"
+    source "$SCRIPT"
+    W= D= G= C= M= Y= NC=
+    mkdir -p "$VERSION_CACHE_DIR"
+    printf '%s\n' '1.19.28' >"$VERSION_CACHE_DIR/MetaCubeX_mihomo"
+    printf '%s\n' '1.19.29-alpha' >"$VERSION_CACHE_DIR/MetaCubeX_mihomo_prerelease"
+    _update_version_cache_async() { :; }
+    _update_prerelease_cache_async() { :; }
+
+    local output
+    output=$(_show_core_versions mihomo)
+    grep -q '^  Mihomo$' <<<"$output" || return 1
+    grep -q '当前版本: v1.19.28' <<<"$output" || return 1
+    grep -q '稳定版本: v1.19.28' <<<"$output" || return 1
+    grep -q '预发布版本: v1.19.29-alpha' <<<"$output"
+)
+
+test_core_menu_replaces_snell_v5_with_mihomo() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    W= G= NC=
+    _header() { :; }
+    _line() { :; }
+    _show_core_versions() { :; }
+    _item() { printf '%s %s\n' "$1" "$2"; }
+
+    local output
+    output=$(update_core_menu <<<"0")
+    grep -q '核心版本管理 (Xray/Sing-box/Mihomo/Snell v6)' <<<"$output" || return 1
+    ! grep -q 'Snell v5' <<<"$output" || return 1
+    grep -q 'Mihomo' <<<"$output"
+)
+
+test_install_mihomo_rejects_unsupported_version_before_download() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    declare -F install_mihomo >/dev/null || return 1
+    curl() {
+        touch "$TEST_TMP/download-attempted"
+        return 1
+    }
+
+    if install_mihomo stable true 1.19.27 >/dev/null 2>&1; then
+        return 1
+    fi
+    [[ ! -e "$TEST_TMP/download-attempted" ]] || return 1
+    [[ ! -e "$VLESS_TEST_MIHOMO_BIN" ]]
+)
+
+test_install_mihomo_requires_publisher_verification() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    write_mihomo_gzip_fixture
+    export TMPDIR="$TEST_TMP/tmp"
+    mkdir -p "$TMPDIR"
+    source "$SCRIPT"
+    declare -F install_mihomo >/dev/null || return 1
+    curl() { stub_mihomo_download "$@"; }
+    _verify_github_release_asset() { return 1; }
+    export ALLOW_UNVERIFIED_DOWNLOADS=1
+
+    if install_mihomo stable true 1.19.28 >/dev/null 2>&1; then
+        return 1
+    fi
+    [[ ! -e "$VLESS_TEST_MIHOMO_BIN" ]] || return 1
+    local -a leftovers
+    shopt -s nullglob dotglob
+    leftovers=("$TMPDIR"/*)
+    ((${#leftovers[@]} == 0))
+)
+
+test_install_mihomo_uses_verified_official_asset() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    write_mihomo_gzip_fixture
+    source "$SCRIPT"
+    declare -F install_mihomo >/dev/null || return 1
+    curl() { stub_mihomo_download "$@"; }
+    _verify_github_release_asset() {
+        printf '%s\n' "$1|$2|$3|$4" >"$TEST_TMP/verify-args"
+        [[ "$1" == "MetaCubeX/mihomo" && "$2" == "1.19.28" && -f "$4" ]]
+    }
+
+    install_mihomo stable true v1.19.28 >/dev/null 2>&1 || return 1
+    [[ "$(<"$TEST_TMP/download-url")" == "https://github.com/MetaCubeX/mihomo/releases/download/v1.19.28/mihomo-linux-amd64-compatible-v1.19.28.gz" ]] || return 1
+    [[ "$(<"$TEST_TMP/verify-args")" == "MetaCubeX/mihomo|1.19.28|https://github.com/MetaCubeX/mihomo/releases/download/v1.19.28/mihomo-linux-amd64-compatible-v1.19.28.gz|"* ]] || return 1
+    [[ -x "$VLESS_TEST_MIHOMO_BIN" ]] || return 1
+    [[ "$(_get_mihomo_version)" == "1.19.28" ]]
 )
 
 test_init_db_has_mihomo_namespace() (
@@ -319,6 +595,20 @@ test_generate_mihomo_config_builds_complete_mixed_config() (
 )
 
 run_test test_source_does_not_run_cli
+run_test test_mihomo_supported_versions
+run_test test_mihomo_asset_names
+run_test test_get_mihomo_version_from_managed_binary
+run_test test_mihomo_backup_uses_managed_binary_path
+run_test test_mihomo_update_rejects_unsupported_version_before_confirmation
+run_test test_update_mihomo_core_uses_selected_channel_version
+run_test test_update_mihomo_core_custom_rejects_unsupported_version
+run_test test_mihomo_async_warming_caches_both_channels
+run_test test_mihomo_async_warming_marks_unavailable_repository
+run_test test_show_core_versions_includes_mihomo_channels
+run_test test_core_menu_replaces_snell_v5_with_mihomo
+run_test test_install_mihomo_rejects_unsupported_version_before_download
+run_test test_install_mihomo_requires_publisher_verification
+run_test test_install_mihomo_uses_verified_official_asset
 run_test test_init_db_has_mihomo_namespace
 run_test test_init_db_upgrades_legacy_namespaces
 run_test test_protocol_core_classification
