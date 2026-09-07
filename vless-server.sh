@@ -11042,6 +11042,230 @@ _mihomo_ports_healthy() {
     [[ -z "$missing" ]]
 }
 
+# 创建 Mihomo 节点变更快照。服务状态只记录，不在此处修改。
+_mihomo_snapshot_create() {
+    local snapshot
+    mkdir -p "$CFG" || return 1
+    snapshot=$(mktemp -d "$CFG/.mihomo-node.XXXXXX") || return 1
+    chmod 700 "$snapshot" || { rm -rf "$snapshot"; return 1; }
+
+    if [[ -f "$DB_FILE" ]]; then
+        cp -p "$DB_FILE" "$snapshot/db.json" || { rm -rf "$snapshot"; return 1; }
+    else
+        touch "$snapshot/db-absent"
+    fi
+    if [[ -f "$MIHOMO_CONFIG" ]]; then
+        cp -p "$MIHOMO_CONFIG" "$snapshot/mihomo.yaml" || { rm -rf "$snapshot"; return 1; }
+    else
+        touch "$snapshot/config-absent"
+    fi
+
+    local service_file
+    if [[ "$DISTRO" == "alpine" ]]; then
+        service_file="$OPENRC_DIR/vless-mihomo"
+    else
+        service_file="$SYSTEMD_DIR/vless-mihomo.service"
+    fi
+    if [[ -f "$service_file" ]]; then
+        cp -p "$service_file" "$snapshot/service" || { rm -rf "$snapshot"; return 1; }
+    else
+        touch "$snapshot/service-absent"
+    fi
+    if svc status vless-mihomo >/dev/null 2>&1; then
+        touch "$snapshot/service-running"
+    else
+        touch "$snapshot/service-stopped"
+    fi
+    printf '%s\n' "$snapshot"
+}
+
+# 恢复数据库、完整配置和服务定义；调用方按是否已修改运行状态决定是否重启。
+_mihomo_snapshot_restore() {
+    local snapshot="$1" service_file
+    [[ -d "$snapshot" ]] || return 1
+
+    if [[ -f "$snapshot/db-absent" ]]; then
+        rm -f "$DB_FILE"
+    else
+        cp -p "$snapshot/db.json" "$DB_FILE" || return 1
+    fi
+    if [[ -f "$snapshot/config-absent" ]]; then
+        rm -f "$MIHOMO_CONFIG"
+    else
+        cp -p "$snapshot/mihomo.yaml" "$MIHOMO_CONFIG" || return 1
+    fi
+
+    if [[ "$DISTRO" == "alpine" ]]; then
+        service_file="$OPENRC_DIR/vless-mihomo"
+    else
+        service_file="$SYSTEMD_DIR/vless-mihomo.service"
+    fi
+    if [[ -f "$snapshot/service-absent" ]]; then
+        rm -f "$service_file"
+    else
+        mkdir -p "$(dirname "$service_file")" || return 1
+        cp -p "$snapshot/service" "$service_file" || return 1
+    fi
+    if [[ "$DISTRO" != "alpine" ]]; then
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+}
+
+_mihomo_service_definition_exists() {
+    if [[ "$DISTRO" == "alpine" ]]; then
+        [[ -f "$OPENRC_DIR/vless-mihomo" ]]
+    else
+        [[ -f "$SYSTEMD_DIR/vless-mihomo.service" ]]
+    fi
+}
+
+_remove_mihomo_service_definition() {
+    if [[ "$DISTRO" == "alpine" ]]; then
+        rm -f "$OPENRC_DIR/vless-mihomo"
+    else
+        rm -f "$SYSTEMD_DIR/vless-mihomo.service" || return 1
+        systemctl daemon-reload >/dev/null 2>&1 || true
+    fi
+}
+
+_mihomo_restore_running_state() {
+    local snapshot="$1"
+    if [[ -f "$snapshot/service-running" ]]; then
+        svc restart vless-mihomo >/dev/null 2>&1 || svc start vless-mihomo >/dev/null 2>&1 || true
+    else
+        svc stop vless-mihomo >/dev/null 2>&1 || true
+    fi
+}
+
+# 原子修改一个 Mihomo Snell 节点，并把数据库、完整配置和共享服务作为同一事务处理。
+_apply_mihomo_node_change() {
+    local protocol="$1" action="$2" old_port="$3" record="$4"
+    local snapshot db_tmp candidate new_port
+
+    [[ " $MIHOMO_PROTOCOLS " == *" $protocol "* ]] || return 1
+    case "$action" in
+        add|replace)
+            _validate_mihomo_record "$protocol" "$record" || return 1
+            new_port=$(printf '%s\n' "$record" | jq -r '.port') || return 1
+            ;;
+        remove) ;;
+        *) return 1 ;;
+    esac
+    [[ "$action" == "add" || "$old_port" == "all" || "$old_port" =~ ^[0-9]+$ ]] || return 1
+
+    snapshot=$(_mihomo_snapshot_create) || return 1
+    db_tmp=$(mktemp "$CFG/db.json.mihomo-node.XXXXXX") || { rm -rf "$snapshot"; return 1; }
+
+    case "$action" in
+        add)
+            jq --arg protocol "$protocol" --argjson record "$record" --argjson port "$new_port" '
+                .mihomo = (.mihomo // {}) |
+                ([.mihomo | to_entries[] | .value |
+                    if type == "array" then .[] else . end | select(.port == $port)] | length) as $duplicates |
+                if $duplicates > 0 then error("duplicate Mihomo port")
+                else .mihomo[$protocol] = (
+                    if .mihomo[$protocol] == null then [$record]
+                    elif (.mihomo[$protocol] | type) == "array" then .mihomo[$protocol] + [$record]
+                    else [.mihomo[$protocol], $record]
+                    end
+                ) end
+            ' "$DB_FILE" >"$db_tmp" 2>/dev/null
+            ;;
+        replace)
+            jq --arg protocol "$protocol" --arg old_port "$old_port" --argjson record "$record" --argjson new_port "$new_port" '
+                .mihomo = (.mihomo // {}) |
+                (.mihomo[$protocol] // null) as $current |
+                (if ($current | type) == "array" then $current elif $current == null then [] else [$current] end) as $records |
+                ([.mihomo | to_entries[] | .key as $key | .value |
+                    if type == "array" then .[] else . end |
+                    select(.port == $new_port and ((($key == $protocol) and (.port == ($old_port | tonumber))) | not))] | length) as $duplicates |
+                if ([$records[] | select(.port == ($old_port | tonumber))] | length) != 1 then error("replace target missing")
+                elif $duplicates > 0 then error("duplicate Mihomo port")
+                else .mihomo[$protocol] = [$records[] | if .port == ($old_port | tonumber) then $record else . end]
+                end
+            ' "$DB_FILE" >"$db_tmp" 2>/dev/null
+            ;;
+        remove)
+            if [[ "$old_port" == "all" ]]; then
+                jq --arg protocol "$protocol" '.mihomo = (.mihomo // {}) | del(.mihomo[$protocol])' \
+                    "$DB_FILE" >"$db_tmp" 2>/dev/null
+            else
+                jq --arg protocol "$protocol" --arg port "$old_port" '
+                    .mihomo = (.mihomo // {}) |
+                    (.mihomo[$protocol] // null) as $current |
+                    (if ($current | type) == "array" then $current elif $current == null then [] else [$current] end) as $records |
+                    if ([$records[] | select(.port == ($port | tonumber))] | length) != 1 then error("remove target missing")
+                    else [$records[] | select(.port != ($port | tonumber))] as $remaining |
+                        if ($remaining | length) == 0 then del(.mihomo[$protocol])
+                        else .mihomo[$protocol] = $remaining end
+                    end
+                ' "$DB_FILE" >"$db_tmp" 2>/dev/null
+            fi
+            ;;
+    esac
+
+    if [[ $? -ne 0 ]] || ! chmod 600 "$db_tmp" || ! mv "$db_tmp" "$DB_FILE"; then
+        rm -f "$db_tmp"
+        _mihomo_snapshot_restore "$snapshot" >/dev/null 2>&1 || true
+        rm -rf "$snapshot"
+        return 1
+    fi
+
+    if ! jq -e '[(.mihomo // {})[] | if type == "array" then .[] else . end] | length > 0' "$DB_FILE" >/dev/null 2>&1; then
+        if ! svc stop vless-mihomo || ! svc disable vless-mihomo; then
+            _mihomo_snapshot_restore "$snapshot" >/dev/null 2>&1 || true
+            _mihomo_restore_running_state "$snapshot"
+            rm -rf "$snapshot"
+            return 1
+        fi
+        if ! rm -f "$MIHOMO_CONFIG" || ! _remove_mihomo_service_definition; then
+            _mihomo_snapshot_restore "$snapshot" >/dev/null 2>&1 || true
+            _mihomo_restore_running_state "$snapshot"
+            rm -rf "$snapshot"
+            return 1
+        fi
+        rm -rf "$snapshot"
+        return 0
+    fi
+
+    candidate="$snapshot/mihomo.candidate.yaml"
+    if ! generate_mihomo_config "$DB_FILE" "$candidate" ||
+       ! validate_mihomo_config "$candidate" "$MIHOMO_BIN"; then
+        _mihomo_snapshot_restore "$snapshot" >/dev/null 2>&1 || true
+        rm -rf "$snapshot"
+        return 1
+    fi
+    if ! chmod 600 "$candidate" || ! mv "$candidate" "$MIHOMO_CONFIG"; then
+        _mihomo_snapshot_restore "$snapshot" >/dev/null 2>&1 || true
+        rm -rf "$snapshot"
+        return 1
+    fi
+
+    if ! _mihomo_service_definition_exists; then
+        if ! create_mihomo_service || ! svc enable vless-mihomo; then
+            _mihomo_snapshot_restore "$snapshot" >/dev/null 2>&1 || true
+            _mihomo_restore_running_state "$snapshot"
+            rm -rf "$snapshot"
+            return 1
+        fi
+    fi
+
+    if [[ -f "$snapshot/service-running" ]]; then
+        svc restart vless-mihomo
+    else
+        svc start vless-mihomo
+    fi
+    if [[ $? -ne 0 ]] || ! svc status vless-mihomo || ! _mihomo_ports_healthy "$DB_FILE"; then
+        _mihomo_snapshot_restore "$snapshot" >/dev/null 2>&1 || true
+        _mihomo_restore_running_state "$snapshot"
+        rm -rf "$snapshot"
+        return 1
+    fi
+
+    rm -rf "$snapshot"
+    return 0
+}
+
 # 事务切换 Mihomo 日志级别：数据库与完整配置必须一起提交或回滚。
 set_mihomo_log_level() {
     local level="$1"
@@ -12685,29 +12909,13 @@ gen_ss_legacy_server_config() {
     echo "server" > "$CFG/role"
 }
 
-# Snell v4 服务端配置
+# Snell v4 服务端配置（由 Mihomo 共享服务承载）
 gen_snell_server_config() {
-    local psk="$1" port="$2" version="${3:-4}"
+    local psk="$1" port="$2" version="${3:-4}" record
     mkdir -p "$CFG"
-
-    local listen_addr="0.0.0.0"
-    local ipv6_enabled="false"
-    if [[ "$version" != "4" ]]; then
-        listen_addr=$(_listen_addr)
-        [[ "$listen_addr" == "::" ]] && ipv6_enabled="true"
-    else
-        _has_ipv6 && ipv6_enabled="true"
-    fi
-
-    cat > "$CFG/snell.conf" << EOF
-[snell-server]
-listen = $(_fmt_hostport "$listen_addr" "$port")
-psk = $psk
-ipv6 = $ipv6_enabled
-obfs = off
-EOF
-
-    register_protocol "snell" "$(build_config psk "$psk" port "$port" version "$version")"
+    record=$(build_config psk "$psk" port "$port" version "$version") || return 1
+    _apply_mihomo_node_change "snell" "${INSTALL_MODE:-add}" "${REPLACE_PORT:-all}" "$record" || return 1
+    unset INSTALL_MODE REPLACE_PORT
 
     _save_join_info "snell" "SNELL|%s|$port|$psk|$version" \
         gen_snell_link "%s" "$port" "$psk" "$version"
@@ -12952,58 +13160,17 @@ EOF
     echo "server" > "$CFG/role"
 }
 
-# Snell + ShadowTLS 服务端配置 (v4/v5)
+# Snell + ShadowTLS 服务端配置 (v4/v5，由 Mihomo 内置监听器承载)
 gen_snell_shadowtls_server_config() {
-    local psk="$1" port="$2" sni="${3:-www.microsoft.com}" stls_password="$4" version="${5:-4}" custom_backend_port="${6:-}"
+    local psk="$1" port="$2" sni="${3:-www.microsoft.com}" stls_password="$4" version="${5:-4}"
+    local protocol_name="snell-shadowtls" record
     mkdir -p "$CFG"
-    
-    local ipv4 ipv6
-    IFS='|' read -r ipv4 ipv6 <<< "$(get_connection_addresses)"
-    local protocol_name="snell-shadowtls"
-    local snell_bin="snell-server"
-    local snell_conf="snell-shadowtls.conf"
-    
-    if [[ "$version" == "5" ]]; then
-        protocol_name="snell-v5-shadowtls"
-        snell_bin="snell-server-v5"
-        snell_conf="snell-v5-shadowtls.conf"
-    fi
-    
-    # Snell 后端端口 (内部监听)
-    local snell_backend_port
-    if [[ -n "$custom_backend_port" ]]; then
-        snell_backend_port="$custom_backend_port"
-    else
-        snell_backend_port=$((port + 10000))
-        [[ $snell_backend_port -gt 65535 ]] && snell_backend_port=$((port - 10000))
-    fi
-    
-    # Snell 监听地址：ShadowTLS 模式下监听本地 127.0.0.1
-    # ShadowTLS 会转发到这个地址
-    local listen_addr="127.0.0.1"
-    
-    local ipv6_line=""
-    # Snell v4 不支持 ipv6 配置项，v5 支持
-    # 如果系统有 IPv6，启用 IPv6 支持；否则禁用
-    if [[ "$version" != "4" ]]; then
-        if _has_ipv6; then
-            ipv6_line="ipv6 = true"
-        else
-            ipv6_line="ipv6 = false"
-        fi
-    fi
+    [[ "$version" == "5" ]] && protocol_name="snell-v5-shadowtls"
 
-    cat > "$CFG/$snell_conf" << EOF
-[snell-server]
-listen = $listen_addr:$snell_backend_port
-psk = $psk
-$ipv6_line
-obfs = off
-EOF
-    
-    register_protocol "$protocol_name" "$(build_config \
-        psk "$psk" port "$port" sni "$sni" stls_password "$stls_password" \
-        snell_backend_port "$snell_backend_port" version "$version")"
+    record=$(build_config psk "$psk" port "$port" version "$version" \
+        sni "$sni" stls_password "$stls_password") || return 1
+    _apply_mihomo_node_change "$protocol_name" "${INSTALL_MODE:-add}" "${REPLACE_PORT:-all}" "$record" || return 1
+    unset INSTALL_MODE REPLACE_PORT
     echo "server" > "$CFG/role"
 }
 
@@ -13103,25 +13270,14 @@ gen_socks_server_config() {
     echo "server" > "$CFG/role"
 }
 
-# Snell v5 服务端配置
+# Snell v5 服务端配置（由 Mihomo 共享服务承载）
 gen_snell_v5_server_config() {
-    local psk="$1" port="$2" version="${3:-5}"
+    local psk="$1" port="$2" version="${3:-5}" record
     mkdir -p "$CFG"
+    record=$(build_config psk "$psk" port "$port" version "$version") || return 1
+    _apply_mihomo_node_change "snell-v5" "${INSTALL_MODE:-add}" "${REPLACE_PORT:-all}" "$record" || return 1
+    unset INSTALL_MODE REPLACE_PORT
 
-    local listen_addr=$(_listen_addr)
-    local ipv6_enabled="false"
-    [[ "$listen_addr" == "::" ]] && ipv6_enabled="true"
-
-    cat > "$CFG/snell-v5.conf" << EOF
-[snell-server]
-listen = $(_fmt_hostport "$listen_addr" "$port")
-psk = $psk
-version = $version
-ipv6 = $ipv6_enabled
-obfs = off
-EOF
-
-    register_protocol "snell-v5" "$(build_config psk "$psk" port "$port" version "$version")"
     _save_join_info "snell-v5" "SNELL-V5|%s|$port|$psk|$version" \
         gen_snell_v5_link "%s" "$port" "$psk" "$version"
     cp "$CFG/snell-v5.join" "$CFG/join.txt" 2>/dev/null
@@ -21683,7 +21839,7 @@ do_install_server() {
     core=$(protocol_core "$protocol")
     
     # 检查该协议是否已安装
-    if is_protocol_installed "$protocol"; then
+    if is_protocol_installed "$protocol" && [[ "$protocol" != "snell" && "$protocol" != "snell-v5" ]]; then
         # 处理已安装协议的多端口选择
         if [[ "$core" != "standalone" ]]; then
             handle_existing_protocol "$protocol" "$core" || return 1
@@ -21834,22 +21990,14 @@ do_install_server() {
         hy2|tuic|anytls)
             install_singbox || { _err "Sing-box 安装失败"; _pause; return 1; }
             ;;
-        snell)
-            install_snell || { _err "Snell 安装失败"; _pause; return 1; }
-            ;;
-        snell-v5)
-            install_snell_v5 || { _err "Snell v5 安装失败"; _pause; return 1; }
+        snell|snell-v5)
+            install_mihomo || { _err "Mihomo 安装失败"; _pause; return 1; }
             ;;
         snell-v6)
             install_snell_v6 || { _err "Snell v6 安装失败"; _pause; return 1; }
             ;;
-        snell-shadowtls)
-            install_snell || { _err "Snell 安装失败"; _pause; return 1; }
-            install_shadowtls || { _err "ShadowTLS 安装失败"; _pause; return 1; }
-            ;;
-        snell-v5-shadowtls)
-            install_snell_v5 || { _err "Snell v5 安装失败"; _pause; return 1; }
-            install_shadowtls || { _err "ShadowTLS 安装失败"; _pause; return 1; }
+        snell-shadowtls|snell-v5-shadowtls)
+            install_mihomo || { _err "Mihomo 安装失败"; _pause; return 1; }
             ;;
         ss2022-shadowtls)
             install_xray || { _err "Xray 安装失败"; _pause; return 1; }
@@ -21877,12 +22025,24 @@ do_install_server() {
         echo ""
         read -rp "  是否启用 ShadowTLS (v3) 插件? [y/N]: " enable_stls_pre
         
-        if [[ "$enable_stls_pre" =~ ^[yY]$ ]]; then
-            skip_port_ask=true  # 启用 ShadowTLS 时跳过第一次端口询问
+        if [[ "$enable_stls_pre" =~ ^[yY]$ && "$protocol" == "ss2022" ]]; then
+            skip_port_ask=true  # SS2022 仍需随后分别选择外部和内部端口
         fi
     fi
+
+    # Snell v4/v5 先根据 ShadowTLS 选择确定最终协议键，再处理该键的添加或覆盖。
+    if [[ "$protocol" == "snell" || "$protocol" == "snell-v5" ]]; then
+        local target_protocol="$protocol"
+        if [[ "$enable_stls_pre" =~ ^[yY]$ ]]; then
+            [[ "$protocol" == "snell" ]] && target_protocol="snell-shadowtls" || target_protocol="snell-v5-shadowtls"
+        fi
+        protocol="$target_protocol"
+        SELECTED_PROTOCOL="$target_protocol"
+        core="mihomo"
+        handle_existing_protocol "$target_protocol" mihomo || return 1
+    fi
     
-    # 使用新的智能端口选择（ShadowTLS 模式下跳过）
+    # 使用新的智能端口选择（SS2022 ShadowTLS 模式下跳过）
     local port
     if [[ "$skip_port_ask" == "false" ]]; then
         port=$(ask_port "$protocol")
@@ -22701,14 +22861,14 @@ do_install_server() {
                 gen_trojan_server_config "$password" "$port" "$final_sni"
             fi
             ;;
-        snell|snell-v5|snell-v6)
-            # 根据协议确定版本
+        snell|snell-v5|snell-shadowtls|snell-v5-shadowtls|snell-v6)
+            # 根据最终协议键确定版本
             local version psk stls_protocol
-            if [[ "$protocol" == "snell" ]]; then
+            if [[ "$protocol" == "snell" || "$protocol" == "snell-shadowtls" ]]; then
                 version="4"
                 psk=$(head -c 16 /dev/urandom 2>/dev/null | base64 -w 0 | tr -d '/+=' | head -c 22)
                 stls_protocol="snell-shadowtls"
-            elif [[ "$protocol" == "snell-v5" ]]; then
+            elif [[ "$protocol" == "snell-v5" || "$protocol" == "snell-v5-shadowtls" ]]; then
                 version="5"
                 psk=$(ask_password 16 "Snell v5 PSK")
                 stls_protocol="snell-v5-shadowtls"
@@ -22732,11 +22892,7 @@ do_install_server() {
             
             # 使用前面询问的结果
             if [[ -n "$stls_protocol" && "$enable_stls_pre" =~ ^[yY]$ ]]; then
-                # 安装 ShadowTLS
-                _info "安装 ShadowTLS..."
-                install_shadowtls || { _err "ShadowTLS 安装失败"; _pause; return 1; }
-                
-                # 启用 ShadowTLS 模式
+                # Mihomo listener 内置 ShadowTLS，无需外部进程和内部后端端口。
                 local stls_password=$(ask_password 16 "ShadowTLS密码")
                 local default_sni=$(gen_sni)
                 
@@ -22745,20 +22901,11 @@ do_install_server() {
                 final_sni="${final_sni:-$default_sni}"
                 _is_valid_dns_name "$final_sni" || { _err "ShadowTLS 握手域名格式无效"; return 1; }
                 
-                # ShadowTLS 监听端口（对外暴露）
-                echo ""
-                echo -e "  ${D}ShadowTLS 监听端口 (对外暴露，建议 443)${NC}"
-                local stls_port=$(ask_port "$stls_protocol")
-                
-                # Snell 内部端口（自动随机生成）
-                local internal_port=$(gen_port)
-                
                 echo ""
                 _line
                 echo -e "  ${C}Snell v${version} + ShadowTLS 配置${NC}"
                 _line
-                echo -e "  对外端口: ${G}$stls_port${NC} (ShadowTLS)"
-                echo -e "  内部端口: ${G}$internal_port${NC} (Snell, 自动生成)"
+                echo -e "  端口: ${G}$port${NC} (Mihomo 内置 ShadowTLS)"
                 echo -e "  PSK: ${G}$psk${NC}"
                 echo -e "  SNI: ${G}$final_sni${NC}"
                 _line
@@ -22766,12 +22913,8 @@ do_install_server() {
                 read -rp "  确认安装? [Y/n]: " confirm
                 [[ "$confirm" =~ ^[nN]$ ]] && return
                 
-                # 切换协议
-                protocol="$stls_protocol"
-                SELECTED_PROTOCOL="$stls_protocol"
-                
                 _info "生成配置..."
-                gen_snell_shadowtls_server_config "$psk" "$stls_port" "$final_sni" "$stls_password" "$version" "$internal_port"
+                gen_snell_shadowtls_server_config "$psk" "$port" "$final_sni" "$stls_password" "$version" || return 1
             else
                 # 普通 Snell 模式
                 local snell_v6_dns_pref="default"
@@ -22896,9 +23039,9 @@ do_install_server() {
                 
                 _info "生成配置..."
                 if [[ "$version" == "4" ]]; then
-                    gen_snell_server_config "$psk" "$port" "$version"
+                    gen_snell_server_config "$psk" "$port" "$version" || return 1
                 elif [[ "$version" == "5" ]]; then
-                    gen_snell_v5_server_config "$psk" "$port" "$version"
+                    gen_snell_v5_server_config "$psk" "$port" "$version" || return 1
                 else
                     gen_snell_v6_server_config \
                         "$psk" "$port" "$version" \
@@ -23062,13 +23205,18 @@ do_install_server() {
             ;;
     esac
     
-    _info "创建服务..."
-    create_server_scripts  # 生成服务端辅助脚本（watchdog、hy2-nat、tuic-nat）
-    create_service "$protocol"
-    _info "启动服务..."
-    
     # 保存当前安装的协议名（防止被后续函数中的循环变量覆盖）
     local current_protocol="$protocol"
+
+    # Mihomo 节点已在生成器内完成配置校验、服务创建和健康检查，不再重复非事务启动。
+    if [[ "${PROTO_KIND[$current_protocol]:-}" == "mihomo" ]]; then
+        create_server_scripts
+    else
+        _info "创建服务..."
+        create_server_scripts  # 生成服务端辅助脚本（watchdog、hy2-nat、tuic-nat）
+        create_service "$protocol"
+        _info "启动服务..."
+    fi
 
     # 独立协议必须显式启用并启动当前服务。
     # 不能只依赖数据库枚举，否则数据库结构异常时会出现 unit 已创建但从未启动的情况。
@@ -23090,7 +23238,7 @@ do_install_server() {
         _ok "$current_service 已启用并启动"
     fi
     
-    if start_services; then
+    if [[ "${PROTO_KIND[$current_protocol]:-}" == "mihomo" ]] || start_services; then
         create_shortcut   # 安装成功才创建快捷命令
 
         # 对 Sing-box 协议做一次显式重建与校验，避免交互安装后配置未完全落盘
@@ -23164,7 +23312,9 @@ do_install_server() {
         
         # 获取当前安装的端口号
         local installed_port=""
-        if [[ "$INSTALL_MODE" == "replace" && -n "$REPLACE_PORT" ]]; then
+        if [[ "${PROTO_KIND[$current_protocol]:-}" == "mihomo" ]]; then
+            installed_port="$port"
+        elif [[ "$INSTALL_MODE" == "replace" && -n "$REPLACE_PORT" ]]; then
             # 覆盖模式：使用被覆盖的端口（可能已更新为新端口）
             installed_port="$REPLACE_PORT"
         else

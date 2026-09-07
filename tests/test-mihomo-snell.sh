@@ -920,6 +920,204 @@ test_mihomo_alpine_logs_use_dedicated_file_then_messages_fallback() (
     [[ "$output" == 'vless-mihomo: fallback line' ]]
 )
 
+prepare_mihomo_transaction_fixture() {
+    source "$SCRIPT"
+    init_db
+    TEST_SERVICE_RUNNING=false
+    TEST_FAIL_RESTART=false
+    export TEST_FAIL_VALIDATION=false
+    export MIHOMO_TX_LOG="$TEST_TMP/svc.log"
+    : >"$TEST_TMP/svc.log"
+    cat >"$MIHOMO_BIN" <<'EOF'
+#!/usr/bin/env bash
+printf '%s\n' validate >>"$MIHOMO_TX_LOG"
+[[ "$1" == "-t" && "$2" == "-f" && -f "$3" ]] || exit 1
+[[ "$TEST_FAIL_VALIDATION" == false ]]
+EOF
+    chmod 700 "$MIHOMO_BIN"
+    systemctl() {
+        printf 'systemctl:%s\n' "$*" >>"$TEST_TMP/systemctl.log"
+    }
+    create_mihomo_service() {
+        printf '%s\n' create >>"$TEST_TMP/svc.log"
+        touch "$SYSTEMD_DIR/vless-mihomo.service"
+    }
+    svc() {
+        local action="$1" name="$2"
+        printf '%s:%s\n' "$action" "$name" >>"$TEST_TMP/svc.log"
+        [[ "$name" == vless-mihomo ]] || return 1
+        case "$action" in
+            status) [[ "$TEST_SERVICE_RUNNING" == true ]] ;;
+            start) TEST_SERVICE_RUNNING=true ;;
+            restart)
+                if [[ "$TEST_FAIL_RESTART" == true ]]; then
+                    TEST_FAIL_RESTART=false
+                    return 1
+                fi
+                TEST_SERVICE_RUNNING=true
+                ;;
+            stop) TEST_SERVICE_RUNNING=false ;;
+            enable|disable) return 0 ;;
+            *) return 1 ;;
+        esac
+    }
+    _mihomo_ports_healthy() {
+        printf '%s\n' health >>"$TEST_TMP/svc.log"
+        [[ "$(mihomo_list_ports "$1")" == "$(jq -r '.listeners[].port' "$MIHOMO_CONFIG")" ]]
+    }
+}
+
+test_mihomo_transaction_adds_multiple_protocol_port_records() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    prepare_mihomo_transaction_fixture
+
+    _apply_mihomo_node_change snell add all '{"port":41001,"psk":"v4-one","version":4}' || return 1
+    _apply_mihomo_node_change snell add all '{"port":41002,"psk":"v4-two","version":4}' || return 1
+    _apply_mihomo_node_change snell-v5 add all '{"port":51001,"psk":"v5-one","version":5}' || return 1
+
+    jq -e '.mihomo.snell == [
+        {port:41001,psk:"v4-one",version:4},
+        {port:41002,psk:"v4-two",version:4}
+    ] and .mihomo["snell-v5"] == [{port:51001,psk:"v5-one",version:5}]' "$DB_FILE" >/dev/null || return 1
+    jq -e '(.listeners | length) == 3 and
+        ([.listeners[].port] == [41001,41002,51001])' "$MIHOMO_CONFIG" >/dev/null || return 1
+    [[ "$(<"$TEST_TMP/svc.log")" == $'status:vless-mihomo\nvalidate\ncreate\nenable:vless-mihomo\nstart:vless-mihomo\nstatus:vless-mihomo\nhealth\nstatus:vless-mihomo\nvalidate\nrestart:vless-mihomo\nstatus:vless-mihomo\nhealth\nstatus:vless-mihomo\nvalidate\nrestart:vless-mihomo\nstatus:vless-mihomo\nhealth' ]]
+)
+
+test_mihomo_transaction_replaces_only_selected_port() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    prepare_mihomo_transaction_fixture
+    write_mixed_mihomo_db
+    generate_mihomo_config
+    TEST_SERVICE_RUNNING=true
+    : >"$TEST_TMP/svc.log"
+
+    _apply_mihomo_node_change snell replace 41001 '{"port":41001,"psk":"v4-replaced","version":4}' || return 1
+
+    jq -e '.mihomo.snell == [
+        {port:41001,psk:"v4-replaced",version:4},
+        {port:41002,psk:"v4-two",version:4}
+    ] and .mihomo["snell-v5"][0].psk == "v5-one"' "$DB_FILE" >/dev/null || return 1
+    jq -e '(.listeners | length) == 4 and
+        (.listeners[] | select(.port == 41001).psk) == "v4-replaced"' "$MIHOMO_CONFIG" >/dev/null
+)
+
+test_mihomo_transaction_removes_only_selected_port() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    prepare_mihomo_transaction_fixture
+    write_mixed_mihomo_db
+    generate_mihomo_config
+    TEST_SERVICE_RUNNING=true
+
+    _apply_mihomo_node_change snell remove 41002 '{}' || return 1
+
+    jq -e '.mihomo.snell == [{port:41001,psk:"v4-one",version:4}] and
+        .mihomo["snell-v5"][0].port == 51001' "$DB_FILE" >/dev/null || return 1
+    jq -e '([.listeners[].port] | index(41002)) == null and
+        ([.listeners[].port] | index(41001)) != null and
+        ([.listeners[].port] | index(51001)) != null' "$MIHOMO_CONFIG" >/dev/null
+)
+
+test_mihomo_transaction_removes_final_node_and_shared_service() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    prepare_mihomo_transaction_fixture
+    _apply_mihomo_node_change snell add all '{"port":41001,"psk":"v4-one","version":4}' || return 1
+    : >"$TEST_TMP/svc.log"
+
+    _apply_mihomo_node_change snell remove all '{}' || return 1
+
+    jq -e '.mihomo == {}' "$DB_FILE" >/dev/null || return 1
+    [[ ! -e "$MIHOMO_CONFIG" && ! -e "$SYSTEMD_DIR/vless-mihomo.service" ]] || return 1
+    [[ "$TEST_SERVICE_RUNNING" == false ]] || return 1
+    [[ "$(<"$TEST_TMP/svc.log")" == $'status:vless-mihomo\nstop:vless-mihomo\ndisable:vless-mihomo' ]]
+)
+
+test_mihomo_transaction_validation_failure_restores_exact_bytes() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    prepare_mihomo_transaction_fixture
+    write_mixed_mihomo_db
+    generate_mihomo_config
+    cp "$DB_FILE" "$TEST_TMP/db.before"
+    cp "$MIHOMO_CONFIG" "$TEST_TMP/config.before"
+    TEST_SERVICE_RUNNING=true
+    TEST_FAIL_VALIDATION=true
+    : >"$TEST_TMP/svc.log"
+
+    ! _apply_mihomo_node_change snell add all '{"port":41003,"psk":"never-committed","version":4}' || return 1
+    cmp -s "$DB_FILE" "$TEST_TMP/db.before" || return 1
+    cmp -s "$MIHOMO_CONFIG" "$TEST_TMP/config.before" || return 1
+    [[ "$(<"$TEST_TMP/svc.log")" == $'status:vless-mihomo\nvalidate' ]]
+)
+
+test_mihomo_transaction_restart_failure_restores_and_restarts_previous_state() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    prepare_mihomo_transaction_fixture
+    write_mixed_mihomo_db
+    generate_mihomo_config
+    touch "$SYSTEMD_DIR/vless-mihomo.service"
+    cp "$DB_FILE" "$TEST_TMP/db.before"
+    cp "$MIHOMO_CONFIG" "$TEST_TMP/config.before"
+    TEST_SERVICE_RUNNING=true
+    TEST_FAIL_RESTART=true
+    : >"$TEST_TMP/svc.log"
+
+    ! _apply_mihomo_node_change snell-v5 replace 51001 '{"port":51001,"psk":"never-committed","version":5}' || return 1
+    cmp -s "$DB_FILE" "$TEST_TMP/db.before" || return 1
+    cmp -s "$MIHOMO_CONFIG" "$TEST_TMP/config.before" || return 1
+    [[ "$TEST_SERVICE_RUNNING" == true ]] || return 1
+    [[ "$(<"$TEST_TMP/svc.log")" == $'status:vless-mihomo\nvalidate\nrestart:vless-mihomo\nrestart:vless-mihomo' ]]
+)
+
+test_mihomo_transaction_rejects_cross_protocol_duplicate_before_service_mutation() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    prepare_mihomo_transaction_fixture
+    _apply_mihomo_node_change snell add all '{"port":41001,"psk":"v4-one","version":4}' || return 1
+    cp "$DB_FILE" "$TEST_TMP/db.before"
+    cp "$MIHOMO_CONFIG" "$TEST_TMP/config.before"
+    : >"$TEST_TMP/svc.log"
+
+    ! _apply_mihomo_node_change snell-v5 add all '{"port":41001,"psk":"duplicate","version":5}' || return 1
+    cmp -s "$DB_FILE" "$TEST_TMP/db.before" || return 1
+    cmp -s "$MIHOMO_CONFIG" "$TEST_TMP/config.before" || return 1
+    ! grep -Eq '^(enable|disable|start|stop|restart):' "$TEST_TMP/svc.log"
+)
+
+test_snell_generators_store_only_transactional_mihomo_records() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    init_db
+    local calls=""
+    : >"$TEST_TMP/build-calls"
+    build_config() {
+        printf '%s\n' "$*" >>"$TEST_TMP/build-calls"
+        jq -n '$ARGS.named' --args "$@"
+    }
+    _apply_mihomo_node_change() {
+        calls+="$1|$2|$3|$(jq -c . <<<"$4")"$'\n'
+    }
+    _save_join_info() { :; }
+    INSTALL_MODE=add
+    REPLACE_PORT=all
+
+    gen_snell_server_config v4-key 41001 4 || return 1
+    gen_snell_v5_server_config v5-key 51001 5 || return 1
+    gen_snell_shadowtls_server_config stls-key 42001 www.microsoft.com stls-secret 4 || return 1
+
+    [[ "$(<"$TEST_TMP/build-calls")" == $'psk v4-key port 41001 version 4\npsk v5-key port 51001 version 5\npsk stls-key port 42001 version 4 sni www.microsoft.com stls_password stls-secret' ]] || return 1
+    [[ "$calls" == $'snell|add|all|{}\nsnell-v5|add|all|{}\nsnell-shadowtls|add|all|{}\n' ]] || return 1
+    jq -e '.xray == {} and .mihomo == {}' "$DB_FILE" >/dev/null || return 1
+    [[ ! -e "$CFG/snell.conf" && ! -e "$CFG/snell-v5.conf" &&
+       ! -e "$CFG/snell-shadowtls.conf" && ! -e "$CFG/snell_backend_port" ]]
+)
+
 test_validate_mihomo_config_checks_json_and_binary_arguments() (
     new_fixture
     trap cleanup_fixture EXIT
@@ -1173,5 +1371,13 @@ run_test test_generate_mihomo_config_rejects_unsafe_psk
 run_test test_generate_mihomo_config_rejects_empty_listener_set_atomically
 run_test test_generate_mihomo_config_accepts_scalar_record_and_debug_log_level
 run_test test_generate_mihomo_config_falls_back_from_invalid_log_level
+run_test test_mihomo_transaction_adds_multiple_protocol_port_records
+run_test test_mihomo_transaction_replaces_only_selected_port
+run_test test_mihomo_transaction_removes_only_selected_port
+run_test test_mihomo_transaction_removes_final_node_and_shared_service
+run_test test_mihomo_transaction_validation_failure_restores_exact_bytes
+run_test test_mihomo_transaction_restart_failure_restores_and_restarts_previous_state
+run_test test_mihomo_transaction_rejects_cross_protocol_duplicate_before_service_mutation
+run_test test_snell_generators_store_only_transactional_mihomo_records
 run_test test_validate_mihomo_config_checks_json_and_binary_arguments
 printf '%s tests passed\n' "$PASS"
