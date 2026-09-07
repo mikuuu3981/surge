@@ -29,7 +29,8 @@ Mihomo 从 v1.19.26 开始提供 Snell v4/v5 入站，从 v1.19.28 开始为 Sne
 5. 保留 Surge 官方 `snell-server-v6` 作为 Snell v6 的唯一实现。
 6. 为 Mihomo 提供与 Xray、Sing-box 相同层级的核心版本查询、通道选择、指定版本安装、
    变更日志和回滚能力。
-7. 保持现有 Surge 节点信息、订阅、systemd/OpenRC 和发行版兼容能力。
+7. 将 Mihomo 纳入与 Xray、Sing-box 一致的运行状态、服务控制、日志和 Watchdog 体系。
+8. 保持现有 Surge 节点信息、订阅、systemd/OpenRC 和发行版兼容能力。
 
 ## 非目标
 
@@ -221,9 +222,26 @@ systemd/OpenRC 服务是否引用该二进制；只有确认没有其他引用�
 `vless-mihomo` 的 systemd/OpenRC 定义直接执行脚本托管二进制与配置。只要数据库中
 至少有一个 Mihomo Snell 节点，该服务就应加入开机启动。
 
-启动、停止、重启、Watchdog、状态页、日志页、SELinux 上下文恢复、强制清理和完整
-卸载都必须认识共享服务。状态页先显示 Mihomo 核心状态，再逐项显示每个 Snell 节点
-的端口监听状态；不能再按 `snell-server` 进程名判断 v4/v5。
+Mihomo 必须完整接入现有核心运行状态体系，而不是只在安装或更新后做一次端口检查：
+
+- `show_status` 的单次数据库解析加入 `MIHOMO:` 键和 `.mihomo` 端口映射；主菜单的
+  “运行中 / 部分运行 / 已停止”汇总把 Mihomo 协议数量纳入分子和分母。
+- 当 `.mihomo` 至少存在一个协议时，通过 `svc status vless-mihomo` 判断共享核心；
+  服务运行时，其所属协议与 Xray、Sing-box 一样计为运行，服务停止时计为停止。
+- `show_services_status` 增加独立的“Mihomo 服务”行，并在其下列出当前托管的 Snell
+  v4/v5、普通或 ShadowTLS 协议。
+- 已安装协议总览增加“Mihomo 协议（共享服务）”分组，逐协议显示一个或多个端口。
+- 启动全部、停止全部、暂停、恢复、重启和自动修复流程均操作 `vless-mihomo`；多个
+  Snell listener 只能登记一次共享服务，不能按节点重复启动。
+- systemd 以 unit 状态为准；OpenRC 在原生状态不可用时通过 `SVC_PROC` 将
+  `vless-mihomo` 映射到 `vless-mihomo` 进程名作为回退。
+- Watchdog 在 `.mihomo` 非空时只监控一次共享服务；检测失败后先校验完整配置，再重启，
+  避免按单个 Snell 协议反复重启同一进程。
+- 日志菜单支持 systemd 的 `journalctl -u vless-mihomo` 和 Alpine 的
+  `/var/log/vless/mihomo.log`，并提供配置校验、调试日志开关和重启提示。
+- 状态详情除共享服务状态外逐项检查 listener 端口；服务在运行但部分端口未监听时显示
+  “部分异常”，不得笼统报告全部正常。
+- SELinux 上下文恢复、强制清理和完整卸载加入 Mihomo 二进制、配置和服务资源。
 
 核心版本管理菜单新增 Mihomo，并与 Xray、Sing-box 使用一致的交互和缓存框架：
 
@@ -285,6 +303,15 @@ systemd/OpenRC 服务是否引用该二进制；只有确认没有其他引用�
 - 单栈与双栈监听。
 - 重复端口、无效版本、缺失密码和无效 SNI 被拒绝。
 
+### 运行状态与服务控制用例
+
+- `.mihomo` 为空时不显示、不启动也不监控 Mihomo 服务。
+- 一个或多个 Mihomo 协议均只对应一个共享服务。
+- 主状态汇总正确计算全部运行、部分运行和全部停止。
+- 服务运行但某个 listener 未监听时显示部分异常及具体端口。
+- systemd 与 OpenRC 都能执行状态、启动、停止、重启、启用和禁用操作。
+- Watchdog、暂停/恢复、日志查看和自动修复均指向 `vless-mihomo`。
+
 ### 核心版本管理用例
 
 - 正确解析当前版本、稳定版和带预发布后缀的版本。
@@ -319,5 +346,7 @@ Snell v6 并存。
 4. 旧 v4/v5 节点自动迁移，客户端参数保持不变。
 5. 迁移失败时旧服务恢复到原状态，迁移成功后旧 v4/v5 资源立即清理。
 6. SS2022+ShadowTLS 和 Snell v6 不受迁移影响。
-7. 核心版本菜单可查看和更新 Mihomo 的稳定版、预发布版与指定版本，且失败可回滚。
-8. 所有生成配置通过 Mihomo 校验，脚本通过 Bash 语法与帮助路径检查。
+7. Mihomo 在主状态、服务状态、日志、Watchdog 和全部服务控制入口中与其他共享核心
+   一致，并能报告单个 listener 异常。
+8. 核心版本菜单可查看和更新 Mihomo 的稳定版、预发布版与指定版本，且失败可回滚。
+9. 所有生成配置通过 Mihomo 校验，脚本通过 Bash 语法与帮助路径检查。
