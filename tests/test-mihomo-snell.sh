@@ -498,6 +498,21 @@ test_create_mihomo_systemd_service_definition() (
     [[ "$(<"$TEST_TMP/systemctl.args")" == "daemon-reload" ]]
 )
 
+test_create_mihomo_systemd_service_fails_when_unit_write_fails() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    rm -rf "$VLESS_TEST_SYSTEMD_DIR"
+    printf '%s\n' not-a-directory >"$VLESS_TEST_SYSTEMD_DIR"
+    source "$SCRIPT"
+    DISTRO=debian
+    systemctl() { touch "$TEST_TMP/daemon-reload-touched"; return 0; }
+
+    if create_mihomo_service 2>/dev/null; then
+        return 1
+    fi
+    [[ ! -e "$TEST_TMP/daemon-reload-touched" ]]
+)
+
 test_create_mihomo_openrc_service_definition() (
     new_fixture
     trap cleanup_fixture EXIT
@@ -550,6 +565,32 @@ test_start_services_runs_one_shared_mihomo_core() (
     [[ "$(<"$TEST_TMP/calls")" == $'install\ngenerate\nvalidate\ncreate' ]] || return 1
     [[ "$(grep -c '^vless-mihomo|vless-mihomo|' "$TEST_TMP/start")" -eq 1 ]] || return 1
     grep -q '|:$' "$TEST_TMP/start"
+)
+
+test_start_services_ignores_legacy_xray_snell_when_mihomo_namespace_empty() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    jq -n '{
+      version:"4.0.0", singbox:{}, mihomo:{}, meta:{},
+      xray:{snell:{port:41001,psk:"legacy-v4",version:4}}
+    }' >"$DB_FILE"
+    init_db() { :; }
+    install_mihomo() { touch "$TEST_TMP/install-touched"; }
+    generate_mihomo_config() { touch "$TEST_TMP/generate-touched"; }
+    create_mihomo_service() { touch "$TEST_TMP/create-touched"; }
+    _start_core_service() { touch "$TEST_TMP/start-touched"; }
+    svc() { printf '%s:%s\n' "$1" "$2" >>"$TEST_TMP/svc"; }
+    _info() { :; }
+    _err() { :; }
+    _warn() { :; }
+
+    start_services >/dev/null
+    [[ ! -e "$TEST_TMP/install-touched" ]] || return 1
+    [[ ! -e "$TEST_TMP/generate-touched" ]] || return 1
+    [[ ! -e "$TEST_TMP/create-touched" ]] || return 1
+    [[ ! -e "$TEST_TMP/start-touched" ]] || return 1
+    ! grep -q 'vless-mihomo' "$TEST_TMP/svc"
 )
 
 test_start_services_does_not_start_mihomo_without_service_definition() (
@@ -639,7 +680,12 @@ test_mihomo_runtime_consistency_ignores_empty_namespace() (
     new_fixture
     trap cleanup_fixture EXIT
     source "$SCRIPT"
-    jq -n '{version:"4.0.0",xray:{},singbox:{},mihomo:{},meta:{}}' >"$DB_FILE"
+    jq -n '{
+      version:"4.0.0", singbox:{}, mihomo:{}, meta:{},
+      xray:{snell:{port:41001,psk:"legacy-v4",version:4}}
+    }' >"$DB_FILE"
+    touch "$MIHOMO_BIN"
+    chmod 700 "$MIHOMO_BIN"
     generate_mihomo_config() { touch "$TEST_TMP/generated"; }
     svc() { touch "$TEST_TMP/service-touched"; }
 
@@ -1095,8 +1141,10 @@ run_test test_mihomo_openrc_status_falls_back_to_shared_process
 run_test test_watchdog_has_one_validated_mihomo_entry
 run_test test_mihomo_ports_healthy_requires_every_listener
 run_test test_create_mihomo_systemd_service_definition
+run_test test_create_mihomo_systemd_service_fails_when_unit_write_fails
 run_test test_create_mihomo_openrc_service_definition
 run_test test_start_services_runs_one_shared_mihomo_core
+run_test test_start_services_ignores_legacy_xray_snell_when_mihomo_namespace_empty
 run_test test_start_services_does_not_start_mihomo_without_service_definition
 run_test test_mihomo_runtime_consistency_repairs_invalid_or_unhealthy_runtime
 run_test test_mihomo_runtime_consistency_stops_if_service_definition_fails

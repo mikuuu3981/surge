@@ -3939,6 +3939,15 @@ get_singbox_protocols()    { filter_installed "$SINGBOX_PROTOCOLS"; }
 get_mihomo_protocols() {
     filter_installed "$MIHOMO_PROTOCOLS"
 }
+
+# 运行时仅处理已经进入 .mihomo 的记录；迁移前的 .xray Snell 仍由旧服务负责。
+get_mihomo_runtime_protocols() {
+    local installed protocol
+    installed=$(db_list_protocols "mihomo") || return 0
+    for protocol in $MIHOMO_PROTOCOLS; do
+        grep -qx "$protocol" <<<"$installed" && printf '%s\n' "$protocol"
+    done
+}
 get_standalone_protocols() { filter_installed "$STANDALONE_PROTOCOLS"; }
 
 # 生成用户级路由规则
@@ -11930,7 +11939,7 @@ depend() {
 EOF
         chmod +x "$OPENRC_DIR/$service_name"
     else
-        cat >"$SYSTEMD_DIR/${service_name}.service" <<EOF
+        if ! cat >"$SYSTEMD_DIR/${service_name}.service" <<EOF
 [Unit]
 Description=Mihomo Snell Proxy Server
 After=network.target
@@ -11946,6 +11955,9 @@ LimitNOFILE=51200
 [Install]
 WantedBy=multi-user.target
 EOF
+        then
+            return 1
+        fi
         systemctl daemon-reload 2>/dev/null
     fi
 }
@@ -13721,7 +13733,8 @@ start_services() {
     fi
     
     # 3. 启动 Mihomo 共享服务（Snell v4/v5 与内置 ShadowTLS）
-    local mihomo_protocols=$(get_mihomo_protocols)
+    local mihomo_protocols
+    mihomo_protocols=$(get_mihomo_runtime_protocols)
     if [[ -n "$mihomo_protocols" ]]; then
         if [[ ! -x "$MIHOMO_BIN" ]]; then
             _info "安装 Mihomo..."
@@ -13827,7 +13840,7 @@ ensure_singbox_runtime_consistency() {
 
 ensure_mihomo_runtime_consistency() {
     local mihomo_protocols
-    mihomo_protocols=$(get_mihomo_protocols)
+    mihomo_protocols=$(get_mihomo_runtime_protocols)
     [[ -z "$mihomo_protocols" ]] && return 0
     is_paused && return 0
     [[ -x "$MIHOMO_BIN" ]] || return 0
