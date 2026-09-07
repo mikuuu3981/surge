@@ -3768,6 +3768,21 @@ protocol_core() {
     fi
 }
 
+# 获取协议记录实际所在的数据库命名空间。
+# 新 Mihomo 记录写入 mihomo；迁移前仍在 xray 的记录继续原地管理。
+protocol_db_core() {
+    local protocol="$1" core
+    core=$(protocol_core "$protocol")
+
+    if [[ "$core" == "standalone" ]]; then
+        echo xray
+    elif [[ "$core" == "mihomo" ]] && db_exists "xray" "$protocol"; then
+        echo xray
+    else
+        echo "$core"
+    fi
+}
+
 #═══════════════════════════════════════════════════════════════════════════════
 #  表驱动元数据 (协议/服务/进程/启动命令)
 #  说明：将 “协议差异” 集中到这里，主体流程尽量通用化
@@ -3837,10 +3852,9 @@ register_protocol() {
     local protocol="$1"
     local config_json="$2"
     
-    # 确定核心类型；独立协议继续沿用 xray 数据库命名空间。
+    # 使用记录实际所在的命名空间，避免更新旧 Snell 时重复写入 mihomo。
     local core
-    core=$(protocol_core "$protocol")
-    [[ "$core" == "standalone" ]] && core="xray"
+    core=$(protocol_db_core "$protocol")
     
     # 获取端口
     local port
@@ -3870,13 +3884,12 @@ register_protocol() {
 
 unregister_protocol() {
     local protocol="$1" core
-    core=$(protocol_core "$protocol")
+    core=$(protocol_db_core "$protocol")
+    db_del "$core" "$protocol" 2>/dev/null
 
-    # 独立协议继续存放在 xray；Mihomo 协议同时清理迁移前的旧记录。
-    if [[ "$core" == "standalone" ]]; then
-        db_del "xray" "$protocol" 2>/dev/null
-    else
-        db_del "$core" "$protocol" 2>/dev/null
+    # 清理修复前可能已重复写入的另一份 Mihomo 记录。
+    if [[ "$(protocol_core "$protocol")" == "mihomo" ]]; then
+        [[ "$core" == "xray" ]] && db_del "mihomo" "$protocol" 2>/dev/null
         [[ "$core" == "mihomo" ]] && db_del "xray" "$protocol" 2>/dev/null
     fi
 }
@@ -3890,13 +3903,8 @@ get_installed_protocols() {
 
 is_protocol_installed() {
     local protocol="$1" core
-    core=$(protocol_core "$protocol")
-    [[ "$core" == "standalone" ]] && core="xray"
-
-    db_exists "$core" "$protocol" && return 0
-    # 自动迁移实现前，继续识别旧 xray 命名空间中的 Snell 记录。
-    [[ "$core" == "mihomo" ]] && db_exists "xray" "$protocol" && return 0
-    return 1
+    core=$(protocol_db_core "$protocol")
+    db_exists "$core" "$protocol"
 }
 
 filter_installed() { # filter_installed "proto1 proto2 ..."
@@ -6076,10 +6084,9 @@ ask_port() {
             fi
         fi
         
-        # 确定当前协议的数据库核心类型
+        # 确定当前协议记录实际所在的数据库命名空间
         local current_core
-        current_core=$(protocol_core "$protocol")
-        [[ "$current_core" == "standalone" ]] && current_core="xray"
+        current_core=$(protocol_db_core "$protocol")
         
         # 检查端口冲突（跨协议检测）
         if ! check_port_conflict "$custom_port" "$protocol" "$current_core"; then
@@ -6140,7 +6147,8 @@ ask_port() {
 # 参数: $1=protocol, $2=core(xray/singbox)
 # 返回: 0=继续安装, 1=取消
 handle_existing_protocol() {
-    local protocol="$1" core="$2"
+    local protocol="$1" core
+    core=$(protocol_db_core "$protocol")
     
     # 获取已有端口列表
     local ports=$(db_list_ports "$core" "$protocol")
@@ -12938,10 +12946,7 @@ create_service() {
     
     # 获取协议配置所在的数据库核心
     _get_proto_core() {
-        local proto="$1" core
-        core=$(protocol_core "$proto")
-        [[ "$core" == "standalone" ]] && core="xray"
-        echo "$core"
+        protocol_db_core "$1"
     }
 
     case "$kind" in
@@ -20402,10 +20407,9 @@ show_services_status() {
 select_port_to_uninstall() {
     local protocol="$1"
     
-    # 确定数据库核心类型
+    # 确定协议记录实际所在的数据库命名空间
     local core
-    core=$(protocol_core "$protocol")
-    [[ "$core" == "standalone" ]] && core="xray"
+    core=$(protocol_db_core "$protocol")
     
     # 获取端口列表
     local ports=$(db_list_ports "$core" "$protocol")
@@ -20487,9 +20491,10 @@ uninstall_specific_protocol() {
     # 选择要卸载的端口
     select_port_to_uninstall "$selected_protocol" || return 1
     
-    # 确定核心类型
-    local core
-    core=$(protocol_core "$selected_protocol")
+    # 保留运行时分类，并确定协议记录实际所在的数据库命名空间
+    local core_type core
+    core_type=$(protocol_core "$selected_protocol")
+    core=$(protocol_db_core "$selected_protocol")
     
     echo -e "  将卸载: ${R}$(get_protocol_name $selected_protocol)${NC}"
     read -rp "  确认卸载? [y/N]: " confirm
@@ -20509,7 +20514,7 @@ uninstall_specific_protocol() {
             echo -e "${CYAN}卸载协议 $selected_protocol 的端口 $SELECTED_PORT...${NC}"
             
             # 删除指定端口实例
-            if [[ "$core" != "standalone" ]]; then
+            if [[ "$core_type" != "standalone" ]]; then
                 db_remove_port "$core" "$selected_protocol" "$SELECTED_PORT"
                 
                 # 检查是否还有其他端口实例
@@ -20572,7 +20577,7 @@ uninstall_specific_protocol() {
             echo -e "${CYAN}卸载协议 $selected_protocol 的端口 $SELECTED_PORT...${NC}"
             
             # 删除指定端口实例
-            if [[ "$core" != "standalone" ]]; then
+            if [[ "$core_type" != "standalone" ]]; then
                 db_remove_port "$core" "$selected_protocol" "$SELECTED_PORT"
                 
                 # 检查是否还有其他端口实例
@@ -20642,7 +20647,7 @@ uninstall_specific_protocol() {
             echo -e "${CYAN}卸载协议 $selected_protocol 的端口 $SELECTED_PORT...${NC}"
             
             # 删除指定端口实例
-            if [[ "$core" != "standalone" ]]; then
+            if [[ "$core_type" != "standalone" ]]; then
                 db_remove_port "$core" "$selected_protocol" "$SELECTED_PORT"
                 
                 # 检查是否还有其他端口实例

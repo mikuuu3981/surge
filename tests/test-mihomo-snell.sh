@@ -62,8 +62,39 @@ test_protocol_core_classification() (
     [[ "$(protocol_core vless)" == xray ]]
 )
 
+test_legacy_mihomo_records_use_xray_namespace() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    CYAN= YELLOW= GREEN= RED= G= NC=
+    init_db
+    db_add xray snell '{"port":8388,"psk":"legacy"}'
+
+    [[ "$(protocol_db_core snell)" == xray ]]
+
+    local output
+    if output=$(handle_existing_protocol snell mihomo <<<"0"); then
+        return 1
+    fi
+    grep -q '8388' <<<"$output"
+
+    INSTALL_MODE=replace
+    REPLACE_PORT=8388
+    register_protocol snell '{"port":8388,"psk":"updated"}' >/dev/null
+    jq -e '.xray.snell.psk == "updated" and .mihomo.snell == null' "$DB_FILE" >/dev/null
+
+    select_port_to_uninstall snell >/dev/null
+    [[ "$SELECTED_PORT" == 8388 ]]
+
+    INSTALL_MODE=
+    REPLACE_PORT=
+    register_protocol snell-v5 '{"port":8389,"psk":"new"}' >/dev/null
+    jq -e '.mihomo["snell-v5"].psk == "new" and .xray["snell-v5"] == null' "$DB_FILE" >/dev/null
+)
+
 run_test test_source_does_not_run_cli
 run_test test_init_db_has_mihomo_namespace
 run_test test_init_db_upgrades_legacy_namespaces
 run_test test_protocol_core_classification
+run_test test_legacy_mihomo_records_use_xray_namespace
 printf '%s tests passed\n' "$PASS"
