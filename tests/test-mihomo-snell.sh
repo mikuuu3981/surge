@@ -20,7 +20,12 @@ new_fixture() {
     TEST_TMP=$(mktemp -d)
     export VLESS_TEST_CFG="$TEST_TMP/etc"
     export VLESS_TEST_MIHOMO_BIN="$TEST_TMP/bin/vless-mihomo"
-    mkdir -p "$VLESS_TEST_CFG" "$(dirname "$VLESS_TEST_MIHOMO_BIN")"
+    export VLESS_TEST_SYSTEMD_DIR="$TEST_TMP/systemd"
+    export VLESS_TEST_OPENRC_DIR="$TEST_TMP/openrc"
+    export VLESS_TEST_MIHOMO_LOG_FILE="$TEST_TMP/log/mihomo.log"
+    export VLESS_TEST_MESSAGES_LOG="$TEST_TMP/log/messages"
+    mkdir -p "$VLESS_TEST_CFG" "$(dirname "$VLESS_TEST_MIHOMO_BIN")" \
+        "$VLESS_TEST_SYSTEMD_DIR" "$VLESS_TEST_OPENRC_DIR" "$TEST_TMP/log"
 }
 
 cleanup_fixture() {
@@ -73,6 +78,18 @@ write_mixed_mihomo_db() {
         snell:[{port:41001,psk:"v4-one",version:4},{port:41002,psk:"v4-two",version:4}],
         "snell-v5":[{port:51001,psk:"v5-one",version:5}],
         "snell-v5-shadowtls":[{port:52001,psk:"v5-stls",version:5,sni:"www.microsoft.com",stls_password:"stls-secret"}]
+      }
+    }' >"$DB_FILE"
+}
+
+write_all_mihomo_protocols_db() {
+    jq -n '{
+      version:"4.0.0", xray:{}, singbox:{}, meta:{},
+      mihomo:{
+        snell:{port:41001,psk:"v4-one",version:4},
+        "snell-v5":{port:51001,psk:"v5-one",version:5},
+        "snell-shadowtls":{port:42001,psk:"v4-stls",version:4,sni:"www.microsoft.com",stls_password:"stls-v4"},
+        "snell-v5-shadowtls":{port:52001,psk:"v5-stls",version:5,sni:"www.microsoft.com",stls_password:"stls-v5"}
       }
     }' >"$DB_FILE"
 }
@@ -398,6 +415,465 @@ test_mihomo_list_ports_prints_every_listener_port() (
     [[ "$ports" == $'41001\n41002\n51001\n52001' ]]
 )
 
+test_mihomo_runtime_metadata_maps_shared_service() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    write_all_mihomo_protocols_db
+
+    [[ "$(get_mihomo_protocols)" == $'snell\nsnell-v5\nsnell-shadowtls\nsnell-v5-shadowtls' ]] || return 1
+    local protocol
+    for protocol in snell snell-v5 snell-shadowtls snell-v5-shadowtls; do
+        [[ "${PROTO_SVC[$protocol]}" == "vless-mihomo" ]] || return 1
+        [[ "${PROTO_BIN[$protocol]}" == "vless-mihomo" ]] || return 1
+        [[ "${PROTO_KIND[$protocol]}" == "mihomo" ]] || return 1
+    done
+    [[ "${SVC_PROC[vless-mihomo]}" == "vless-mihomo" ]]
+)
+
+test_mihomo_openrc_status_falls_back_to_shared_process() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    DISTRO=alpine
+    rc-service() { return 1; }
+    _pgrep() { [[ "$1" == vless-mihomo ]]; }
+
+    svc status vless-mihomo
+)
+
+test_watchdog_has_one_validated_mihomo_entry() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    write_all_mihomo_protocols_db
+
+    create_server_scripts
+    [[ -x "$CFG/watchdog.sh" ]] || return 1
+    [[ "$(grep -o 'vless-mihomo:vless-mihomo' "$CFG/watchdog.sh" | wc -l)" -eq 1 ]] || return 1
+    grep -Fq 'vless-mihomo -t -f "$CFG/mihomo.yaml"' "$CFG/watchdog.sh"
+)
+
+test_mihomo_ports_healthy_requires_every_listener() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    write_all_mihomo_protocols_db
+    ss() {
+        cat <<'EOF'
+LISTEN 0 4096 0.0.0.0:41001 0.0.0.0:*
+LISTEN 0 4096 [::]:51001 [::]:*
+LISTEN 0 4096 0.0.0.0:42001 0.0.0.0:*
+LISTEN 0 4096 [::]:52001 [::]:*
+EOF
+    }
+
+    _mihomo_ports_healthy "$DB_FILE" || return 1
+
+    ss() {
+        cat <<'EOF'
+LISTEN 0 4096 0.0.0.0:41001 0.0.0.0:*
+LISTEN 0 4096 [::]:51001 [::]:*
+LISTEN 0 4096 0.0.0.0:42001 0.0.0.0:*
+EOF
+    }
+    ! _mihomo_ports_healthy "$DB_FILE"
+)
+
+test_create_mihomo_systemd_service_definition() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    DISTRO=debian
+    systemctl() { printf '%s\n' "$*" >"$TEST_TMP/systemctl.args"; }
+
+    create_mihomo_service
+    local unit="$VLESS_TEST_SYSTEMD_DIR/vless-mihomo.service"
+    [[ -f "$unit" ]] || return 1
+    grep -Fq "ExecStartPre=$MIHOMO_BIN -t -f $MIHOMO_CONFIG" "$unit" || return 1
+    grep -Fq "ExecStart=$MIHOMO_BIN -d $CFG -f $MIHOMO_CONFIG" "$unit" || return 1
+    grep -Fq 'Restart=always' "$unit" || return 1
+    grep -Fq 'RestartSec=3' "$unit" || return 1
+    grep -Fq 'LimitNOFILE=51200' "$unit" || return 1
+    [[ "$(<"$TEST_TMP/systemctl.args")" == "daemon-reload" ]]
+)
+
+test_create_mihomo_openrc_service_definition() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    DISTRO=alpine
+    rm -rf "$(dirname "$VLESS_TEST_MIHOMO_LOG_FILE")"
+
+    create_mihomo_service
+    local init="$VLESS_TEST_OPENRC_DIR/vless-mihomo"
+    [[ -d "$(dirname "$VLESS_TEST_MIHOMO_LOG_FILE")" ]] || return 1
+    [[ -x "$init" ]] || return 1
+    grep -Fq "command=\"$MIHOMO_BIN\"" "$init" || return 1
+    grep -Fq "command_args=\"-d $CFG -f $MIHOMO_CONFIG\"" "$init" || return 1
+    grep -Fq 'command_background="yes"' "$init" || return 1
+    grep -Fq 'pidfile="/run/vless-mihomo.pid"' "$init" || return 1
+    grep -Fq 'need net' "$init" || return 1
+    grep -Fq 'output_log="/var/log/vless/mihomo.log"' "$init" || return 1
+    grep -Fq 'error_log="/var/log/vless/mihomo.log"' "$init"
+)
+
+test_start_services_runs_one_shared_mihomo_core() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    write_mixed_mihomo_db
+    init_db() { :; }
+    get_xray_protocols() { :; }
+    get_singbox_protocols() { :; }
+    get_standalone_protocols() { :; }
+    install_mihomo() {
+        touch "$MIHOMO_BIN"
+        chmod 700 "$MIHOMO_BIN"
+        printf '%s\n' install >>"$TEST_TMP/calls"
+    }
+    generate_mihomo_config() {
+        printf '%s\n' '{}' >"$MIHOMO_CONFIG"
+        printf '%s\n' generate >>"$TEST_TMP/calls"
+    }
+    validate_mihomo_config() {
+        [[ "$1" == "$MIHOMO_CONFIG" && "$2" == "$MIHOMO_BIN" ]]
+        printf '%s\n' validate >>"$TEST_TMP/calls"
+    }
+    create_mihomo_service() { printf '%s\n' create >>"$TEST_TMP/calls"; }
+    _start_core_service() {
+        printf '%s|%s|%s|%s\n' "$1" "$2" "$3" "$4" >>"$TEST_TMP/start"
+    }
+    svc() { :; }
+
+    start_services >/dev/null
+    [[ "$(<"$TEST_TMP/calls")" == $'install\ngenerate\nvalidate\ncreate' ]] || return 1
+    [[ "$(grep -c '^vless-mihomo|vless-mihomo|' "$TEST_TMP/start")" -eq 1 ]] || return 1
+    grep -q '|:$' "$TEST_TMP/start"
+)
+
+test_start_services_does_not_start_mihomo_without_service_definition() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    write_mixed_mihomo_db
+    touch "$MIHOMO_BIN"
+    chmod 700 "$MIHOMO_BIN"
+    init_db() { :; }
+    get_xray_protocols() { :; }
+    get_singbox_protocols() { :; }
+    get_standalone_protocols() { :; }
+    generate_mihomo_config() { printf '%s\n' '{}' >"$MIHOMO_CONFIG"; }
+    validate_mihomo_config() { return 0; }
+    create_mihomo_service() { return 1; }
+    _start_core_service() { touch "$TEST_TMP/start-touched"; }
+    svc() { :; }
+    _err() { :; }
+    _warn() { :; }
+
+    if start_services >/dev/null; then
+        return 1
+    fi
+    [[ ! -e "$TEST_TMP/start-touched" ]]
+)
+
+test_mihomo_runtime_consistency_repairs_invalid_or_unhealthy_runtime() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    write_mixed_mihomo_db
+    touch "$MIHOMO_BIN"
+    chmod 700 "$MIHOMO_BIN"
+    printf '%s\n' '{}' >"$MIHOMO_CONFIG"
+    local health_calls=0
+    validate_mihomo_config() {
+        printf '%s\n' validate >>"$TEST_TMP/calls"
+        [[ -f "$1" && "$2" == "$MIHOMO_BIN" ]]
+    }
+    _mihomo_ports_healthy() {
+        health_calls=$((health_calls + 1))
+        printf '%s\n' health >>"$TEST_TMP/calls"
+        [[ $health_calls -gt 1 ]]
+    }
+    generate_mihomo_config() {
+        printf '%s\n' '{}' >"$MIHOMO_CONFIG"
+        printf '%s\n' generate >>"$TEST_TMP/calls"
+    }
+    create_server_scripts() { printf '%s\n' scripts >>"$TEST_TMP/calls"; }
+    create_mihomo_service() { printf '%s\n' service >>"$TEST_TMP/calls"; }
+    svc() {
+        printf '%s:%s\n' "$1" "$2" >>"$TEST_TMP/svc"
+        return 0
+    }
+    _info() { :; }
+    _ok() { :; }
+
+    ensure_mihomo_runtime_consistency
+    grep -q '^generate$' "$TEST_TMP/calls" || return 1
+    [[ "$(grep -c '^validate$' "$TEST_TMP/calls")" -ge 1 ]] || return 1
+    [[ "$(grep -c '^health$' "$TEST_TMP/calls")" -eq 2 ]] || return 1
+    grep -q '^restart:vless-mihomo$' "$TEST_TMP/svc"
+)
+
+test_mihomo_runtime_consistency_stops_if_service_definition_fails() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    write_mixed_mihomo_db
+    touch "$MIHOMO_BIN" "$MIHOMO_CONFIG"
+    chmod 700 "$MIHOMO_BIN"
+    validate_mihomo_config() { return 0; }
+    _mihomo_ports_healthy() { return 1; }
+    generate_mihomo_config() { return 0; }
+    create_server_scripts() { return 0; }
+    create_mihomo_service() { return 1; }
+    svc() { printf '%s:%s\n' "$1" "$2" >>"$TEST_TMP/svc"; return 1; }
+    _info() { :; }
+
+    declare -F ensure_mihomo_runtime_consistency >/dev/null || return 1
+    ! ensure_mihomo_runtime_consistency
+    ! grep -Eq '^(enable|restart|start):' "$TEST_TMP/svc"
+)
+
+test_mihomo_runtime_consistency_ignores_empty_namespace() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    jq -n '{version:"4.0.0",xray:{},singbox:{},mihomo:{},meta:{}}' >"$DB_FILE"
+    generate_mihomo_config() { touch "$TEST_TMP/generated"; }
+    svc() { touch "$TEST_TMP/service-touched"; }
+
+    declare -F ensure_mihomo_runtime_consistency >/dev/null || return 1
+    ensure_mihomo_runtime_consistency
+    [[ ! -e "$TEST_TMP/generated" && ! -e "$TEST_TMP/service-touched" ]]
+)
+
+test_mihomo_lifecycle_cleanup_stops_shared_service_once() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    DISTRO=alpine
+    rc-service() { return 0; }
+    svc() { printf '%s:%s\n' "$1" "$2" >>"$TEST_TMP/svc"; }
+    cleanup_hy2_nat_rules() { :; }
+
+    stop_services >/dev/null
+    force_cleanup
+    [[ "$(grep -c '^stop:vless-mihomo$' "$TEST_TMP/svc")" -eq 2 ]]
+)
+
+test_set_mihomo_log_level_commits_complete_config() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    write_mixed_mihomo_db
+    printf '%s\n' '{"old":true}' >"$MIHOMO_CONFIG"
+    generate_mihomo_config() {
+        local db_file="${1:-$DB_FILE}" output_file="${2:-$MIHOMO_CONFIG}"
+        jq -n --arg level "$(jq -r '.meta.mihomo_log_level' "$db_file")" '{"log-level":$level,listeners:[1]}' >"$output_file"
+    }
+    validate_mihomo_config() { jq -e '.listeners | length == 1' "$1" >/dev/null; }
+    svc() { [[ "$1:$2" == 'restart:vless-mihomo' ]]; }
+
+    declare -F set_mihomo_log_level >/dev/null || return 1
+    set_mihomo_log_level debug
+    jq -e '.meta.mihomo_log_level == "debug"' "$DB_FILE" >/dev/null || return 1
+    jq -e '.["log-level"] == "debug" and (.listeners | length) == 1' "$MIHOMO_CONFIG" >/dev/null
+)
+
+test_set_mihomo_log_level_rolls_back_database_and_config() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    write_mixed_mihomo_db
+    cp "$DB_FILE" "$TEST_TMP/db.before"
+    printf '%s\n' '{"old":true}' >"$MIHOMO_CONFIG"
+    cp "$MIHOMO_CONFIG" "$TEST_TMP/config.before"
+    generate_mihomo_config() { printf '%s\n' '{"new":true}' >"${2:-$MIHOMO_CONFIG}"; }
+    validate_mihomo_config() { return 0; }
+    local restarts=0
+    svc() {
+        [[ "$1:$2" == 'restart:vless-mihomo' ]] || return 1
+        restarts=$((restarts + 1))
+        [[ $restarts -gt 1 ]]
+    }
+
+    declare -F set_mihomo_log_level >/dev/null || return 1
+    ! set_mihomo_log_level warning
+    cmp -s "$DB_FILE" "$TEST_TMP/db.before" || return 1
+    cmp -s "$MIHOMO_CONFIG" "$TEST_TMP/config.before" || return 1
+    [[ $restarts -eq 2 ]]
+)
+
+test_set_mihomo_log_level_rolls_back_on_validation_failure() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    write_mixed_mihomo_db
+    cp "$DB_FILE" "$TEST_TMP/db.before"
+    printf '%s\n' '{"old":true}' >"$MIHOMO_CONFIG"
+    cp "$MIHOMO_CONFIG" "$TEST_TMP/config.before"
+    generate_mihomo_config() { printf '%s\n' '{"new":true}' >"${2:-$MIHOMO_CONFIG}"; }
+    validate_mihomo_config() { return 1; }
+    svc() { touch "$TEST_TMP/service-touched"; }
+
+    declare -F set_mihomo_log_level >/dev/null || return 1
+    ! set_mihomo_log_level debug
+    cmp -s "$DB_FILE" "$TEST_TMP/db.before" || return 1
+    cmp -s "$MIHOMO_CONFIG" "$TEST_TMP/config.before" || return 1
+    [[ ! -e "$TEST_TMP/service-touched" ]]
+)
+
+test_mihomo_systemd_lifecycle_stops_shared_service_once() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    DISTRO=debian
+    systemctl() {
+        [[ "$1:$2" == "is-active:--quiet" ]] && return 0
+        return 0
+    }
+    svc() { printf '%s:%s\n' "$1" "$2" >>"$TEST_TMP/svc"; }
+    cleanup_hy2_nat_rules() { :; }
+
+    stop_services >/dev/null
+    [[ "$(grep -c '^stop:vless-mihomo$' "$TEST_TMP/svc")" -eq 1 ]]
+)
+
+test_mihomo_selinux_restore_includes_managed_binary() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    DISTRO=centos
+    getenforce() { printf '%s\n' Enforcing; }
+    restorecon() { printf '%s\n' "$*" >"$TEST_TMP/restorecon.args"; }
+    setsebool() { :; }
+    _info() { :; }
+
+    fix_selinux_context
+    grep -Fq "$MIHOMO_BIN" "$TEST_TMP/restorecon.args"
+)
+
+test_mihomo_status_reports_partial_anomaly_and_missing_ports() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    write_mixed_mihomo_db
+    G= Y= R= C= D= NC=
+    svc() { [[ "$1:$2" == 'status:vless-mihomo' ]]; }
+    ss() {
+        printf '%s\n' \
+            'LISTEN 0 4096 0.0.0.0:41001 0.0.0.0:*' \
+            'LISTEN 0 4096 0.0.0.0:41002 0.0.0.0:*' \
+            'LISTEN 0 4096 0.0.0.0:51001 0.0.0.0:*'
+    }
+    access_restriction_enabled() { return 1; }
+
+    local output
+    output=$(show_status)
+    grep -q '部分异常' <<<"$output" || return 1
+    grep -q '缺失端口.*52001' <<<"$output" || return 1
+    grep -q '已安装 (3个)' <<<"$output"
+)
+
+test_mihomo_service_and_protocol_presentations() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    write_mixed_mihomo_db
+    G= Y= R= C= D= W= NC=
+    svc() { [[ "$1:$2" == 'status:vless-mihomo' ]]; }
+    ss() { mihomo_list_ports "$DB_FILE" | while read -r port; do printf 'LISTEN 0 4096 0.0.0.0:%s 0.0.0.0:*\n' "$port"; done; }
+    _line() { :; }
+
+    local services overview installed
+    services=$(show_services_status)
+    overview=$(show_protocols_overview)
+    installed=$(show_all_protocols_info <<<"0")
+    grep -q 'Mihomo 服务.*运行中' <<<"$services" || return 1
+    grep -q 'Mihomo 协议 (共享服务)' <<<"$overview" || return 1
+    grep -q 'Mihomo 协议 (共享服务)' <<<"$installed" || return 1
+    grep -q '41001,41002' <<<"$installed"
+)
+
+test_service_log_menu_dispatches_one_shared_mihomo_item() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    write_mixed_mihomo_db
+    G= W= NC=
+    _header() { :; }
+    _line() { :; }
+    _err() { :; }
+    show_mihomo_diagnostics() { printf '%s\n' diagnostics-opened; }
+
+    local output
+    output=$(show_service_logs <<<"1")
+    [[ "$(grep -c 'Mihomo 服务日志' <<<"$output")" -eq 1 ]] || return 1
+    grep -q 'diagnostics-opened' <<<"$output"
+)
+
+test_mihomo_diagnostics_menu_and_systemd_logs() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    write_mixed_mihomo_db
+    G= Y= R= C= D= W= NC=
+    _header() { :; }
+    _line() { :; }
+    _item() { printf '%s) %s\n' "$1" "$2"; }
+    journalctl() { printf '%s\n' "$*" >"$TEST_TMP/journalctl.args"; }
+
+    local menu
+    menu=$(show_mihomo_diagnostics <<<"0")
+    grep -q '查看最近 50 行' <<<"$menu" || return 1
+    grep -q '实时跟踪日志' <<<"$menu" || return 1
+    grep -q '校验完整配置' <<<"$menu" || return 1
+    grep -q '启用 debug 日志' <<<"$menu" || return 1
+    grep -q '恢复 warning 日志' <<<"$menu" || return 1
+    _show_mihomo_logs last
+    [[ "$(<"$TEST_TMP/journalctl.args")" == '-u vless-mihomo --no-pager -n 50' ]]
+)
+
+test_mihomo_diagnostics_actions_validate_and_change_log_level() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    write_mixed_mihomo_db
+    G= Y= R= C= D= W= NC=
+    _header() { :; }
+    _line() { :; }
+    _item() { :; }
+    _pause() { :; }
+    _ok() { :; }
+    _err() { :; }
+    validate_mihomo_config() { printf '%s|%s\n' "$1" "$2" >"$TEST_TMP/validate.args"; }
+    set_mihomo_log_level() { printf '%s\n' "$1" >>"$TEST_TMP/levels"; }
+
+    show_mihomo_diagnostics <<<'3' >/dev/null
+    [[ "$(<"$TEST_TMP/validate.args")" == "$MIHOMO_CONFIG|$MIHOMO_BIN" ]] || return 1
+    show_mihomo_diagnostics <<<'4' >/dev/null
+    show_mihomo_diagnostics <<<'5' >/dev/null
+    [[ "$(<"$TEST_TMP/levels")" == $'debug\nwarning' ]]
+)
+
+test_mihomo_alpine_logs_use_dedicated_file_then_messages_fallback() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    DISTRO=alpine
+    printf '%s\n' first second >"$VLESS_TEST_MIHOMO_LOG_FILE"
+
+    local output
+    output=$(_show_mihomo_logs last)
+    [[ "$output" == $'first\nsecond' ]] || return 1
+
+    rm -f "$VLESS_TEST_MIHOMO_LOG_FILE"
+    printf '%s\n' 'unrelated' 'vless-mihomo: fallback line' >"$VLESS_TEST_MESSAGES_LOG"
+    output=$(_show_mihomo_logs last)
+    [[ "$output" == 'vless-mihomo: fallback line' ]]
+)
+
 test_validate_mihomo_config_checks_json_and_binary_arguments() (
     new_fixture
     trap cleanup_fixture EXIT
@@ -614,6 +1090,29 @@ run_test test_init_db_upgrades_legacy_namespaces
 run_test test_protocol_core_classification
 run_test test_legacy_mihomo_records_use_xray_namespace
 run_test test_mihomo_list_ports_prints_every_listener_port
+run_test test_mihomo_runtime_metadata_maps_shared_service
+run_test test_mihomo_openrc_status_falls_back_to_shared_process
+run_test test_watchdog_has_one_validated_mihomo_entry
+run_test test_mihomo_ports_healthy_requires_every_listener
+run_test test_create_mihomo_systemd_service_definition
+run_test test_create_mihomo_openrc_service_definition
+run_test test_start_services_runs_one_shared_mihomo_core
+run_test test_start_services_does_not_start_mihomo_without_service_definition
+run_test test_mihomo_runtime_consistency_repairs_invalid_or_unhealthy_runtime
+run_test test_mihomo_runtime_consistency_stops_if_service_definition_fails
+run_test test_mihomo_runtime_consistency_ignores_empty_namespace
+run_test test_mihomo_lifecycle_cleanup_stops_shared_service_once
+run_test test_set_mihomo_log_level_commits_complete_config
+run_test test_set_mihomo_log_level_rolls_back_database_and_config
+run_test test_set_mihomo_log_level_rolls_back_on_validation_failure
+run_test test_mihomo_systemd_lifecycle_stops_shared_service_once
+run_test test_mihomo_selinux_restore_includes_managed_binary
+run_test test_mihomo_status_reports_partial_anomaly_and_missing_ports
+run_test test_mihomo_service_and_protocol_presentations
+run_test test_service_log_menu_dispatches_one_shared_mihomo_item
+run_test test_mihomo_diagnostics_menu_and_systemd_logs
+run_test test_mihomo_diagnostics_actions_validate_and_change_log_level
+run_test test_mihomo_alpine_logs_use_dedicated_file_then_messages_fallback
 run_test test_generate_mihomo_config_builds_complete_mixed_config
 run_test test_generate_mihomo_config_rejects_duplicate_ports_atomically
 run_test test_generate_mihomo_config_rejects_version_six

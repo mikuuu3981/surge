@@ -56,12 +56,18 @@ readonly SCRIPT_RAW_URL="https://raw.githubusercontent.com/${SCRIPT_SOURCE_REPO}
 if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
     CFG="${VLESS_TEST_CFG:-/etc/vless-reality}"
     MIHOMO_BIN="${VLESS_TEST_MIHOMO_BIN:-/usr/local/bin/vless-mihomo}"
+    SYSTEMD_DIR="${VLESS_TEST_SYSTEMD_DIR:-/etc/systemd/system}"
+    OPENRC_DIR="${VLESS_TEST_OPENRC_DIR:-/etc/init.d}"
 else
     CFG="/etc/vless-reality"
     MIHOMO_BIN="/usr/local/bin/vless-mihomo"
+    SYSTEMD_DIR="/etc/systemd/system"
+    OPENRC_DIR="/etc/init.d"
 fi
-readonly CFG MIHOMO_BIN
+readonly CFG MIHOMO_BIN SYSTEMD_DIR OPENRC_DIR
 readonly MIHOMO_CONFIG="$CFG/mihomo.yaml"
+readonly MIHOMO_LOG_FILE="${VLESS_TEST_MIHOMO_LOG_FILE:-/var/log/vless/mihomo.log}"
+readonly SYSTEM_MESSAGES_LOG="${VLESS_TEST_MESSAGES_LOG:-/var/log/messages}"
 readonly MIHOMO_MIGRATION_MARKER="$CFG/.mihomo-snell-migrated-v1"
 readonly ACME_DEFAULT_EMAIL="acme@vaio.com"
 
@@ -3824,6 +3830,13 @@ for _p in snell-shadowtls snell-v5-shadowtls ss2022-shadowtls; do
     PROTO_BIN[$_p]="shadow-tls"
 done
 
+# Mihomo 统一服务：Snell v4/v5（含内置 ShadowTLS）共享一个进程。
+for _p in $MIHOMO_PROTOCOLS; do
+    PROTO_SVC[$_p]="vless-mihomo"
+    PROTO_BIN[$_p]="vless-mihomo"
+    PROTO_KIND[$_p]="mihomo"
+done
+
 BACKEND_NAME[snell-shadowtls]="vless-snell-shadowtls-backend"
 BACKEND_DESC[snell-shadowtls]="Snell Backend for ShadowTLS"
 BACKEND_EXEC[snell-shadowtls]="/usr/local/bin/snell-server -c $CFG/snell-shadowtls.conf"
@@ -3840,6 +3853,7 @@ BACKEND_EXEC[ss2022-shadowtls]="/usr/local/bin/xray run -c $CFG/ss2022-shadowtls
 declare -A SVC_PROC=(
     [vless-reality]="xray"
     [vless-singbox]="sing-box"
+    [vless-mihomo]="vless-mihomo"
     [vless-snell]="snell-server"
     [vless-snell-v5]="snell-server-v5"
     [vless-snell-v6]="snell-server-v6"
@@ -5619,7 +5633,7 @@ ensure_dual_stack_listen() {
 #═══════════════════════════════════════════════════════════════════════════════
 force_cleanup() {
     # 停止所有 vless 相关服务
-    local services="watchdog reality hy2 tuic snell snell-v5 snell-v6 anytls singbox"
+    local services="watchdog reality hy2 tuic snell snell-v5 snell-v6 anytls singbox mihomo"
     services+=" snell-shadowtls snell-v5-shadowtls ss2022-shadowtls"
     services+=" snell-shadowtls-backend snell-v5-shadowtls-backend ss2022-shadowtls-backend"
     for s in $services; do svc stop "vless-$s" 2>/dev/null; done
@@ -8102,7 +8116,7 @@ fix_selinux_context() {
     
     # 恢复文件上下文
     if command -v restorecon &>/dev/null; then
-        restorecon -Rv /usr/local/bin/xray /usr/local/bin/sing-box /usr/local/bin/snell-server \
+        restorecon -Rv /usr/local/bin/xray /usr/local/bin/sing-box "$MIHOMO_BIN" /usr/local/bin/snell-server \
             /usr/local/bin/snell-server-v5 /usr/local/bin/snell-server-v6 /usr/local/bin/anytls-server /usr/local/bin/shadow-tls \
             /etc/vless-reality 2>/dev/null || true
     fi
@@ -11000,6 +11014,77 @@ mihomo_list_ports() {
     ' "$db_file" 2>/dev/null
 }
 
+_mihomo_missing_ports() {
+    local db_file="${1:-$DB_FILE}" port
+    local listening_ports
+    listening_ports=$(ss -H -ltn 2>/dev/null | awk '{print $4}' | awk -F: '{print $NF}' | sort -u) || return 1
+
+    while IFS= read -r port; do
+        [[ -z "$port" ]] && continue
+        grep -qx "$port" <<<"$listening_ports" || printf '%s\n' "$port"
+    done < <(mihomo_list_ports "$db_file")
+}
+
+_mihomo_ports_healthy() {
+    local db_file="${1:-$DB_FILE}" ports missing
+    ports=$(mihomo_list_ports "$db_file") || return 1
+    [[ -n "$ports" ]] || return 1
+    missing=$(_mihomo_missing_ports "$db_file") || return 1
+    [[ -z "$missing" ]]
+}
+
+# 事务切换 Mihomo 日志级别：数据库与完整配置必须一起提交或回滚。
+set_mihomo_log_level() {
+    local level="$1"
+    [[ "$level" == "warning" || "$level" == "debug" ]] || return 1
+    [[ -f "$DB_FILE" ]] || return 1
+
+    local snapshot
+    snapshot=$(mktemp -d "$CFG/.mihomo-log-level.XXXXXX") || return 1
+    chmod 700 "$snapshot"
+    cp -p "$DB_FILE" "$snapshot/db.json" || { rm -rf "$snapshot"; return 1; }
+    if [[ -f "$MIHOMO_CONFIG" ]]; then
+        cp -p "$MIHOMO_CONFIG" "$snapshot/mihomo.yaml" || { rm -rf "$snapshot"; return 1; }
+    else
+        touch "$snapshot/config-absent"
+    fi
+
+    local db_tmp
+    db_tmp=$(mktemp "$CFG/db.json.mihomo-log.XXXXXX") || { rm -rf "$snapshot"; return 1; }
+    if ! jq --arg level "$level" '.meta = (.meta // {}) | .meta.mihomo_log_level = $level' \
+        "$DB_FILE" >"$db_tmp" || ! chmod 600 "$db_tmp" || ! mv "$db_tmp" "$DB_FILE"; then
+        rm -f "$db_tmp"
+        rm -rf "$snapshot"
+        return 1
+    fi
+
+    if ! generate_mihomo_config || ! validate_mihomo_config "$MIHOMO_CONFIG" "$MIHOMO_BIN"; then
+        cp -p "$snapshot/db.json" "$DB_FILE"
+        if [[ -f "$snapshot/config-absent" ]]; then
+            rm -f "$MIHOMO_CONFIG"
+        else
+            cp -p "$snapshot/mihomo.yaml" "$MIHOMO_CONFIG"
+        fi
+        rm -rf "$snapshot"
+        return 1
+    fi
+
+    if ! svc restart vless-mihomo; then
+        cp -p "$snapshot/db.json" "$DB_FILE"
+        if [[ -f "$snapshot/config-absent" ]]; then
+            rm -f "$MIHOMO_CONFIG"
+        else
+            cp -p "$snapshot/mihomo.yaml" "$MIHOMO_CONFIG"
+        fi
+        svc restart vless-mihomo >/dev/null 2>&1 || true
+        rm -rf "$snapshot"
+        return 1
+    fi
+
+    rm -rf "$snapshot"
+    return 0
+}
+
 # 从数据库重建 Mihomo 的完整配置；JSON 同时是有效 YAML。
 generate_mihomo_config() {
     local db_file="${1:-$DB_FILE}" output_file="${2:-$MIHOMO_CONFIG}"
@@ -11819,6 +11904,49 @@ LimitNOFILE=51200
 WantedBy=multi-user.target
 EOF
         systemctl daemon-reload
+    fi
+}
+
+# 创建 Mihomo 共享服务。
+create_mihomo_service() {
+    local service_name="vless-mihomo"
+
+    if [[ "$DISTRO" == "alpine" ]]; then
+        mkdir -p "$(dirname "$MIHOMO_LOG_FILE")" || return 1
+        cat >"$OPENRC_DIR/$service_name" <<EOF
+#!/sbin/openrc-run
+name="Mihomo Snell Proxy Server"
+command="$MIHOMO_BIN"
+command_args="-d $CFG -f $MIHOMO_CONFIG"
+command_background="yes"
+pidfile="/run/vless-mihomo.pid"
+output_log="/var/log/vless/mihomo.log"
+error_log="/var/log/vless/mihomo.log"
+
+depend() {
+    need net localmount
+    after firewall
+}
+EOF
+        chmod +x "$OPENRC_DIR/$service_name"
+    else
+        cat >"$SYSTEMD_DIR/${service_name}.service" <<EOF
+[Unit]
+Description=Mihomo Snell Proxy Server
+After=network.target
+
+[Service]
+Type=simple
+ExecStartPre=$MIHOMO_BIN -t -f $MIHOMO_CONFIG
+ExecStart=$MIHOMO_BIN -d $CFG -f $MIHOMO_CONFIG
+Restart=always
+RestartSec=3
+LimitNOFILE=51200
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload 2>/dev/null
     fi
 }
 
@@ -13139,6 +13267,10 @@ get_all_services() {
         esac
     done
     [[ "$has_singbox" == "true" ]] && services+="vless-singbox:sing-box "
+
+    # Mihomo 的四个协议键共享同一个服务，只生成一个监控项。
+    local mihomo_protos=$(jq -r '(.mihomo // {}) | keys[]' "$DB_FILE" 2>/dev/null)
+    [[ -n "$mihomo_protos" ]] && services+="vless-mihomo:vless-mihomo "
     
     echo "$services"
 }
@@ -13150,6 +13282,10 @@ while true; do
         IFS=':' read -r svc_name proc_name <<< "$svc_info"
         # 多种方式检测进程 (使用兼容函数)
         if ! _pgrep "$proc_name" && ! pgrep -f "$proc_name" > /dev/null 2>&1; then
+            if [[ "$svc_name" == "vless-mihomo" ]] && ! vless-mihomo -t -f "$CFG/mihomo.yaml" >/dev/null 2>&1; then
+                log "ERROR: Mihomo 配置校验失败，跳过重启 $svc_name"
+                continue
+            fi
             log "CRITICAL: $proc_name 进程不存在，尝试重启 $svc_name..."
             restart_service "$svc_name"
             sleep 5
@@ -13584,7 +13720,30 @@ start_services() {
         fi
     fi
     
-    # 3. 启动独立进程协议 (Snell 等闭源协议)
+    # 3. 启动 Mihomo 共享服务（Snell v4/v5 与内置 ShadowTLS）
+    local mihomo_protocols=$(get_mihomo_protocols)
+    if [[ -n "$mihomo_protocols" ]]; then
+        if [[ ! -x "$MIHOMO_BIN" ]]; then
+            _info "安装 Mihomo..."
+            install_mihomo || { _err "Mihomo 安装失败"; failed_services+=("vless-mihomo"); }
+        fi
+
+        if [[ -x "$MIHOMO_BIN" ]]; then
+            if generate_mihomo_config && validate_mihomo_config "$MIHOMO_CONFIG" "$MIHOMO_BIN"; then
+                if ! create_mihomo_service; then
+                    _err "Mihomo 服务定义创建失败"
+                    failed_services+=("vless-mihomo")
+                elif ! _start_core_service "vless-mihomo" "vless-mihomo" "$mihomo_protocols" ":"; then
+                    failed_services+=("vless-mihomo")
+                fi
+            else
+                _err "Mihomo 配置生成或校验失败"
+                failed_services+=("vless-mihomo")
+            fi
+        fi
+    fi
+
+    # 4. 启动独立进程协议 (Snell v6 等闭源协议)
     local standalone_protocols=$(get_standalone_protocols)
     local ind_proto
     for ind_proto in $standalone_protocols; do
@@ -13666,6 +13825,33 @@ ensure_singbox_runtime_consistency() {
     fi
 }
 
+ensure_mihomo_runtime_consistency() {
+    local mihomo_protocols
+    mihomo_protocols=$(get_mihomo_protocols)
+    [[ -z "$mihomo_protocols" ]] && return 0
+    is_paused && return 0
+    [[ -x "$MIHOMO_BIN" ]] || return 0
+
+    local need_repair=false
+    if [[ ! -f "$MIHOMO_CONFIG" ]] || ! validate_mihomo_config "$MIHOMO_CONFIG" "$MIHOMO_BIN"; then
+        need_repair=true
+    elif ! svc status vless-mihomo >/dev/null 2>&1 || ! _mihomo_ports_healthy "$DB_FILE"; then
+        need_repair=true
+    fi
+    [[ "$need_repair" == "false" ]] && return 0
+
+    _info "检测到 Mihomo 配置或监听异常，正在自动修复..."
+    generate_mihomo_config || return 1
+    validate_mihomo_config "$MIHOMO_CONFIG" "$MIHOMO_BIN" || return 1
+    create_server_scripts || return 1
+    create_mihomo_service || return 1
+    svc enable vless-mihomo >/dev/null 2>&1 || true
+    svc restart vless-mihomo || svc start vless-mihomo || return 1
+    validate_mihomo_config "$MIHOMO_CONFIG" "$MIHOMO_BIN" || return 1
+    _mihomo_ports_healthy "$DB_FILE" || return 1
+    _ok "Mihomo 配置与监听已自动修复"
+}
+
 stop_services() {
     local stopped_services=()
     
@@ -13691,6 +13877,11 @@ stop_services() {
     # 停止 Sing-box 服务 (Hy2/TUIC)
     if is_service_active vless-singbox; then
         svc stop vless-singbox 2>/dev/null && stopped_services+=("vless-singbox")
+    fi
+
+    # Mihomo 的所有入站共享一个服务，只停止一次。
+    if is_service_active vless-mihomo; then
+        svc stop vless-mihomo 2>/dev/null && stopped_services+=("vless-mihomo")
     fi
     
     # 停止独立进程协议服务 (Snell 等)
@@ -19616,6 +19807,7 @@ show_all_protocols_info() {
         
         local xray_protocols=$(get_xray_protocols)
         local singbox_protocols=$(get_singbox_protocols)
+        local mihomo_protocols=$(get_mihomo_protocols)
         local standalone_protocols=$(get_standalone_protocols)
         local all_protocols=()
         local idx=1
@@ -19657,6 +19849,20 @@ show_all_protocols_info() {
             echo ""
         fi
         
+        if [[ -n "$mihomo_protocols" ]]; then
+            echo -e "  ${Y}Mihomo 协议 (共享服务):${NC}"
+            for protocol in $mihomo_protocols; do
+                local port
+                port=$(db_list_ports "mihomo" "$protocol" | tr '\n' ',' | sed 's/,$//')
+                if [[ -n "$port" ]]; then
+                    echo -e "    ${G}$idx${NC}) $(get_protocol_name "$protocol") - 端口: ${G}$port${NC}"
+                    all_protocols+=("$protocol")
+                    ((idx++))
+                fi
+            done
+            echo ""
+        fi
+
         if [[ -n "$standalone_protocols" ]]; then
             echo -e "  ${Y}独立进程协议:${NC}"
             for protocol in $standalone_protocols; do
@@ -20649,6 +20855,7 @@ manage_protocol_services() {
 show_protocols_overview() {
     local xray_protocols=$(get_xray_protocols)
     local singbox_protocols=$(get_singbox_protocols)
+    local mihomo_protocols=$(get_mihomo_protocols)
     local standalone_protocols=$(get_standalone_protocols)
     
     echo -e "  ${C}已安装协议概览${NC}"
@@ -20698,6 +20905,27 @@ show_protocols_overview() {
         echo ""
     fi
     
+    if [[ -n "$mihomo_protocols" ]]; then
+        echo -e "  ${Y}Mihomo 协议 (共享服务):${NC}"
+        for protocol in $mihomo_protocols; do
+            local ports
+            ports=$(db_list_ports "mihomo" "$protocol")
+            if [[ -n "$ports" ]]; then
+                local port_count
+                port_count=$(echo "$ports" | wc -l)
+                if [[ $port_count -eq 1 ]]; then
+                    echo -e "    ${G}●${NC} $(get_protocol_name "$protocol") - 端口: ${G}$ports${NC}"
+                else
+                    echo -e "    ${G}●${NC} $(get_protocol_name "$protocol") - 端口: ${G}$port_count 个实例${NC}"
+                    while IFS= read -r port; do
+                        echo -e "      ${C}├─${NC} 端口 ${G}$port${NC}"
+                    done <<<"$ports"
+                fi
+            fi
+        done
+        echo ""
+    fi
+
     if [[ -n "$standalone_protocols" ]]; then
         echo -e "  ${Y}独立协议 (独立服务):${NC}"
         for protocol in $standalone_protocols; do
@@ -20743,6 +20971,26 @@ show_services_status() {
         fi
     fi
     
+    # Mihomo 共享服务状态（Snell v4/v5，含内置 ShadowTLS）
+    local mihomo_protocols=$(get_mihomo_protocols)
+    if [[ -n "$mihomo_protocols" ]]; then
+        if svc status vless-mihomo 2>/dev/null; then
+            local missing_ports
+            missing_ports=$(_mihomo_missing_ports "$DB_FILE" 2>/dev/null || true)
+            if [[ -n "$missing_ports" ]]; then
+                echo -e "  ${Y}●${NC} Mihomo 服务 - ${Y}部分异常${NC}"
+                echo -e "      ${Y}└${NC} 缺失端口: $(tr '\n' ',' <<<"$missing_ports" | sed 's/,$//')"
+            else
+                echo -e "  ${G}●${NC} Mihomo 服务 - ${G}运行中${NC}"
+            fi
+        else
+            echo -e "  ${R}●${NC} Mihomo 服务 - ${R}已停止${NC}"
+        fi
+        for proto in $mihomo_protocols; do
+            echo -e "      ${D}└${NC} $(get_protocol_name "$proto")"
+        done
+    fi
+
     # 独立进程协议服务状态 (Snell 等)
     local standalone_protocols=$(get_standalone_protocols)
     for protocol in $standalone_protocols; do
@@ -22940,32 +23188,37 @@ show_status() {
     
     [[ ! -f "$DB_FILE" ]] && { echo -e "  状态: ${D}○ 未安装${NC}"; return; }
     
-    # 一次 jq 调用，输出格式: XRAY:proto1,proto2 SINGBOX:proto3 PORTS:proto1=443|58380,proto2=8080 RULES:count
-    # 兼容数组和对象两种格式：数组提取所有端口用|分隔，对象直接取端口
-    local db_parsed=$(jq -r '
+    # 一次 jq 调用，输出各核心协议键、路由数和端口映射。
+    # 兼容数组和对象两种格式：数组提取所有端口用|分隔，对象直接取端口。
+    local db_parsed
+    db_parsed=$(jq -r '
         "XRAY:" + ((.xray // {}) | keys | join(",")) +
         " SINGBOX:" + ((.singbox // {}) | keys | join(",")) +
+        " MIHOMO:" + ((.mihomo // {}) | keys | join(",")) +
         " RULES:" + ((.routing_rules // []) | length | tostring) +
         " PORTS:" + ([
             (.xray // {} | to_entries[] | "\(.key)=" + (if (.value | type) == "array" then ([.value[].port] | map(tostring) | join("|")) else (.value.port | tostring) end)),
-            (.singbox // {} | to_entries[] | "\(.key)=" + (if (.value | type) == "array" then ([.value[].port] | map(tostring) | join("|")) else (.value.port | tostring) end))
+            (.singbox // {} | to_entries[] | "\(.key)=" + (if (.value | type) == "array" then ([.value[].port] | map(tostring) | join("|")) else (.value.port | tostring) end)),
+            (.mihomo // {} | to_entries[] | "\(.key)=" + (if (.value | type) == "array" then ([.value[].port] | map(tostring) | join("|")) else (.value.port | tostring) end))
         ] | join(","))
     ' "$DB_FILE" 2>/dev/null)
     
     # 解析结果
-    local xray_keys="" singbox_keys="" rules_count="0" ports_map=""
+    local xray_keys="" singbox_keys="" mihomo_keys="" rules_count="0" ports_map=""
     local part
     for part in $db_parsed; do
         case "$part" in
             XRAY:*) xray_keys="${part#XRAY:}" ;;
             SINGBOX:*) singbox_keys="${part#SINGBOX:}" ;;
+            MIHOMO:*) mihomo_keys="${part#MIHOMO:}" ;;
             RULES:*) rules_count="${part#RULES:}" ;;
             PORTS:*) ports_map="${part#PORTS:}" ;;
         esac
     done
     
     # 转换逗号分隔为换行分隔
-    local installed=$(echo -e "${xray_keys//,/\\n}\n${singbox_keys//,/\\n}" | grep -v '^$' | sort -u)
+    local installed
+    installed=$(echo -e "${xray_keys//,/\\n}\n${singbox_keys//,/\\n}\n${mihomo_keys//,/\\n}" | grep -v '^$' | sort -u)
     [[ -z "$installed" ]] && { echo -e "  状态: ${D}○ 未安装${NC}"; return; }
     
     # 缓存已安装协议供 main_menu 使用
@@ -22975,13 +23228,16 @@ show_status() {
     local protocol_count=$(echo "$installed" | wc -l)
     
     # 在内存中过滤协议类型
-    local xray_protocols="" singbox_protocols="" standalone_protocols=""
+    local xray_protocols="" singbox_protocols="" mihomo_protocols="" standalone_protocols=""
     local p
     for p in $XRAY_PROTOCOLS; do
         [[ ",$xray_keys," == *",$p,"* ]] && xray_protocols="$xray_protocols $p"
     done
     for p in $SINGBOX_PROTOCOLS; do
         [[ ",$singbox_keys," == *",$p,"* ]] && singbox_protocols="$singbox_protocols $p"
+    done
+    for p in $MIHOMO_PROTOCOLS; do
+        [[ ",$mihomo_keys," == *",$p,"* ]] && mihomo_protocols="$mihomo_protocols $p"
     done
     for p in $STANDALONE_PROTOCOLS; do
         if [[ ",$xray_keys," == *",$p,"* ]] || [[ ",$singbox_keys," == *",$p,"* ]]; then
@@ -22990,14 +23246,21 @@ show_status() {
     done
     xray_protocols="${xray_protocols# }"
     singbox_protocols="${singbox_protocols# }"
+    mihomo_protocols="${mihomo_protocols# }"
     standalone_protocols="${standalone_protocols# }"
     
-    # 检查服务运行状态
-    local xray_running=false singbox_running=false
+    # 检查服务运行状态。Mihomo 还要逐项确认所有 listener 端口。
+    local xray_running=false singbox_running=false mihomo_running=false mihomo_healthy=true
+    local mihomo_missing_ports=""
     local standalone_running=0 standalone_total=0
     
     [[ -n "$xray_protocols" ]] && svc status vless-reality >/dev/null 2>&1 && xray_running=true
     [[ -n "$singbox_protocols" ]] && svc status vless-singbox >/dev/null 2>&1 && singbox_running=true
+    if [[ -n "$mihomo_protocols" ]] && svc status vless-mihomo >/dev/null 2>&1; then
+        mihomo_running=true
+        mihomo_missing_ports=$(_mihomo_missing_ports "$DB_FILE" 2>/dev/null || true)
+        [[ -n "$mihomo_missing_ports" ]] && mihomo_healthy=false
+    fi
     
     local ind_proto
     for ind_proto in $standalone_protocols; do
@@ -23006,17 +23269,21 @@ show_status() {
     done
     
     # 计算运行状态
-    local xray_count=0 singbox_count=0
+    local xray_count=0 singbox_count=0 mihomo_count=0
     [[ -n "$xray_protocols" ]] && xray_count=$(echo "$xray_protocols" | wc -w)
     [[ -n "$singbox_protocols" ]] && singbox_count=$(echo "$singbox_protocols" | wc -w)
+    [[ -n "$mihomo_protocols" ]] && mihomo_count=$(echo "$mihomo_protocols" | wc -w)
     local running_protocols=0
     
     [[ "$xray_running" == "true" ]] && running_protocols=$xray_count
     [[ "$singbox_running" == "true" ]] && running_protocols=$((running_protocols + singbox_count))
+    [[ "$mihomo_running" == "true" ]] && running_protocols=$((running_protocols + mihomo_count))
     running_protocols=$((running_protocols + standalone_running))
     
     if is_paused; then
         status_icon="${Y}⏸${NC}"; status_text="${Y}已暂停${NC}"
+    elif [[ "$mihomo_running" == "true" && "$mihomo_healthy" == "false" ]]; then
+        status_icon="${Y}●${NC}"; status_text="${Y}部分异常${NC}"
     elif [[ $running_protocols -eq $protocol_count ]]; then
         status_icon="${G}●${NC}"; status_text="${G}运行中${NC}"
     elif [[ $running_protocols -gt 0 ]]; then
@@ -23026,6 +23293,9 @@ show_status() {
     fi
     
     echo -e "  状态: $status_icon $status_text"
+    if [[ -n "$mihomo_missing_ports" ]]; then
+        echo -e "  Mihomo 缺失端口: ${Y}$(tr '\n' ',' <<<"$mihomo_missing_ports" | sed 's/,$//')${NC}"
+    fi
     
     # 从 ports_map 获取端口的辅助函数（纯字符串匹配）
     _get_port() {
@@ -26823,6 +27093,91 @@ show_logs() {
     esac
 }
 
+# Mihomo 日志读取与诊断操作。Alpine 优先使用专用日志，再回退系统消息。
+_show_mihomo_logs() {
+    local mode="${1:-last}"
+    if [[ "$DISTRO" == "alpine" ]]; then
+        local log_file="$MIHOMO_LOG_FILE"
+        [[ -f "$log_file" ]] || log_file="$SYSTEM_MESSAGES_LOG"
+        if [[ ! -f "$log_file" ]]; then
+            _warn "Mihomo 日志不可用"
+            return 1
+        fi
+        if [[ "$mode" == "follow" ]]; then
+            if [[ "$log_file" == "$MIHOMO_LOG_FILE" ]]; then
+                tail -f "$log_file"
+            else
+                tail -f "$log_file" | while IFS= read -r line; do
+                    case "${line,,}" in
+                        *vless-mihomo*|*mihomo*) printf '%s\n' "$line" ;;
+                    esac
+                done
+            fi
+        elif [[ "$log_file" == "$MIHOMO_LOG_FILE" ]]; then
+            tail -n 50 "$log_file"
+        else
+            grep -iE 'vless-mihomo|mihomo' "$log_file" 2>/dev/null | tail -n 50
+        fi
+    elif [[ "$mode" == "follow" ]]; then
+        journalctl -u vless-mihomo -f
+    else
+        journalctl -u vless-mihomo --no-pager -n 50
+    fi
+}
+
+show_mihomo_diagnostics() {
+    while true; do
+        _header
+        echo -e "  ${W}Mihomo 日志与诊断${NC}"
+        _line
+        _item "1" "查看最近 50 行"
+        _item "2" "实时跟踪日志"
+        _item "3" "校验完整配置"
+        _item "4" "启用 debug 日志"
+        _item "5" "恢复 warning 日志"
+        _item "0" "返回"
+        _line
+
+        local choice
+        read -rp "  请选择: " choice || choice="0"
+        case "$choice" in
+            1)
+                _show_mihomo_logs last
+                _pause
+                ;;
+            2)
+                _show_mihomo_logs follow
+                ;;
+            3)
+                if validate_mihomo_config "$MIHOMO_CONFIG" "$MIHOMO_BIN"; then
+                    _ok "Mihomo 完整配置校验通过"
+                else
+                    _err "Mihomo 完整配置校验失败"
+                fi
+                _pause
+                ;;
+            4)
+                if set_mihomo_log_level debug; then
+                    _ok "Mihomo debug 日志已启用"
+                else
+                    _err "Mihomo 日志级别切换失败，已回滚"
+                fi
+                _pause
+                ;;
+            5)
+                if set_mihomo_log_level warning; then
+                    _ok "Mihomo warning 日志已恢复"
+                else
+                    _err "Mihomo 日志级别切换失败，已回滚"
+                fi
+                _pause
+                ;;
+            0|"") return ;;
+            *) _err "无效选择"; _pause ;;
+        esac
+    done
+}
+
 # 按协议查看服务日志
 show_service_logs() {
     _header
@@ -26855,6 +27210,14 @@ show_service_logs() {
         ((idx++))
     fi
     
+    # Mihomo 的全部 listener 共享一项日志与诊断入口。
+    local mihomo_protocols=$(get_mihomo_protocols)
+    if [[ -n "$mihomo_protocols" ]]; then
+        echo -e "  ${G}$idx${NC}) Mihomo 服务日志与诊断 (Snell v4/v5)"
+        proto_array+=("mihomo")
+        ((idx++))
+    fi
+
     # 独立进程协议 (Snell/AnyTLS/ShadowTLS)
     local standalone_protocols=$(get_standalone_protocols)
     for proto in $standalone_protocols; do
@@ -26890,6 +27253,10 @@ show_service_logs() {
         singbox)
             service_name="vless-singbox"
             proc_name="sing-box"
+            ;;
+        mihomo)
+            show_mihomo_diagnostics
+            return
             ;;
         snell)
             service_name="vless-snell"
@@ -29715,6 +30082,7 @@ main_menu() {
     init_db   # 初始化 JSON 数据库
     db_migrate_to_multiuser  # 迁移旧的单用户配置到多用户格式
     ensure_singbox_runtime_consistency 2>/dev/null || true
+    ensure_mihomo_runtime_consistency 2>/dev/null || true
 
     # 自动更新系统脚本 (确保 vless 命令始终是最新版本)
     _auto_update_system_script
