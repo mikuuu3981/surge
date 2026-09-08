@@ -11171,26 +11171,58 @@ _mihomo_migration_restore_binary() {
     return 1
 }
 
+# 仅 source 的测试可在观察点替换夹具条目；直接执行时这是无副作用的 no-op。
+_mihomo_migration_proc_observe() {
+    if [[ "${BASH_SOURCE[0]}" != "$0" && -n "${VLESS_TEST_PROC_ROOT:-}" ]] && \
+        declare -F _mihomo_migration_test_proc_observe >/dev/null; then
+        _mihomo_migration_test_proc_observe "$@"
+    fi
+}
+
+_mihomo_migration_proc_path_identity() {
+    stat -c '%d:%i' -- "$1" 2>/dev/null
+}
+
 # 只接受 /proc comm 的精确进程名，不能使用 Alpine _pgrep 的 -f 回退结果。
 # 返回 0=active、1=inactive、2=无法完整检查；后者绝不能作为已停止处理。
 _mihomo_migration_managed_process_running() {
     # 仅被 source 时接受测试夹具路径；直接执行时始终检查真实 /proc。
-    local process="vless-mihomo" proc_root="/proc" proc_dir comm_path comm
+    local process="vless-mihomo" expected_comm proc_root="/proc"
+    local proc_dir pid comm_path comm pid_identity comm_identity read_rc
+    expected_comm="${process}"$'\n'
     if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
         proc_root="${VLESS_TEST_PROC_ROOT:-/proc}"
     fi
-    [[ -d "$proc_root" && -r "$proc_root" && -x "$proc_root" ]] || return 2
+    [[ ! -L "$proc_root" && -d "$proc_root" && -r "$proc_root" && -x "$proc_root" ]] || return 2
     for proc_dir in "$proc_root"/[0-9]*; do
-        if [[ ! -e "$proc_dir" ]]; then
-            # glob 未匹配时保留字面量；已列出的 PID 消失则检查不完整。
-            [[ "$proc_dir" == "$proc_root"/'[0-9]*' ]] && break
-            return 2
-        fi
-        [[ -d "$proc_dir" ]] || return 2
+        pid=${proc_dir##*/}
+        # /proc 也会有非 PID 条目；只有纯 ASCII 数字目录属于此次扫描。
+        [[ "$pid" =~ ^[0123456789]+$ ]] || continue
+        [[ ! -L "$proc_dir" && -d "$proc_dir" ]] || return 2
+        pid_identity=$(_mihomo_migration_proc_path_identity "$proc_dir") || return 2
+        _mihomo_migration_proc_observe pid-validated "$proc_dir" || return 2
+        [[ ! -L "$proc_dir" && -d "$proc_dir" && \
+            "$(_mihomo_migration_proc_path_identity "$proc_dir")" == "$pid_identity" ]] || return 2
+
         comm_path="$proc_dir/comm"
-        [[ -f "$comm_path" && -r "$comm_path" ]] || return 2
-        IFS= read -r comm <"$comm_path" || return 2
-        [[ "$comm" == "$process" ]] && return 0
+        [[ ! -L "$comm_path" && -f "$comm_path" && -r "$comm_path" ]] || return 2
+        comm_identity=$(_mihomo_migration_proc_path_identity "$comm_path") || return 2
+        _mihomo_migration_proc_observe comm-validated "$proc_dir" "$comm_path" || return 2
+        [[ ! -L "$proc_dir" && -d "$proc_dir" && \
+            "$(_mihomo_migration_proc_path_identity "$proc_dir")" == "$pid_identity" && \
+            ! -L "$comm_path" && -f "$comm_path" && -r "$comm_path" && \
+            "$(_mihomo_migration_proc_path_identity "$comm_path")" == "$comm_identity" ]] || return 2
+
+        comm=""
+        IFS= read -r -d '' comm <"$comm_path"
+        read_rc=$?
+        [[ "$read_rc" -eq 1 ]] || return 2
+        _mihomo_migration_proc_observe comm-read "$proc_dir" "$comm_path" || return 2
+        [[ ! -L "$proc_dir" && -d "$proc_dir" && \
+            "$(_mihomo_migration_proc_path_identity "$proc_dir")" == "$pid_identity" && \
+            ! -L "$comm_path" && -f "$comm_path" && -r "$comm_path" && \
+            "$(_mihomo_migration_proc_path_identity "$comm_path")" == "$comm_identity" ]] || return 2
+        [[ "$comm" == "$expected_comm" ]] && return 0
     done
     return 1
 }

@@ -1601,6 +1601,8 @@ test_mihomo_migration_candidate_rejects_conflicts_and_deduplicates_match() (
 
 prepare_migration_runtime_fixture() {
     source "$SCRIPT"
+    # Migration fixtures must not race the host /proc while testing rollback state.
+    new_mihomo_migration_proc_fixture
     write_legacy_migration_db
     printf '%s\n' '{"old":true}' >"$MIHOMO_CONFIG"
     MIG_RUNNING=([vless-snell]=true [vless-snell-v5]=false [vless-snell-shadowtls]=true [vless-snell-shadowtls-backend]=false [vless-snell-v5-shadowtls]=false [vless-snell-v5-shadowtls-backend]=false [vless-mihomo]=false)
@@ -1828,6 +1830,104 @@ test_mihomo_migration_process_scan_vanished_entry_is_error() (
     source "$SCRIPT"
     new_mihomo_migration_proc_fixture
     mkdir -p "$MIHOMO_MIGRATION_PROC_ROOT/101"
+
+    assert_mihomo_migration_process_scan_error
+)
+
+# A first-line-only reader would incorrectly report this as active.
+test_mihomo_migration_process_scan_requires_full_comm_content() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    new_mihomo_migration_proc_fixture
+    mkdir -p "$MIHOMO_MIGRATION_PROC_ROOT/101"
+    printf 'vless-mihomo\nx\n' >"$MIHOMO_MIGRATION_PROC_ROOT/101/comm"
+
+    if _mihomo_migration_managed_process_running; then
+        return 1
+    else
+        [[ "$?" -eq 1 ]]
+    fi
+)
+
+test_mihomo_migration_process_scan_rejects_pid_directory_symlink() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    new_mihomo_migration_proc_fixture
+    mkdir -p "$MIHOMO_MIGRATION_PROC_ROOT/target"
+    printf 'unrelated\n' >"$MIHOMO_MIGRATION_PROC_ROOT/target/comm"
+    ln -s target "$MIHOMO_MIGRATION_PROC_ROOT/101"
+
+    assert_mihomo_migration_process_scan_error
+)
+
+test_mihomo_migration_process_scan_rejects_comm_symlink() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    new_mihomo_migration_proc_fixture
+    mkdir -p "$MIHOMO_MIGRATION_PROC_ROOT/101"
+    printf 'unrelated\n' >"$MIHOMO_MIGRATION_PROC_ROOT/comm-target"
+    ln -s ../comm-target "$MIHOMO_MIGRATION_PROC_ROOT/101/comm"
+
+    assert_mihomo_migration_process_scan_error
+)
+
+test_mihomo_migration_process_scan_ignores_numeric_prefix_non_pid_entry() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    new_mihomo_migration_proc_fixture
+    mkdir -p "$MIHOMO_MIGRATION_PROC_ROOT/101-not-a-pid"
+
+    if _mihomo_migration_managed_process_running; then
+        return 1
+    else
+        [[ "$?" -eq 1 ]]
+    fi
+)
+
+test_mihomo_migration_process_scan_empty_root_is_inactive() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    new_mihomo_migration_proc_fixture
+
+    if _mihomo_migration_managed_process_running; then
+        return 1
+    else
+        [[ "$?" -eq 1 ]]
+    fi
+)
+
+test_mihomo_migration_process_scan_detects_pid_replacement() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    new_mihomo_migration_proc_fixture
+    write_mihomo_migration_proc_comm 101 unrelated
+    write_mihomo_migration_proc_comm 202 vless-mihomo
+    _mihomo_migration_test_proc_observe() {
+        [[ "$1" == pid-validated ]] || return 0
+        mv "$MIHOMO_MIGRATION_PROC_ROOT/101" "$MIHOMO_MIGRATION_PROC_ROOT/101.old"
+        mv "$MIHOMO_MIGRATION_PROC_ROOT/202" "$MIHOMO_MIGRATION_PROC_ROOT/101"
+    }
+
+    assert_mihomo_migration_process_scan_error
+)
+
+test_mihomo_migration_process_scan_detects_comm_replacement() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    new_mihomo_migration_proc_fixture
+    write_mihomo_migration_proc_comm 101 unrelated
+    printf 'vless-mihomo\n' >"$MIHOMO_MIGRATION_PROC_ROOT/comm.replacement"
+    _mihomo_migration_test_proc_observe() {
+        [[ "$1" == comm-read ]] || return 0
+        mv "$MIHOMO_MIGRATION_PROC_ROOT/comm.replacement" "$MIHOMO_MIGRATION_PROC_ROOT/101/comm"
+    }
 
     assert_mihomo_migration_process_scan_error
 )
@@ -2081,6 +2181,13 @@ run_test test_mihomo_migration_manager_unavailable_scans_exact_active_process
 run_test test_mihomo_migration_manager_unavailable_complete_process_scan_is_inactive
 run_test test_mihomo_migration_process_scan_permission_entry_is_error
 run_test test_mihomo_migration_process_scan_vanished_entry_is_error
+run_test test_mihomo_migration_process_scan_requires_full_comm_content
+run_test test_mihomo_migration_process_scan_rejects_pid_directory_symlink
+run_test test_mihomo_migration_process_scan_rejects_comm_symlink
+run_test test_mihomo_migration_process_scan_ignores_numeric_prefix_non_pid_entry
+run_test test_mihomo_migration_process_scan_empty_root_is_inactive
+run_test test_mihomo_migration_process_scan_detects_pid_replacement
+run_test test_mihomo_migration_process_scan_detects_comm_replacement
 run_test test_mihomo_migration_uncertain_process_scan_retains_rollback_snapshot
 run_test test_mihomo_migration_service_state_distinguishes_systemd_states
 run_test test_mihomo_migration_service_state_uses_openrc_exit_contract
