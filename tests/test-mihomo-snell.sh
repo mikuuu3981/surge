@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 SCRIPT="$ROOT/vless-server.sh"
 PASS=0
+declare -A MIG_RUNNING MIG_ENABLED
 
 run_test() {
     local name="$1"
@@ -1545,6 +1546,195 @@ test_generate_mihomo_config_builds_complete_mixed_config() (
     [[ "$(stat -c '%a' "$output")" == "600" ]]
 )
 
+write_legacy_migration_db() {
+    jq -n '{
+      version:"4.0.0", singbox:{}, meta:{}, mihomo:{},
+      xray:{
+        snell:{port:41001,psk:"v4-key",version:4},
+        "snell-v5":[{port:51001,psk:"v5-key",version:5}],
+        "snell-shadowtls":{port:42001,psk:"v4-stls",version:4,sni:"www.microsoft.com",stls_password:"v4-secret",snell_backend_port:42002},
+        "snell-v5-shadowtls":[{port:52001,psk:"v5-stls",version:5,sni:"www.cloudflare.com",stls_password:"v5-secret",snell_backend_port:52002}],
+        "ss2022-shadowtls":{port:62001,password:"ss-key"},
+        "snell-v6":{port:61001,psk:"v6-key",version:6}
+      }
+    }' >"$DB_FILE"
+}
+
+test_mihomo_migration_candidate_normalizes_legacy_records() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    write_legacy_migration_db
+
+    local candidate="$TEST_TMP/candidate.json"
+    _build_mihomo_migration_db "$DB_FILE" "$candidate" || return 1
+    jq -e '
+      (.mihomo.snell | length) == 2 and
+      (.mihomo["snell-v5"] | length) == 1 and
+      (.mihomo["snell-shadowtls"][0] | .port == 42001 and .psk == "v4-stls" and .version == 4 and .sni == "www.microsoft.com" and .stls_password == "v4-secret" and has("snell_backend_port") | not) and
+      (.mihomo["snell-v5-shadowtls"][0] | .port == 52001 and .psk == "v5-stls" and .version == 5 and .sni == "www.cloudflare.com" and .stls_password == "v5-secret" and has("snell_backend_port") | not) and
+      (.xray | has("snell") | not and has("snell-v5") | not and has("snell-shadowtls") | not and has("snell-v5-shadowtls") | not) and
+      .xray["ss2022-shadowtls"].port == 62001 and .xray["snell-v6"].port == 61001
+    ' "$candidate" >/dev/null
+    cmp -s "$DB_FILE" <(jq '.' "$DB_FILE") || return 1
+)
+
+test_mihomo_migration_candidate_rejects_conflicts_and_deduplicates_match() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    write_legacy_migration_db
+    jq '.mihomo.snell = [{port:41001,psk:"v4-key",version:4}]' "$DB_FILE" >"$TEST_TMP/db.next"
+    mv "$TEST_TMP/db.next" "$DB_FILE"
+    _build_mihomo_migration_db "$DB_FILE" "$TEST_TMP/match.json" || return 1
+    [[ "$(jq '.mihomo.snell | length' "$TEST_TMP/match.json")" == 1 ]] || return 1
+
+    jq '.mihomo.snell = [{port:41001,psk:"different",version:4}]' "$DB_FILE" >"$TEST_TMP/db.next"
+    mv "$TEST_TMP/db.next" "$DB_FILE"
+    ! _build_mihomo_migration_db "$DB_FILE" "$TEST_TMP/conflict.json" || return 1
+
+    write_legacy_migration_db
+    jq '.mihomo["snell-v5"] = [{port:41001,psk:"other",version:5}]' "$DB_FILE" >"$TEST_TMP/db.next"
+    mv "$TEST_TMP/db.next" "$DB_FILE"
+    ! _build_mihomo_migration_db "$DB_FILE" "$TEST_TMP/port-conflict.json"
+)
+
+prepare_migration_runtime_fixture() {
+    source "$SCRIPT"
+    write_legacy_migration_db
+    printf '%s\n' '{"old":true}' >"$MIHOMO_CONFIG"
+    MIG_RUNNING=([vless-snell]=true [vless-snell-v5]=false [vless-snell-shadowtls]=true [vless-snell-shadowtls-backend]=false [vless-snell-v5-shadowtls]=false [vless-snell-v5-shadowtls-backend]=false [vless-mihomo]=false)
+    MIG_ENABLED=([vless-snell]=true [vless-snell-v5]=true [vless-snell-shadowtls]=true [vless-snell-shadowtls-backend]=false [vless-snell-v5-shadowtls]=false [vless-snell-v5-shadowtls-backend]=false [vless-mihomo]=false)
+    MIG_FAIL_START=false
+    : >"$TEST_TMP/migration.log"
+    install_mihomo() { printf '%s\n' install >>"$TEST_TMP/migration.log"; touch "$MIHOMO_BIN"; chmod 700 "$MIHOMO_BIN"; }
+    validate_mihomo_config() { printf '%s\n' validate >>"$TEST_TMP/migration.log"; return 0; }
+    create_mihomo_service() { printf '%s\n' create >>"$TEST_TMP/migration.log"; touch "$SYSTEMD_DIR/vless-mihomo.service"; }
+    _mihomo_ports_healthy() { printf '%s\n' health >>"$TEST_TMP/migration.log"; return 0; }
+    _cleanup_legacy_snell_resources() { printf '%s\n' "$1" >"$TEST_TMP/cleanup-services"; printf '%s\n' cleanup >>"$TEST_TMP/migration.log"; return 0; }
+    svc() {
+        local action="$1" name="$2"
+        printf '%s:%s\n' "$action" "$name" >>"$TEST_TMP/migration.log"
+        case "$action" in
+            status) [[ "${MIG_RUNNING[$name]:-false}" == true ]] ;;
+            enabled) [[ "${MIG_ENABLED[$name]:-false}" == true ]] ;;
+            stop) MIG_RUNNING[$name]=false ;;
+            start) [[ "$name" == vless-mihomo && "$MIG_FAIL_START" == true ]] && return 1; MIG_RUNNING[$name]=true ;;
+            restart) MIG_RUNNING[$name]=true ;;
+            enable) MIG_ENABLED[$name]=true ;;
+            disable) MIG_ENABLED[$name]=false ;;
+            *) return 1 ;;
+        esac
+    }
+    systemctl() { :; }
+}
+
+test_mihomo_migration_preflight_validation_keeps_legacy_running() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    prepare_migration_runtime_fixture
+    cp "$MIHOMO_CONFIG" "$TEST_TMP/config.before"
+    validate_mihomo_config() { printf '%s\n' validate >>"$TEST_TMP/migration.log"; return 1; }
+
+    ! migrate_legacy_snell_to_mihomo || return 1
+    cmp -s "$MIHOMO_CONFIG" "$TEST_TMP/config.before" || return 1
+    [[ "${MIG_RUNNING[vless-snell]}" == true && "${MIG_RUNNING[vless-snell-shadowtls]}" == true ]] || return 1
+    ! grep -q '^stop:vless-snell' "$TEST_TMP/migration.log"
+)
+
+test_mihomo_migration_cutover_orders_cleanup_last_and_is_idempotent() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    prepare_migration_runtime_fixture
+
+    migrate_legacy_snell_to_mihomo || return 1
+    jq -e '.mihomo.snell[] | select(.port == 41001 and .psk == "v4-key")' "$DB_FILE" >/dev/null || return 1
+    jq -e '([.listeners[].port] | sort) == [41001,42001,51001,52001]' "$MIHOMO_CONFIG" >/dev/null || return 1
+    [[ -f "$MIHOMO_MIGRATION_MARKER" && "$(stat -c '%a' "$MIHOMO_MIGRATION_MARKER")" == 600 ]] || return 1
+    local stop_line start_line cleanup_line before
+    stop_line=$(grep -n '^stop:vless-snell$' "$TEST_TMP/migration.log" | cut -d: -f1)
+    start_line=$(grep -n '^start:vless-mihomo$' "$TEST_TMP/migration.log" | cut -d: -f1)
+    cleanup_line=$(grep -n '^cleanup$' "$TEST_TMP/migration.log" | cut -d: -f1)
+    [[ -n "$stop_line" && -n "$start_line" && -n "$cleanup_line" && "$stop_line" -lt "$start_line" && "$start_line" -lt "$cleanup_line" ]] || return 1
+    [[ "$(tail -n1 "$TEST_TMP/migration.log")" == cleanup ]] || return 1
+    grep -qx vless-snell "$TEST_TMP/cleanup-services" || return 1
+    before=$(cksum "$DB_FILE" "$MIHOMO_CONFIG" "$TEST_TMP/migration.log")
+    migrate_legacy_snell_to_mihomo || return 1
+    [[ "$(cksum "$DB_FILE" "$MIHOMO_CONFIG" "$TEST_TMP/migration.log")" == "$before" ]]
+)
+
+test_mihomo_migration_start_failure_restores_files_and_prior_services() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    prepare_migration_runtime_fixture
+    cp "$DB_FILE" "$TEST_TMP/db.before"
+    cp "$MIHOMO_CONFIG" "$TEST_TMP/config.before"
+    MIG_FAIL_START=true
+
+    ! migrate_legacy_snell_to_mihomo || return 1
+    cmp -s "$DB_FILE" "$TEST_TMP/db.before" || return 1
+    cmp -s "$MIHOMO_CONFIG" "$TEST_TMP/config.before" || return 1
+    [[ "${MIG_RUNNING[vless-snell]}" == true && "${MIG_RUNNING[vless-snell-shadowtls]}" == true ]] || return 1
+    [[ "${MIG_RUNNING[vless-snell-v5]}" == false && "${MIG_RUNNING[vless-snell-shadowtls-backend]}" == false ]] || return 1
+    [[ ! -e "$MIHOMO_MIGRATION_MARKER" ]]
+)
+
+test_mihomo_migration_cleanup_failure_restores_before_marker() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    prepare_migration_runtime_fixture
+    cp "$DB_FILE" "$TEST_TMP/db.before"
+    cp "$MIHOMO_CONFIG" "$TEST_TMP/config.before"
+    _cleanup_legacy_snell_resources() { printf '%s\n' cleanup-failed >>"$TEST_TMP/migration.log"; return 1; }
+
+    ! migrate_legacy_snell_to_mihomo || return 1
+    cmp -s "$DB_FILE" "$TEST_TMP/db.before" || return 1
+    cmp -s "$MIHOMO_CONFIG" "$TEST_TMP/config.before" || return 1
+    [[ "${MIG_RUNNING[vless-snell]}" == true && ! -e "$MIHOMO_MIGRATION_MARKER" ]]
+)
+
+test_external_shadowtls_detection_checks_ss2022_and_service_references() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    init_db
+    jq '.xray["ss2022-shadowtls"] = {port:62001}' "$DB_FILE" >"$TEST_TMP/db.next"
+    mv "$TEST_TMP/db.next" "$DB_FILE"
+    _external_shadowtls_is_needed || return 1
+    jq 'del(.xray["ss2022-shadowtls"])' "$DB_FILE" >"$TEST_TMP/db.next"
+    mv "$TEST_TMP/db.next" "$DB_FILE"
+    printf '%s\n' 'ExecStart=/usr/local/bin/shadow-tls --v3 server' >"$SYSTEMD_DIR/external-shadowtls.service"
+    _external_shadowtls_is_needed
+)
+
+test_install_shadowtls_marks_managed_binary_ownership() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    _map_arch() { printf '%s\n' x86_64-unknown-linux-musl; }
+    _install_binary() { touch "$TEST_TMP/shadowtls-installed"; }
+
+    install_shadowtls || return 1
+    [[ -f "$CFG/.shadowtls-managed" && "$(stat -c '%a' "$CFG/.shadowtls-managed")" == 600 && -f "$TEST_TMP/shadowtls-installed" ]]
+)
+
+test_mihomo_migration_cleanup_preserves_ss2022_v6_and_unmanaged_shadowtls() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    write_legacy_migration_db
+    printf '%s\n' '/usr/local/bin/shadow-tls' >"$TEST_TMP/unit"
+    cp "$TEST_TMP/unit" "$SYSTEMD_DIR/other.service"
+    rm() { printf '%s\n' "$*" >>"$TEST_TMP/remove.log"; }
+    svc() { printf '%s:%s\n' "$1" "$2" >>"$TEST_TMP/service.log"; return 0; }
+    systemctl() { :; }
+
+    _external_shadowtls_is_needed || return 1
+    _cleanup_legacy_snell_resources || return 1
+    ! grep -q 'snell-v6\|ss2022-shadowtls\|/usr/local/bin/shadow-tls' "$TEST_TMP/remove.log" || return 1
+    grep -q '/usr/local/bin/snell-server-v5' "$TEST_TMP/remove.log"
+)
+
 run_test test_source_does_not_run_cli
 run_test test_mihomo_supported_versions
 run_test test_mihomo_asset_names
@@ -1622,4 +1812,13 @@ run_test test_mihomo_transaction_retains_snapshot_when_service_restore_fails
 run_test test_mihomo_transaction_rejects_cross_protocol_duplicate_before_service_mutation
 run_test test_snell_generators_store_only_transactional_mihomo_records
 run_test test_validate_mihomo_config_checks_json_and_binary_arguments
+run_test test_mihomo_migration_candidate_normalizes_legacy_records
+run_test test_mihomo_migration_candidate_rejects_conflicts_and_deduplicates_match
+run_test test_mihomo_migration_preflight_validation_keeps_legacy_running
+run_test test_mihomo_migration_cutover_orders_cleanup_last_and_is_idempotent
+run_test test_mihomo_migration_start_failure_restores_files_and_prior_services
+run_test test_mihomo_migration_cleanup_failure_restores_before_marker
+run_test test_external_shadowtls_detection_checks_ss2022_and_service_references
+run_test test_install_shadowtls_marks_managed_binary_ownership
+run_test test_mihomo_migration_cleanup_preserves_ss2022_v6_and_unmanaged_shadowtls
 printf '%s tests passed\n' "$PASS"

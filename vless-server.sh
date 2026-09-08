@@ -11043,6 +11043,216 @@ _apply_mihomo_node_change() {
     return 0
 }
 
+# 将旧版 .xray Snell v4/v5 配置规范化为 Mihomo 候选数据库，不修改源文件。
+_build_mihomo_migration_db() {
+    local source_db="$1" candidate_db="$2" tmp
+    [[ -f "$source_db" ]] || return 1
+    jq empty "$source_db" >/dev/null 2>&1 || return 1
+    tmp=$(mktemp "${candidate_db}.tmp.XXXXXX") || return 1
+    if ! jq '
+        def records:
+            if . == null then [] elif type == "array" then . else [.] end;
+        def normalized: del(.snell_backend_port);
+        ["snell", "snell-v5", "snell-shadowtls", "snell-v5-shadowtls"] as $protocols |
+        .mihomo = (.mihomo // {}) |
+        reduce $protocols[] as $protocol (
+            .;
+            (.mihomo[$protocol] | records | map(normalized)) as $existing |
+            (.xray[$protocol] | records | map(normalized)) as $legacy |
+            ($existing + $legacy) as $combined |
+            if ([ $combined | group_by(.port)[] |
+                  select(length > 1) |
+                  .[0] as $first | select(any(.[]; . != $first)) ] | length) > 0 then
+                error("conflicting Mihomo protocol and port")
+            else
+                .mihomo[$protocol] = ($combined | unique_by(.port))
+            end
+        ) |
+        ([.mihomo[]? | records | .[]] | group_by(.port) |
+         any(length > 1)) as $duplicate_ports |
+        if $duplicate_ports then error("duplicate Mihomo port") else . end |
+        .xray |= del(.snell, .["snell-v5"], .["snell-shadowtls"], .["snell-v5-shadowtls"])
+    ' "$source_db" >"$tmp" 2>/dev/null; then
+        rm -f "$tmp"
+        return 1
+    fi
+    if ! chmod 600 "$tmp" || ! mv "$tmp" "$candidate_db"; then
+        rm -f "$tmp"
+        return 1
+    fi
+}
+
+_legacy_snell_service_names() {
+    local protocol
+    for protocol in $(get_legacy_snell_protocols); do
+        case "$protocol" in
+            snell) printf '%s\n' vless-snell ;;
+            snell-v5) printf '%s\n' vless-snell-v5 ;;
+            snell-shadowtls) printf '%s\n' vless-snell-shadowtls vless-snell-shadowtls-backend ;;
+            snell-v5-shadowtls) printf '%s\n' vless-snell-v5-shadowtls vless-snell-v5-shadowtls-backend ;;
+        esac
+    done
+}
+
+# SS2022 或任意其他服务仍使用外部 ShadowTLS 时，不得删除其二进制。
+_external_shadowtls_is_needed() {
+    jq -e '.xray["ss2022-shadowtls"] != null' "$DB_FILE" >/dev/null 2>&1 && return 0
+    grep -R -F -q '/usr/local/bin/shadow-tls' "$SYSTEMD_DIR" "$OPENRC_DIR" 2>/dev/null
+}
+
+_cleanup_legacy_snell_resources() {
+    local legacy_services="${1:-}" service_name
+    [[ -n "$legacy_services" ]] || legacy_services=$(_legacy_snell_service_names)
+    for service_name in $legacy_services; do
+        svc disable "$service_name" >/dev/null 2>&1 || return 1
+        rm -f "$SYSTEMD_DIR/${service_name}.service" "$OPENRC_DIR/$service_name" || return 1
+    done
+    if [[ "$DISTRO" != "alpine" ]]; then
+        systemctl daemon-reload >/dev/null 2>&1 || return 1
+    fi
+    rm -f "$CFG/snell.conf" "$CFG/snell-v5.conf" \
+        "$CFG/snell-shadowtls.conf" "$CFG/snell-v5-shadowtls.conf" \
+        /usr/local/bin/snell-server /usr/local/bin/snell-server-v5 || return 1
+    if ! _external_shadowtls_is_needed && [[ -f "$CFG/.shadowtls-managed" ]]; then
+        rm -f /usr/local/bin/shadow-tls "$CFG/.shadowtls-managed" || return 1
+    fi
+}
+
+_mihomo_migration_snapshot_path() {
+    local snapshot="$1" name="$2" path="$3"
+    printf '%s\n' "$path" >"$snapshot/${name}.path" || return 1
+    if [[ -f "$path" ]]; then
+        cp -p "$path" "$snapshot/$name" || return 1
+    else
+        touch "$snapshot/${name}.absent" || return 1
+    fi
+}
+
+_mihomo_migration_snapshot_create() {
+    local services="$1" snapshot service_name index=0 path
+    snapshot=$(mktemp -d "$CFG/.mihomo-migration.XXXXXX") || return 1
+    chmod 700 "$snapshot" || { rm -rf "$snapshot"; return 1; }
+    printf '%s\n' "$services" >"$snapshot/services" || { rm -rf "$snapshot"; return 1; }
+    for service_name in $services vless-mihomo; do
+        if svc status "$service_name" >/dev/null 2>&1; then touch "$snapshot/${service_name}.running"; else touch "$snapshot/${service_name}.stopped"; fi
+        if svc enabled "$service_name" >/dev/null 2>&1; then touch "$snapshot/${service_name}.enabled"; else touch "$snapshot/${service_name}.disabled"; fi
+    done
+    for path in "$DB_FILE" "$MIHOMO_CONFIG" \
+        "$CFG/snell.conf" "$CFG/snell-v5.conf" "$CFG/snell-shadowtls.conf" "$CFG/snell-v5-shadowtls.conf" \
+        "$CFG/.shadowtls-managed" "$MIHOMO_MIGRATION_MARKER" \
+        /usr/local/bin/snell-server /usr/local/bin/snell-server-v5 /usr/local/bin/shadow-tls; do
+        _mihomo_migration_snapshot_path "$snapshot" "resource-$index" "$path" || { rm -rf "$snapshot"; return 1; }
+        index=$((index + 1))
+    done
+    for service_name in $services vless-mihomo; do
+        for path in "$SYSTEMD_DIR/${service_name}.service" "$OPENRC_DIR/$service_name"; do
+            _mihomo_migration_snapshot_path "$snapshot" "resource-$index" "$path" || { rm -rf "$snapshot"; return 1; }
+            index=$((index + 1))
+        done
+    done
+    printf '%s\n' "$snapshot"
+}
+
+_mihomo_migration_snapshot_restore() {
+    local snapshot="$1" path_file path
+    [[ -d "$snapshot" ]] || return 1
+    # 先关闭新的共享服务，避免旧监听器恢复时发生端口竞争。
+    svc stop vless-mihomo >/dev/null 2>&1 || return 1
+    for path_file in "$snapshot"/*.path; do
+        [[ -e "$path_file" ]] || continue
+        path=$(<"$path_file")
+        if [[ -f "${path_file%.path}.absent" ]]; then
+            rm -f "$path" || return 1
+        else
+            mkdir -p "$(dirname "$path")" || return 1
+            cp -p "${path_file%.path}" "$path" || return 1
+        fi
+    done
+    if [[ "$DISTRO" != "alpine" ]]; then
+        systemctl daemon-reload >/dev/null 2>&1 || return 1
+    fi
+}
+
+_mihomo_migration_restore_service_states() {
+    local snapshot="$1" service_name failed=false
+    while IFS= read -r service_name; do
+        [[ -n "$service_name" ]] || continue
+        if [[ -f "$snapshot/${service_name}.enabled" ]]; then
+            svc enable "$service_name" >/dev/null 2>&1 || failed=true
+        else
+            svc disable "$service_name" >/dev/null 2>&1 || failed=true
+        fi
+    done < <(printf '%s\n' vless-mihomo; cat "$snapshot/services")
+    while IFS= read -r service_name; do
+        [[ -n "$service_name" ]] || continue
+        if [[ -f "$snapshot/${service_name}.running" ]]; then
+            svc start "$service_name" >/dev/null 2>&1 || failed=true
+        else
+            svc stop "$service_name" >/dev/null 2>&1 || failed=true
+        fi
+    done < <(printf '%s\n' vless-mihomo; cat "$snapshot/services")
+    [[ "$failed" == false ]]
+}
+
+_mihomo_migration_rollback() {
+    local snapshot="$1"
+    if ! _mihomo_migration_snapshot_restore "$snapshot" || ! _mihomo_migration_restore_service_states "$snapshot"; then
+        printf 'Snell 自动迁移回滚失败，恢复快照保留在: %s\n' "$snapshot" >&2
+        return 1
+    fi
+    rm -rf "$snapshot"
+}
+
+# 仅在交互式启动阶段调用：预检完成前不会停止任何旧 Snell 服务。
+migrate_legacy_snell_to_mihomo() {
+    local legacy_services snapshot candidate_db candidate_config
+    [[ -f "$MIHOMO_MIGRATION_MARKER" ]] && return 0
+    legacy_services=$(_legacy_snell_service_names)
+    [[ -n "$legacy_services" ]] || return 0
+    snapshot=$(_mihomo_migration_snapshot_create "$legacy_services") || return 1
+    candidate_db=$(mktemp "$CFG/db.json.mihomo-migration.XXXXXX") || { rm -rf "$snapshot"; return 1; }
+    candidate_config=$(mktemp "$CFG/mihomo.yaml.mihomo-migration.XXXXXX") || { rm -f "$candidate_db"; rm -rf "$snapshot"; return 1; }
+
+    if ! install_mihomo stable ||
+       ! _build_mihomo_migration_db "$DB_FILE" "$candidate_db" ||
+       ! generate_mihomo_config "$candidate_db" "$candidate_config" ||
+       ! validate_mihomo_config "$candidate_config" "$MIHOMO_BIN"; then
+        rm -f "$candidate_db" "$candidate_config"
+        rm -rf "$snapshot"
+        return 1
+    fi
+    chmod 600 "$candidate_config" || { rm -f "$candidate_db" "$candidate_config"; rm -rf "$snapshot"; return 1; }
+
+    local service_name
+    for service_name in $legacy_services; do
+        if [[ -f "$snapshot/${service_name}.running" ]] && ! svc stop "$service_name"; then
+            rm -f "$candidate_db" "$candidate_config"
+            _mihomo_migration_rollback "$snapshot"
+            return 1
+        fi
+    done
+    if ! mv "$candidate_db" "$DB_FILE" || ! mv "$candidate_config" "$MIHOMO_CONFIG" ||
+       ! create_mihomo_service || ! svc enable vless-mihomo; then
+        _mihomo_migration_rollback "$snapshot"
+        return 1
+    fi
+    if [[ -f "$snapshot/vless-mihomo.running" ]]; then
+        svc restart vless-mihomo
+    else
+        svc start vless-mihomo
+    fi
+    if [[ $? -ne 0 ]] || ! svc status vless-mihomo || ! _mihomo_ports_healthy "$DB_FILE" ||
+       ! _cleanup_legacy_snell_resources "$legacy_services"; then
+        _mihomo_migration_rollback "$snapshot"
+        return 1
+    fi
+    if ! (umask 077; : >"$MIHOMO_MIGRATION_MARKER") || ! chmod 600 "$MIHOMO_MIGRATION_MARKER"; then
+        _mihomo_migration_rollback "$snapshot"
+        return 1
+    fi
+    rm -rf "$snapshot"
+}
+
 _mihomo_restore_db_config() {
     local snapshot="$1" failed=false
     if [[ -f "$snapshot/db-absent" ]]; then
@@ -12133,7 +12343,9 @@ install_shadowtls() {
     local aarch=$(_map_arch "x86_64-unknown-linux-musl:aarch64-unknown-linux-musl:armv7-unknown-linux-musleabihf") || { _err "不支持的架构"; return 1; }
     _install_binary "shadow-tls" "ihciah/shadow-tls" \
         'https://github.com/ihciah/shadow-tls/releases/download/v$version/shadow-tls-${aarch}' \
-        shadowtls
+        shadowtls || return 1
+    (umask 077; : >"$CFG/.shadowtls-managed") || return 1
+    chmod 600 "$CFG/.shadowtls-managed"
 }
 
 # 安装 NaïveProxy (Caddy with forwardproxy)
@@ -29908,6 +30120,9 @@ main_menu() {
     init_log  # 初始化日志
     init_db   # 初始化 JSON 数据库
     db_migrate_to_multiuser  # 迁移旧的单用户配置到多用户格式
+    if ! migrate_legacy_snell_to_mihomo; then
+        _warn "Snell v4/v5 自动迁移未完成，旧服务已保留或恢复"
+    fi
     ensure_singbox_runtime_consistency 2>/dev/null || true
     ensure_mihomo_runtime_consistency 2>/dev/null || true
 
