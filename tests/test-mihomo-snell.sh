@@ -97,6 +97,22 @@ write_all_mihomo_protocols_db() {
     }' >"$DB_FILE"
 }
 
+# Execute the generated discovery function without entering its watchdog loop.
+watchdog_services() {
+    create_server_scripts
+    local runner="$TEST_TMP/watchdog-services.sh" line
+    while IFS= read -r line; do
+        case "$line" in
+            'CFG="/etc/vless-reality"') printf 'CFG=%q\n' "$CFG" >>"$runner" ;;
+            'LOG_FILE="/var/log/vless-watchdog.log"') printf 'LOG_FILE=%q\n' "$TEST_TMP/watchdog.log" >>"$runner" ;;
+            'log "INFO: Watchdog 启动"') break ;;
+            *) printf '%s\n' "$line" >>"$runner" ;;
+        esac
+    done <"$CFG/watchdog.sh"
+    printf '%s\n' 'get_all_services' >>"$runner"
+    bash "$runner"
+}
+
 test_source_does_not_run_cli() (
     new_fixture
     trap cleanup_fixture EXIT
@@ -505,6 +521,59 @@ test_watchdog_has_one_validated_mihomo_entry() (
     grep -Fq 'vless-mihomo -t -f "$CFG/mihomo.yaml"' "$CFG/watchdog.sh"
 )
 
+# Break caught: treating legacy .xray Snell records as Xray/Mihomo would monitor
+# the wrong service, while omitting a ShadowTLS backend would leave it unmonitored.
+test_watchdog_discovers_only_legacy_xray_snell_services() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    init_db
+    jq -n '{
+      version:"4.0.0", singbox:{}, meta:{}, mihomo:{},
+      xray:{
+        snell:{port:41001,psk:"legacy-v4"},
+        "snell-v5":{port:51001,psk:"legacy-v5"},
+        "snell-shadowtls":{port:42001,backend_port:42002,psk:"legacy-stls"},
+        "snell-v5-shadowtls":{port:52001,backend_port:52002,psk:"legacy-v5-stls"}
+      }
+    }' >"$DB_FILE"
+    local services
+    services=$(watchdog_services)
+    [[ "$services" == 'vless-snell:snell-server vless-snell-shadowtls:shadow-tls vless-snell-shadowtls-backend:snell-server vless-snell-v5:snell-server-v5 vless-snell-v5-shadowtls:shadow-tls vless-snell-v5-shadowtls-backend:snell-server-v5 ' ]]
+)
+
+# Break caught: falling back to the retired frontend/backend services for a new
+# .mihomo node would create duplicate ownership of the listener.
+test_watchdog_routes_mihomo_records_only_to_shared_service() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    write_all_mihomo_protocols_db
+
+    [[ "$(watchdog_services)" == 'vless-mihomo:vless-mihomo ' ]]
+)
+
+# Break caught: routing a pre-migration record to Mihomo hides logs for its old
+# ShadowTLS frontend service; new .mihomo records must not enter this fallback.
+test_service_log_menu_routes_legacy_xray_shadowtls_to_old_frontend() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    init_db
+    db_add xray snell-shadowtls '{"port":42001,"backend_port":42002,"psk":"legacy"}'
+    G= W= NC=
+    _header() { :; }
+    _line() { :; }
+    _err() { :; }
+    _pause() { :; }
+    journalctl() { printf '%s\n' "$*" >"$TEST_TMP/journalctl.args"; }
+
+    local output
+    output=$(show_service_logs <<<"1")
+    grep -q 'Snell+ShadowTLS 服务日志' <<<"$output" || return 1
+    [[ "$(<"$TEST_TMP/journalctl.args")" == '-u vless-snell-shadowtls --no-pager -n 50' ]]
+)
+
 test_mihomo_ports_healthy_requires_every_listener() (
     new_fixture
     trap cleanup_fixture EXIT
@@ -821,25 +890,36 @@ test_set_mihomo_log_level_rolls_back_on_validation_failure() (
     [[ ! -e "$TEST_TMP/service-touched" ]]
 )
 
+# Break caught: deleting the recovery snapshot or ignoring a failed restore
+# would discard the original DB/config after a failed log-level transaction.
 test_set_mihomo_log_level_retains_snapshot_when_restore_fails() (
     new_fixture
     trap cleanup_fixture EXIT
     source "$SCRIPT"
     write_mixed_mihomo_db
+    cp "$DB_FILE" "$TEST_TMP/db.before"
     printf '%s\n' '{"old":true}' >"$MIHOMO_CONFIG"
+    cp "$MIHOMO_CONFIG" "$TEST_TMP/config.before"
     generate_mihomo_config() { printf '%s\n' '{"new":true}' >"${2:-$MIHOMO_CONFIG}"; }
     validate_mihomo_config() { return 1; }
+    local restore_attempts=0
     cp() {
-        if [[ "${2:-}" == "$TEST_TMP/etc/.mihomo-log-level."*"/db.json" ]]; then
+        if [[ "${1:-}" == "-p" && "${2:-}" == "$TEST_TMP/etc/.mihomo-log-level."*"/db.json" && "${3:-}" == "$DB_FILE" ]]; then
+            restore_attempts=$((restore_attempts + 1))
             return 1
         fi
         command cp "$@"
     }
 
-    ! set_mihomo_log_level debug
+    ! set_mihomo_log_level debug || return 1
+    [[ $restore_attempts -eq 1 ]] || return 1
+    ! cmp -s "$DB_FILE" "$TEST_TMP/db.before" || return 1
+    cmp -s "$MIHOMO_CONFIG" "$TEST_TMP/config.before" || return 1
     local snapshot
     snapshot=$(find "$CFG" -maxdepth 1 -type d -name '.mihomo-log-level.*' -print -quit)
-    [[ -n "$snapshot" && -f "$snapshot/db.json" && -f "$snapshot/mihomo.yaml" ]]
+    [[ -n "$snapshot" ]] || return 1
+    cmp -s "$snapshot/db.json" "$TEST_TMP/db.before" || return 1
+    cmp -s "$snapshot/mihomo.yaml" "$TEST_TMP/config.before"
 )
 
 test_mihomo_systemd_lifecycle_stops_shared_service_once() (
@@ -1491,6 +1571,9 @@ run_test test_mihomo_list_ports_prints_every_listener_port
 run_test test_mihomo_runtime_metadata_maps_shared_service
 run_test test_mihomo_openrc_status_falls_back_to_shared_process
 run_test test_watchdog_has_one_validated_mihomo_entry
+run_test test_watchdog_discovers_only_legacy_xray_snell_services
+run_test test_watchdog_routes_mihomo_records_only_to_shared_service
+run_test test_service_log_menu_routes_legacy_xray_shadowtls_to_old_frontend
 run_test test_mihomo_ports_healthy_requires_every_listener
 run_test test_create_mihomo_systemd_service_definition
 run_test test_create_mihomo_systemd_service_fails_when_unit_write_fails

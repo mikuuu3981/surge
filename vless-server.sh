@@ -3921,13 +3921,22 @@ filter_installed() { # filter_installed "proto1 proto2 ..."
 get_xray_protocols()       { filter_installed "$XRAY_PROTOCOLS"; }
 get_singbox_protocols()    { filter_installed "$SINGBOX_PROTOCOLS"; }
 get_mihomo_protocols() {
-    filter_installed "$MIHOMO_PROTOCOLS"
+    get_mihomo_runtime_protocols
 }
 
 # 运行时仅处理已经进入 .mihomo 的记录；迁移前的 .xray Snell 仍由旧服务负责。
 get_mihomo_runtime_protocols() {
     local installed protocol
     installed=$(db_list_protocols "mihomo") || return 0
+    for protocol in $MIHOMO_PROTOCOLS; do
+        grep -qx "$protocol" <<<"$installed" && printf '%s\n' "$protocol"
+    done
+}
+
+# 迁移前的 Snell v4/v5 记录仍归旧服务所有；绝不能将 .mihomo 新节点带入该回退路径。
+get_legacy_snell_protocols() {
+    local installed protocol
+    installed=$(db_list_protocols "xray") || return 0
     for protocol in $MIHOMO_PROTOCOLS; do
         grep -qx "$protocol" <<<"$installed" && printf '%s\n' "$protocol"
     done
@@ -13054,9 +13063,25 @@ get_all_services() {
     
     [[ ! -f "$DB_FILE" ]] && { echo ""; return; }
     
-    # 检查 Xray 协议
-    local xray_protos=$(jq -r '.xray | keys[]' "$DB_FILE" 2>/dev/null)
-    [[ -n "$xray_protos" ]] && services+="vless-reality:xray "
+    # 检查 Xray 协议；迁移前的 Snell 记录仍归其旧服务所有，不能错误归属给 Xray。
+    local xray_protos=$(jq -r '(.xray // {}) | keys[]' "$DB_FILE" 2>/dev/null)
+    local has_xray=false
+    for proto in $xray_protos; do
+        case "$proto" in
+            snell) services+="vless-snell:snell-server " ;;
+            snell-v5) services+="vless-snell-v5:snell-server-v5 " ;;
+            snell-shadowtls)
+                services+="vless-snell-shadowtls:shadow-tls "
+                services+="vless-snell-shadowtls-backend:snell-server "
+                ;;
+            snell-v5-shadowtls)
+                services+="vless-snell-v5-shadowtls:shadow-tls "
+                services+="vless-snell-v5-shadowtls-backend:snell-server-v5 "
+                ;;
+            *) has_xray=true ;;
+        esac
+    done
+    [[ "$has_xray" == "true" ]] && services+="vless-reality:xray "
     
     # 检查 Sing-box 协议 (hy2/tuic 由 vless-singbox 统一管理)
     local singbox_protos=$(jq -r '.singbox | keys[]' "$DB_FILE" 2>/dev/null)
@@ -27018,9 +27043,11 @@ show_service_logs() {
         ((idx++))
     fi
 
-    # 独立进程协议 (Snell/AnyTLS/ShadowTLS)
-    local standalone_protocols=$(get_standalone_protocols)
-    for proto in $standalone_protocols; do
+    # 独立进程协议及迁移前 .xray 中的 Snell v4/v5 旧服务。
+    local standalone_protocols legacy_snell_protocols
+    standalone_protocols=$(get_standalone_protocols)
+    legacy_snell_protocols=$(get_legacy_snell_protocols)
+    for proto in $standalone_protocols $legacy_snell_protocols; do
         local proto_name=$(get_protocol_name $proto)
         echo -e "  ${G}$idx${NC}) $proto_name 服务日志"
         proto_array+=("$proto")
@@ -27058,11 +27085,19 @@ show_service_logs() {
             show_mihomo_diagnostics
             return
             ;;
+        snell)
+            service_name="vless-snell"
+            proc_name="snell-server"
+            ;;
+        snell-v5)
+            service_name="vless-snell-v5"
+            proc_name="snell-server-v5"
+            ;;
         snell-v6)
             service_name="vless-snell-v6"
             proc_name="snell-server-v6"
             ;;
-        ss2022-shadowtls)
+        snell-shadowtls|snell-v5-shadowtls|ss2022-shadowtls)
             service_name="vless-${selected}"
             proc_name="shadow-tls"
             ;;
