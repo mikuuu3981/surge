@@ -27,6 +27,13 @@ chmod +x nft.sh
 nftm
 ```
 
+## Snell 与 Mihomo
+
+- Snell v4/v5 由 Mihomo v1.19.28+ 提供；一个进程可同时监听多个端口，且每个端口可独立使用不同的 PSK 和版本。
+- Snell+ShadowTLS 使用 Mihomo 内置的 ShadowTLS v3；Snell v6 仍由官方 `snell-server-v6` 提供。
+- 旧版 Snell v4/v5 安装会自动迁移到 Mihomo，迁移失败会自动回滚。
+- Mihomo 已纳入核心版本管理和运行状态显示。
+
 REALITY 防偷流量说明：
 
 REALITY 对鉴权失败的连接会回落到 `target`。如果伪装目标使用 Cloudflare 等公共 CDN，服务器可能被扫描后被当作 CDN 端口转发器，消耗额外出口流量。脚本会按照 XTLS 官方文档为 VLESS+REALITY 和 VLESS+REALITY+XHTTP 写入 `limitFallbackUpload` / `limitFallbackDownload` 令牌桶限速，并为每个实例随机化参数；合法 REALITY 连接不受此限速影响。

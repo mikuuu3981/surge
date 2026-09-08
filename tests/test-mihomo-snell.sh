@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 SCRIPT="$ROOT/vless-server.sh"
 PASS=0
+REAL_MIHOMO_BIN="${VLESS_TEST_MIHOMO_BIN:-}"
 declare -A MIG_RUNNING MIG_ENABLED
 
 run_test() {
@@ -1350,6 +1351,31 @@ test_snell_generators_store_only_transactional_mihomo_records() (
        ! -e "$CFG/snell-shadowtls.conf" && ! -e "$CFG/snell_backend_port" ]]
 )
 
+test_release_version_is_rendered_in_header() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+
+    local output
+    output=$(TERM=dumb _header 2>&1)
+    [[ "$output" == *"v3.5.14"* ]]
+)
+
+test_validate_mixed_config_with_supplied_real_mihomo() (
+    if [[ -z "$REAL_MIHOMO_BIN" || ! -x "$REAL_MIHOMO_BIN" ]]; then
+        printf '%s\n' 'skip - real Mihomo binary not supplied'
+        return 0
+    fi
+
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    write_mixed_mihomo_db
+    generate_mihomo_config "$DB_FILE" "$TEST_TMP/mihomo.yaml"
+
+    validate_mihomo_config "$TEST_TMP/mihomo.yaml" "$REAL_MIHOMO_BIN"
+)
+
 test_validate_mihomo_config_checks_json_and_binary_arguments() (
     new_fixture
     trap cleanup_fixture EXIT
@@ -2435,6 +2461,8 @@ run_test test_mihomo_transaction_retains_snapshot_when_file_restore_fails
 run_test test_mihomo_transaction_retains_snapshot_when_service_restore_fails
 run_test test_mihomo_transaction_rejects_cross_protocol_duplicate_before_service_mutation
 run_test test_snell_generators_store_only_transactional_mihomo_records
+run_test test_release_version_is_rendered_in_header
+run_test test_validate_mixed_config_with_supplied_real_mihomo
 run_test test_validate_mihomo_config_checks_json_and_binary_arguments
 run_test test_mihomo_migration_candidate_normalizes_legacy_records
 run_test test_mihomo_migration_candidate_rejects_conflicts_and_deduplicates_match
