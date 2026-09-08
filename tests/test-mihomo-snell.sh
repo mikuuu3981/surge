@@ -7,6 +7,9 @@ PASS=0
 
 run_test() {
     local name="$1"
+    if [[ -n "${VLESS_TEST_ONLY:-}" && "$name" != "$VLESS_TEST_ONLY" ]]; then
+        return 0
+    fi
     if "$name"; then
         printf 'ok - %s\n' "$name"
         PASS=$((PASS + 1))
@@ -286,6 +289,54 @@ test_core_menu_replaces_snell_v5_with_mihomo() (
     grep -q '核心版本管理 (Xray/Sing-box/Mihomo/Snell v6)' <<<"$output" || return 1
     ! grep -q 'Snell v5' <<<"$output" || return 1
     grep -q 'Mihomo' <<<"$output"
+)
+
+test_official_snell_v4_v5_install_update_entrypoints_are_unreachable() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+
+    ! declare -F install_snell >/dev/null || return 1
+    ! declare -F install_snell_v5 >/dev/null || return 1
+    ! declare -F update_snell_v5_core >/dev/null || return 1
+    ! declare -F update_snell_v5_core_custom >/dev/null
+)
+
+test_core_update_helper_rejects_official_snell_v5() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    _check_core_update_deps() { return 0; }
+    _confirm_core_update_version() { return 0; }
+    _backup_core_binary() { return 0; }
+    _show_changelog_summary() { :; }
+    _ok() { :; }
+    _err() { :; }
+    _warn() { :; }
+    _info() { :; }
+    svc() { return 1; }
+    forbidden_installer() { touch "$TEST_TMP/official-installer-called"; }
+
+    ! _update_core_to_version "Snell v5" stable 5.0.1 vless-snell-v5 forbidden_installer || return 1
+    [[ ! -e "$TEST_TMP/official-installer-called" ]]
+)
+
+test_mihomo_runtime_metadata_has_no_external_snell_v4_v5_execution() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+
+    local protocol
+    for protocol in snell snell-v5 snell-shadowtls snell-v5-shadowtls; do
+        [[ "${PROTO_SVC[$protocol]:-}" == vless-mihomo ]] || return 1
+        [[ "${PROTO_BIN[$protocol]:-}" == vless-mihomo ]] || return 1
+        [[ "${PROTO_KIND[$protocol]:-}" == mihomo ]] || return 1
+        [[ -z "${PROTO_EXEC[$protocol]:-}" ]] || return 1
+        [[ -z "${BACKEND_NAME[$protocol]:-}" ]] || return 1
+        [[ -z "${BACKEND_EXEC[$protocol]:-}" ]] || return 1
+    done
+    [[ -z "${SVC_PROC[vless-snell]:-}" && -z "${SVC_PROC[vless-snell-v5]:-}" &&
+       -z "${SVC_PROC[vless-snell-shadowtls]:-}" && -z "${SVC_PROC[vless-snell-v5-shadowtls]:-}" ]]
 )
 
 test_install_mihomo_rejects_unsupported_version_before_download() (
@@ -770,6 +821,27 @@ test_set_mihomo_log_level_rolls_back_on_validation_failure() (
     [[ ! -e "$TEST_TMP/service-touched" ]]
 )
 
+test_set_mihomo_log_level_retains_snapshot_when_restore_fails() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    write_mixed_mihomo_db
+    printf '%s\n' '{"old":true}' >"$MIHOMO_CONFIG"
+    generate_mihomo_config() { printf '%s\n' '{"new":true}' >"${2:-$MIHOMO_CONFIG}"; }
+    validate_mihomo_config() { return 1; }
+    cp() {
+        if [[ "${2:-}" == "$TEST_TMP/etc/.mihomo-log-level."*"/db.json" ]]; then
+            return 1
+        fi
+        command cp "$@"
+    }
+
+    ! set_mihomo_log_level debug
+    local snapshot
+    snapshot=$(find "$CFG" -maxdepth 1 -type d -name '.mihomo-log-level.*' -print -quit)
+    [[ -n "$snapshot" && -f "$snapshot/db.json" && -f "$snapshot/mihomo.yaml" ]]
+)
+
 test_mihomo_systemd_lifecycle_stops_shared_service_once() (
     new_fixture
     trap cleanup_fixture EXIT
@@ -924,6 +996,7 @@ prepare_mihomo_transaction_fixture() {
     source "$SCRIPT"
     init_db
     TEST_SERVICE_RUNNING=false
+    TEST_SERVICE_ENABLED=false
     TEST_FAIL_RESTART=false
     export TEST_FAIL_VALIDATION=false
     export MIHOMO_TX_LOG="$TEST_TMP/svc.log"
@@ -948,6 +1021,7 @@ EOF
         [[ "$name" == vless-mihomo ]] || return 1
         case "$action" in
             status) [[ "$TEST_SERVICE_RUNNING" == true ]] ;;
+            enabled) [[ "$TEST_SERVICE_ENABLED" == true ]] ;;
             start) TEST_SERVICE_RUNNING=true ;;
             restart)
                 if [[ "$TEST_FAIL_RESTART" == true ]]; then
@@ -957,7 +1031,8 @@ EOF
                 TEST_SERVICE_RUNNING=true
                 ;;
             stop) TEST_SERVICE_RUNNING=false ;;
-            enable|disable) return 0 ;;
+            enable) TEST_SERVICE_ENABLED=true ;;
+            disable) TEST_SERVICE_ENABLED=false ;;
             *) return 1 ;;
         esac
     }
@@ -982,7 +1057,7 @@ test_mihomo_transaction_adds_multiple_protocol_port_records() (
     ] and .mihomo["snell-v5"] == [{port:51001,psk:"v5-one",version:5}]' "$DB_FILE" >/dev/null || return 1
     jq -e '(.listeners | length) == 3 and
         ([.listeners[].port] == [41001,41002,51001])' "$MIHOMO_CONFIG" >/dev/null || return 1
-    [[ "$(<"$TEST_TMP/svc.log")" == $'status:vless-mihomo\nvalidate\ncreate\nenable:vless-mihomo\nstart:vless-mihomo\nstatus:vless-mihomo\nhealth\nstatus:vless-mihomo\nvalidate\nrestart:vless-mihomo\nstatus:vless-mihomo\nhealth\nstatus:vless-mihomo\nvalidate\nrestart:vless-mihomo\nstatus:vless-mihomo\nhealth' ]]
+    [[ "$(<"$TEST_TMP/svc.log")" == $'status:vless-mihomo\nenabled:vless-mihomo\nvalidate\ncreate\nenable:vless-mihomo\nstart:vless-mihomo\nstatus:vless-mihomo\nhealth\nstatus:vless-mihomo\nenabled:vless-mihomo\nvalidate\nrestart:vless-mihomo\nstatus:vless-mihomo\nhealth\nstatus:vless-mihomo\nenabled:vless-mihomo\nvalidate\nrestart:vless-mihomo\nstatus:vless-mihomo\nhealth' ]]
 )
 
 test_mihomo_transaction_replaces_only_selected_port() (
@@ -1033,7 +1108,7 @@ test_mihomo_transaction_removes_final_node_and_shared_service() (
     jq -e '.mihomo == {}' "$DB_FILE" >/dev/null || return 1
     [[ ! -e "$MIHOMO_CONFIG" && ! -e "$SYSTEMD_DIR/vless-mihomo.service" ]] || return 1
     [[ "$TEST_SERVICE_RUNNING" == false ]] || return 1
-    [[ "$(<"$TEST_TMP/svc.log")" == $'status:vless-mihomo\nstop:vless-mihomo\ndisable:vless-mihomo' ]]
+    [[ "$(<"$TEST_TMP/svc.log")" == $'status:vless-mihomo\nenabled:vless-mihomo\nstop:vless-mihomo\ndisable:vless-mihomo' ]]
 )
 
 test_mihomo_transaction_validation_failure_restores_exact_bytes() (
@@ -1051,7 +1126,7 @@ test_mihomo_transaction_validation_failure_restores_exact_bytes() (
     ! _apply_mihomo_node_change snell add all '{"port":41003,"psk":"never-committed","version":4}' || return 1
     cmp -s "$DB_FILE" "$TEST_TMP/db.before" || return 1
     cmp -s "$MIHOMO_CONFIG" "$TEST_TMP/config.before" || return 1
-    [[ "$(<"$TEST_TMP/svc.log")" == $'status:vless-mihomo\nvalidate' ]]
+    [[ "$(<"$TEST_TMP/svc.log")" == $'status:vless-mihomo\nenabled:vless-mihomo\nvalidate' ]]
 )
 
 test_mihomo_transaction_restart_failure_restores_and_restarts_previous_state() (
@@ -1064,6 +1139,7 @@ test_mihomo_transaction_restart_failure_restores_and_restarts_previous_state() (
     cp "$DB_FILE" "$TEST_TMP/db.before"
     cp "$MIHOMO_CONFIG" "$TEST_TMP/config.before"
     TEST_SERVICE_RUNNING=true
+    TEST_SERVICE_ENABLED=true
     TEST_FAIL_RESTART=true
     : >"$TEST_TMP/svc.log"
 
@@ -1071,7 +1147,82 @@ test_mihomo_transaction_restart_failure_restores_and_restarts_previous_state() (
     cmp -s "$DB_FILE" "$TEST_TMP/db.before" || return 1
     cmp -s "$MIHOMO_CONFIG" "$TEST_TMP/config.before" || return 1
     [[ "$TEST_SERVICE_RUNNING" == true ]] || return 1
-    [[ "$(<"$TEST_TMP/svc.log")" == $'status:vless-mihomo\nvalidate\nrestart:vless-mihomo\nrestart:vless-mihomo' ]]
+    [[ "$(<"$TEST_TMP/svc.log")" == $'status:vless-mihomo\nenabled:vless-mihomo\nvalidate\nrestart:vless-mihomo\nrestart:vless-mihomo' ]]
+)
+
+test_mihomo_transaction_enables_existing_disabled_service() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    prepare_mihomo_transaction_fixture
+    write_mixed_mihomo_db
+    generate_mihomo_config
+    touch "$SYSTEMD_DIR/vless-mihomo.service"
+    TEST_SERVICE_RUNNING=true
+    TEST_SERVICE_ENABLED=false
+    : >"$TEST_TMP/svc.log"
+
+    _apply_mihomo_node_change snell add all '{"port":41003,"psk":"v4-three","version":4}' || return 1
+
+    [[ "$TEST_SERVICE_ENABLED" == true ]] || return 1
+    grep -q '^enable:vless-mihomo$' "$TEST_TMP/svc.log"
+)
+
+test_mihomo_transaction_restores_prior_disabled_state_on_rollback() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    prepare_mihomo_transaction_fixture
+    write_mixed_mihomo_db
+    generate_mihomo_config
+    touch "$SYSTEMD_DIR/vless-mihomo.service"
+    TEST_SERVICE_RUNNING=true
+    TEST_SERVICE_ENABLED=false
+    TEST_FAIL_RESTART=true
+    : >"$TEST_TMP/svc.log"
+
+    ! _apply_mihomo_node_change snell add all '{"port":41003,"psk":"rollback","version":4}' || return 1
+
+    [[ "$TEST_SERVICE_ENABLED" == false && "$TEST_SERVICE_RUNNING" == true ]] || return 1
+    [[ "$(grep -E '^(enable|disable|restart):' "$TEST_TMP/svc.log")" == $'enable:vless-mihomo\nrestart:vless-mihomo\ndisable:vless-mihomo\nrestart:vless-mihomo' ]]
+)
+
+test_mihomo_transaction_retains_snapshot_when_file_restore_fails() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    prepare_mihomo_transaction_fixture
+    write_mixed_mihomo_db
+    generate_mihomo_config
+    TEST_SERVICE_RUNNING=true
+    TEST_FAIL_VALIDATION=true
+    _mihomo_snapshot_restore() {
+        printf '%s\n' "$1" >"$TEST_TMP/failed-snapshot"
+        return 1
+    }
+
+    ! _apply_mihomo_node_change snell add all '{"port":41003,"psk":"rollback","version":4}' || return 1
+    local snapshot
+    snapshot=$(<"$TEST_TMP/failed-snapshot")
+    [[ -d "$snapshot" && -f "$snapshot/db.json" && -f "$snapshot/mihomo.yaml" ]]
+)
+
+test_mihomo_transaction_retains_snapshot_when_service_restore_fails() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    prepare_mihomo_transaction_fixture
+    write_mixed_mihomo_db
+    generate_mihomo_config
+    touch "$SYSTEMD_DIR/vless-mihomo.service"
+    TEST_SERVICE_RUNNING=true
+    TEST_SERVICE_ENABLED=false
+    TEST_FAIL_RESTART=true
+    _mihomo_restore_running_state() {
+        printf '%s\n' "$1" >"$TEST_TMP/failed-snapshot"
+        return 1
+    }
+
+    ! _apply_mihomo_node_change snell add all '{"port":41003,"psk":"rollback","version":4}' || return 1
+    local snapshot
+    snapshot=$(<"$TEST_TMP/failed-snapshot")
+    [[ -d "$snapshot" && -f "$snapshot/db.json" && -f "$snapshot/mihomo.yaml" ]]
 )
 
 test_mihomo_transaction_rejects_cross_protocol_duplicate_before_service_mutation() (
@@ -1326,6 +1477,9 @@ run_test test_mihomo_async_warming_caches_both_channels
 run_test test_mihomo_async_warming_marks_unavailable_repository
 run_test test_show_core_versions_includes_mihomo_channels
 run_test test_core_menu_replaces_snell_v5_with_mihomo
+run_test test_official_snell_v4_v5_install_update_entrypoints_are_unreachable
+run_test test_core_update_helper_rejects_official_snell_v5
+run_test test_mihomo_runtime_metadata_has_no_external_snell_v4_v5_execution
 run_test test_install_mihomo_rejects_unsupported_version_before_download
 run_test test_install_mihomo_requires_publisher_verification
 run_test test_install_mihomo_uses_verified_official_asset
@@ -1351,6 +1505,7 @@ run_test test_mihomo_lifecycle_cleanup_stops_shared_service_once
 run_test test_set_mihomo_log_level_commits_complete_config
 run_test test_set_mihomo_log_level_rolls_back_database_and_config
 run_test test_set_mihomo_log_level_rolls_back_on_validation_failure
+run_test test_set_mihomo_log_level_retains_snapshot_when_restore_fails
 run_test test_mihomo_systemd_lifecycle_stops_shared_service_once
 run_test test_mihomo_selinux_restore_includes_managed_binary
 run_test test_mihomo_status_reports_partial_anomaly_and_missing_ports
@@ -1377,6 +1532,10 @@ run_test test_mihomo_transaction_removes_only_selected_port
 run_test test_mihomo_transaction_removes_final_node_and_shared_service
 run_test test_mihomo_transaction_validation_failure_restores_exact_bytes
 run_test test_mihomo_transaction_restart_failure_restores_and_restarts_previous_state
+run_test test_mihomo_transaction_enables_existing_disabled_service
+run_test test_mihomo_transaction_restores_prior_disabled_state_on_rollback
+run_test test_mihomo_transaction_retains_snapshot_when_file_restore_fails
+run_test test_mihomo_transaction_retains_snapshot_when_service_restore_fails
 run_test test_mihomo_transaction_rejects_cross_protocol_duplicate_before_service_mutation
 run_test test_snell_generators_store_only_transactional_mihomo_records
 run_test test_validate_mihomo_config_checks_json_and_binary_arguments

@@ -3814,21 +3814,17 @@ PROTO_SVC[hy2]="vless-singbox";  PROTO_BIN[hy2]="sing-box"; PROTO_KIND[hy2]="sin
 PROTO_SVC[tuic]="vless-singbox"; PROTO_BIN[tuic]="sing-box"; PROTO_KIND[tuic]="singbox"
 PROTO_SVC[anytls]="vless-singbox"; PROTO_BIN[anytls]="sing-box"; PROTO_KIND[anytls]="singbox"
 
-# 独立协议 (Snell 等闭源协议仍需独立进程)
-PROTO_SVC[snell]="vless-snell";     PROTO_EXEC[snell]="/usr/local/bin/snell-server -c $CFG/snell.conf";        PROTO_BIN[snell]="snell-server"; PROTO_KIND[snell]="snell"
-PROTO_SVC[snell-v5]="vless-snell-v5"; PROTO_EXEC[snell-v5]="/usr/local/bin/snell-server-v5 -c $CFG/snell-v5.conf"; PROTO_BIN[snell-v5]="snell-server-v5"; PROTO_KIND[snell-v5]="snell"
+# Snell v6 继续使用官方独立进程；v4/v5 仅由下方 Mihomo 元数据注册。
 PROTO_SVC[snell-v6]="vless-snell-v6"; PROTO_EXEC[snell-v6]="/usr/local/bin/snell-server-v6 -c $CFG/snell-v6.conf"; PROTO_BIN[snell-v6]="snell-server-v6"; PROTO_KIND[snell-v6]="snell"
 
 # 动态命令：运行时从数据库取参数
 PROTO_SVC[anytls]="vless-anytls"; PROTO_KIND[anytls]="anytls"
 PROTO_SVC[naive]="vless-naive"; PROTO_KIND[naive]="naive"
 
-# ShadowTLS：主服务 shadow-tls + 额外 backend 服务
-for _p in snell-shadowtls snell-v5-shadowtls ss2022-shadowtls; do
-    PROTO_SVC[$_p]="vless-${_p}"
-    PROTO_KIND[$_p]="shadowtls"
-    PROTO_BIN[$_p]="shadow-tls"
-done
+# SS2022+ShadowTLS 继续使用外部主服务和后端；Snell v4/v5 使用 Mihomo 内置 ShadowTLS。
+PROTO_SVC[ss2022-shadowtls]="vless-ss2022-shadowtls"
+PROTO_KIND[ss2022-shadowtls]="shadowtls"
+PROTO_BIN[ss2022-shadowtls]="shadow-tls"
 
 # Mihomo 统一服务：Snell v4/v5（含内置 ShadowTLS）共享一个进程。
 for _p in $MIHOMO_PROTOCOLS; do
@@ -3836,14 +3832,6 @@ for _p in $MIHOMO_PROTOCOLS; do
     PROTO_BIN[$_p]="vless-mihomo"
     PROTO_KIND[$_p]="mihomo"
 done
-
-BACKEND_NAME[snell-shadowtls]="vless-snell-shadowtls-backend"
-BACKEND_DESC[snell-shadowtls]="Snell Backend for ShadowTLS"
-BACKEND_EXEC[snell-shadowtls]="/usr/local/bin/snell-server -c $CFG/snell-shadowtls.conf"
-
-BACKEND_NAME[snell-v5-shadowtls]="vless-snell-v5-shadowtls-backend"
-BACKEND_DESC[snell-v5-shadowtls]="Snell v5 Backend for ShadowTLS"
-BACKEND_EXEC[snell-v5-shadowtls]="/usr/local/bin/snell-server-v5 -c $CFG/snell-v5-shadowtls.conf"
 
 BACKEND_NAME[ss2022-shadowtls]="vless-ss2022-shadowtls-backend"
 BACKEND_DESC[ss2022-shadowtls]="SS2022 Backend for ShadowTLS"
@@ -3854,13 +3842,9 @@ declare -A SVC_PROC=(
     [vless-reality]="xray"
     [vless-singbox]="sing-box"
     [vless-mihomo]="vless-mihomo"
-    [vless-snell]="snell-server"
-    [vless-snell-v5]="snell-server-v5"
     [vless-snell-v6]="snell-server-v6"
     [vless-anytls]="anytls-server"
     [vless-naive]="caddy"
-    [vless-snell-shadowtls]="shadow-tls"
-    [vless-snell-v5-shadowtls]="shadow-tls"
     [vless-ss2022-shadowtls]="shadow-tls"
     [nginx]="nginx"
 )
@@ -8125,8 +8109,8 @@ fix_selinux_context() {
     
     # 恢复文件上下文
     if command -v restorecon &>/dev/null; then
-        restorecon -Rv /usr/local/bin/xray /usr/local/bin/sing-box "$MIHOMO_BIN" /usr/local/bin/snell-server \
-            /usr/local/bin/snell-server-v5 /usr/local/bin/snell-server-v6 /usr/local/bin/anytls-server /usr/local/bin/shadow-tls \
+        restorecon -Rv /usr/local/bin/xray /usr/local/bin/sing-box "$MIHOMO_BIN" /usr/local/bin/snell-server-v6 \
+            /usr/local/bin/anytls-server /usr/local/bin/shadow-tls \
             /etc/vless-reality 2>/dev/null || true
     fi
     
@@ -8141,9 +8125,6 @@ readonly GITHUB_API_PER_PAGE=10
 readonly VERSION_CACHE_DIR="$CFG/version-cache"
 readonly VERSION_CACHE_TTL=3600  # 缓存1小时
 readonly SCRIPT_VERSION_CACHE_FILE="$VERSION_CACHE_DIR/.script_version"
-readonly SNELL_RELEASE_NOTES_URL="https://kb.nssurge.com/surge-knowledge-base/release-notes/snell.md"
-readonly SNELL_RELEASE_NOTES_ZH_URL="https://kb.nssurge.com/surge-knowledge-base/zh/release-notes/snell.md"
-readonly SNELL_DEFAULT_VERSION="5.0.1"
 readonly MIHOMO_REPO="MetaCubeX/mihomo"
 readonly MIHOMO_MIN_VERSION="1.19.28"
 readonly SNELL_V6_REPO="passeway/Snell"
@@ -8359,61 +8340,6 @@ _get_script_update_info() {
     fi
 }
 
-_get_snell_versions_from_kb() {
-    local limit="${1:-10}"
-    local result versions
-    result=$(curl -sL --connect-timeout 5 --max-time 10 "$SNELL_RELEASE_NOTES_URL" 2>/dev/null)
-    [[ -z "$result" ]] && return 1
-    versions=$(printf '%s\n' "$result" | sed -nE 's/^### v([0-9]+(\.[0-9]+)+(-[0-9A-Za-z.]+)?).*/\1/p' | head -n "$limit")
-    [[ -z "$versions" ]] && return 1
-    echo "$versions"
-}
-
-_get_snell_latest_version() {
-    local use_cache="${1:-true}"
-    local force="${2:-false}"
-    _init_version_cache
-
-    local cache_file="$VERSION_CACHE_DIR/surge-networks_snell"
-    if [[ "$force" != "true" ]] && _is_cache_fresh "$cache_file"; then
-        cat "$cache_file" 2>/dev/null
-        return 0
-    fi
-
-    if [[ "$force" != "true" && "$use_cache" == "true" ]]; then
-        local cached_version
-        if cached_version=$(_get_cached_version "surge-networks/snell"); then
-            if _is_plain_version "$cached_version"; then
-                echo "$cached_version"
-                return 0
-            fi
-        fi
-    fi
-
-    local version
-    version=$(_get_snell_versions_from_kb 1 | head -n 1)
-    [[ -z "$version" ]] && version="$SNELL_DEFAULT_VERSION"
-    _save_version_cache "surge-networks/snell" "$version"
-    echo "$version"
-}
-
-_get_snell_changelog_from_kb() {
-    local version="$1"
-    local result block
-    result=$(curl -sL --connect-timeout 5 --max-time 10 "$SNELL_RELEASE_NOTES_ZH_URL" 2>/dev/null)
-    [[ -z "$result" ]] && return 1
-    
-    # BusyBox 兼容写法：使用 sed 替代复杂的 awk 正则
-    # 匹配从 "### v版本号" 开始到下一个 "### v" 之间的内容
-    block=$(printf '%s\n' "$result" | sed -n "/^### v${version}/,/^### v/p" | sed '1d;$d')
-    [[ -z "$block" ]] && return 1
-    
-    # 过滤掉不需要的行
-    block=$(printf '%s\n' "$block" | grep -v '^{%' | grep -v '^[[:space:]]*```' | grep -v '^[[:space:]]*$')
-    [[ -z "$block" ]] && return 1
-    echo "$block"
-}
-
 # 获取缓存的版本号
 _get_cached_version() {
     local repo="$1"
@@ -8516,15 +8442,6 @@ _update_version_cache_async() {
     if _is_cache_fresh "$cache_file"; then
         return 0
     fi
-    if [[ "$repo" == "surge-networks/snell" ]]; then
-        (
-            local version
-            version=$(_get_snell_versions_from_kb 1 | head -n 1)
-            rm -f "$unavailable_file" 2>/dev/null || true
-            [[ -n "$version" ]] && _save_version_cache "$repo" "$version"
-        ) &
-        return 0
-    fi
     (
         local version
         local response http_code body
@@ -8549,11 +8466,6 @@ _update_prerelease_cache_async() {
     local cache_file="$VERSION_CACHE_DIR/$(echo "$repo" | tr '/' '_')_prerelease"
     local unavailable_file="$VERSION_CACHE_DIR/$(echo "$repo" | tr '/' '_')_unavailable"
     if _is_cache_fresh "$cache_file"; then
-        return 0
-    fi
-    if [[ "$repo" == "surge-networks/snell" ]]; then
-        echo "无" > "$cache_file" 2>/dev/null || true
-        rm -f "$unavailable_file" 2>/dev/null || true
         return 0
     fi
     (
@@ -8619,11 +8531,6 @@ _get_latest_version() {
 
     # 初始化缓存目录
     _init_version_cache
-
-    if [[ "$repo" == "surge-networks/snell" ]]; then
-        _get_snell_latest_version "$use_cache" "$force"
-        return $?
-    fi
 
     local cache_file="$VERSION_CACHE_DIR/$(echo "$repo" | tr '/' '_')"
     if [[ "$force" != "true" ]] && _is_cache_fresh "$cache_file"; then
@@ -8746,12 +8653,6 @@ _get_latest_prerelease_version() {
 
     # 初始化缓存目录
     _init_version_cache
-
-    if [[ "$repo" == "surge-networks/snell" ]]; then
-        echo "无" > "$cache_file" 2>/dev/null || true
-        echo "无"
-        return 0
-    fi
 
     if [[ "$force" != "true" ]] && _is_cache_fresh "$cache_file"; then
         cat "$cache_file" 2>/dev/null
@@ -8880,14 +8781,6 @@ _get_release_versions() {
     local repo_safe cache_file
     repo_safe=$(echo "$repo" | tr '/' '_')
     cache_file="$VERSION_CACHE_DIR/${repo_safe}_releases_${mode}"
-    if [[ "$repo" == "surge-networks/snell" ]] && _is_cache_fresh "$cache_file"; then
-        local cached_versions
-        cached_versions=$(cat "$cache_file" 2>/dev/null)
-        if [[ -n "$cached_versions" ]]; then
-            echo "$cached_versions"
-            return 0
-        fi
-    fi
     if _is_cache_fresh "$cache_file"; then
         local cached_versions cached_count
         cached_versions=$(cat "$cache_file" 2>/dev/null)
@@ -8896,26 +8789,6 @@ _get_release_versions() {
             echo "$cached_versions"
             return 0
         fi
-    fi
-    if [[ "$repo" == "surge-networks/snell" ]]; then
-        local versions
-        if [[ "$mode" == "prerelease" || "$mode" == "test" || "$mode" == "beta" ]]; then
-            _err "Snell 无预发布版本"
-            return 1
-        fi
-        versions=$(_get_snell_versions_from_kb "$limit")
-        [[ -z "$versions" ]] && versions="$SNELL_DEFAULT_VERSION"
-        case "$mode" in
-            prerelease|test|beta) versions=$(printf '%s\n' "$versions" | grep -E '-' || true) ;;
-            stable) versions=$(printf '%s\n' "$versions" | grep -v -E '-' || true) ;;
-        esac
-        if [[ -z "$versions" ]]; then
-            _err "未找到符合条件的版本"
-            return 1
-        fi
-        echo "$versions" > "$cache_file" 2>/dev/null || true
-        echo "$versions"
-        return 0
     fi
     case "$mode" in
         prerelease|test|beta) filter='[.[] | select(.prerelease == true)]' ;;
@@ -8979,10 +8852,6 @@ _get_release_versions() {
 # 获取版本变更日志
 _get_release_changelog() {
     local repo="$1" version="$2"
-    if [[ "$repo" == "surge-networks/snell" ]]; then
-        _get_snell_changelog_from_kb "$version"
-        return $?
-    fi
     local tag="v$version"
     local result
     result=$(curl -sL "https://api.github.com/repos/$repo/releases/tags/$tag" 2>/dev/null)
@@ -9043,12 +8912,6 @@ _sha256_file() {
 _snell_release_sha256() {
     local version="$1" arch="$2" pinned="" asset_name="" digest=""
     case "${version}:${arch}" in
-        4.1.1:amd64)  pinned="cc2271b79c7506888b34e651e8741b3aa7fc7d5f60aa65ef8bb096f3313a193b" ;;
-        4.1.1:aarch64) pinned="38d4cdc03dcdb3608af8594df83e1795265167fafc5d802f815148908902d758" ;;
-        4.1.1:armv7l)  pinned="d00b98ed803be4039f0f0630b810932cd3d3d87ee3e6ed224106fdc63347d8e6" ;;
-        5.0.1:amd64)  pinned="9bea1c2b9e35b73b31634856c04d18c393072b9e5dcde6a32781d8b8f908c539" ;;
-        5.0.1:aarch64) pinned="2f178bf5ac468ce1a130454efa40a0603fbbe4e47ecc4880a989f4abc7f824cf" ;;
-        5.0.1:armv7l)  pinned="14489f3e857569c8835dd3598b7ea6bca5371d4290ac7cf0f6c8dfb3381c1fb2" ;;
         6.0.0b4:amd64)  pinned="d66891cffc9f1b24a7b959ffbd2c4a246013f4f9e612733027b5ad106ce5f87f" ;;
         6.0.0b4:aarch64) pinned="2c957ee6bb37ce4b1df2b6a23e652b75546d10bc4f0443a2928e5834ae0429af" ;;
         6.0.0rc:amd64)  pinned="21c4aa6b4a208236f33e9923603acd8a26534a02104aed40496ddf77949dfb4b" ;;
@@ -9435,27 +9298,6 @@ _mihomo_asset_name() {
     printf 'mihomo-linux-%s-v%s.gz\n' "$arch" "$version"
 }
 
-# Snell v5 版本获取
-_get_snell_v5_version() {
-    local version="未知"
-
-    if check_cmd snell-server-v5; then
-        local output status
-        output=$(snell-server-v5 --version 2>&1)
-        status=$?
-        if [[ $status -ne 0 ]]; then
-            version="未安装"
-        else
-            version=$(printf '%s\n' "$output" | head -n 1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.]+)?' | head -n 1)
-            [[ -z "$version" ]] && version="未知"
-        fi
-    else
-        version="未安装"
-    fi
-
-    echo "$version"
-}
-
 # Snell v6 版本获取
 _save_snell_v6_installed_version() {
     local version="$1" tmp=""
@@ -9541,12 +9383,6 @@ _get_core_version() {
             ;;
         mihomo|vless-mihomo)
             version=$(_get_mihomo_version)
-            ;;
-        snell-server-v5)
-            version=$(_get_snell_v5_version)
-            ;;
-        snellv5|snell-v5)
-            version=$(_get_snell_v5_version)
             ;;
         snell-server-v6|snellv6|snell-v6)
             version=$(_get_snell_v6_version)
@@ -9691,7 +9527,6 @@ _select_version_from_list() {
         Xray) check_cmd xray && current_ver=$(xray version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1) ;;
         Sing-box) check_cmd sing-box && current_ver=$(sing-box version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?' | head -n 1) ;;
         Mihomo) current_ver=$(_get_mihomo_version) ;;
-        "Snell v5") current_ver=$(_get_snell_v5_version) ;;
         "Snell v6") current_ver=$(_get_snell_v6_version) ;;
     esac
     if [[ "$current_ver" != "未知" && "$current_ver" != "未安装" ]]; then
@@ -9789,7 +9624,6 @@ _backup_core_binary() {
         xray) current_ver=$(xray version 2>/dev/null | head -n 1 | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' | head -n 1) ;;
         sing-box) current_ver=$(sing-box version 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+(-[a-zA-Z0-9.]+)?' | head -n 1) ;;
         vless-mihomo) current_ver=$(_get_mihomo_version) ;;
-        snell-server-v5) current_ver=$(_get_snell_v5_version) ;;
         snell-server-v6) current_ver=$(_get_snell_v6_version) ;;
     esac
     [[ -z "$current_ver" ]] && current_ver="unknown"
@@ -9838,7 +9672,6 @@ _update_core_to_version() {
         Xray) binary_name="xray" ;;
         Sing-box) binary_name="sing-box" ;;
         Mihomo) binary_name="vless-mihomo" ;;
-        "Snell v5") binary_name="snell-server-v5" ;;
         *) _err "未知核心: $core"; return 1 ;;
     esac
 
@@ -9879,7 +9712,6 @@ _update_core_to_version() {
             Xray) _show_changelog_summary "XTLS/Xray-core" "$version" 8 ;;
             Sing-box) _show_changelog_summary "SagerNet/sing-box" "$version" 8 ;;
             Mihomo) _show_changelog_summary "$MIHOMO_REPO" "$version" 8 ;;
-            "Snell v5") _show_changelog_summary "surge-networks/snell" "$version" 8 ;;
         esac
 
         # 清理旧备份 (保留最近 3 个)
@@ -10311,58 +10143,6 @@ update_mihomo_core() {
     _update_core_to_version "Mihomo" "$channel" "$version" "vless-mihomo" "install_mihomo"
 }
 
-update_snell_v5_core() {
-    local channel="${1:-stable}"
-    _check_core_update_deps || return 1
-    _confirm_core_update "Snell v5" "$channel" || return 1
-
-    local is_new_install=false
-    if ! check_cmd snell-server-v5; then
-        _warn "未检测到 Snell v5，将执行安装"
-        is_new_install=true
-    fi
-
-    local need_restart=false service_running=false
-    if svc status vless-snell-v5 2>/dev/null; then
-        service_running=true
-        need_restart=true
-        _info "停止 vless-snell-v5 服务..."
-        if ! svc stop vless-snell-v5 2>/dev/null; then
-            _warn "停止服务失败，继续更新"
-        fi
-    fi
-
-    if install_snell_v5 "$channel" "true"; then
-        _ok "Snell v5 内核已更新"
-        local new_version
-        new_version=$(_get_snell_v5_version)
-        if [[ -n "$new_version" && "$new_version" != "未安装" && "$new_version" != "未知" && "$is_new_install" != "true" ]]; then
-            _show_changelog_summary "surge-networks/snell" "$new_version" 10
-        fi
-        if [[ "$need_restart" == "true" ]]; then
-            _info "重新启动 vless-snell-v5 服务..."
-            if svc start vless-snell-v5 2>/dev/null; then
-                _ok "服务已启动"
-            else
-                _err "服务启动失败，请手动检查配置: svc start vless-snell-v5"
-                return 1
-            fi
-        fi
-        return 0
-    fi
-
-    _err "Snell v5 内核更新失败"
-    if [[ "$service_running" == "true" ]]; then
-        _warn "尝试恢复服务..."
-        if svc start vless-snell-v5 2>/dev/null; then
-            _ok "服务已恢复"
-        else
-            _err "服务恢复失败，请手动检查: svc start vless-snell-v5"
-        fi
-    fi
-    return 1
-}
-
 update_snell_v6_core() {
     local version="${1:-}"
     [[ -z "$version" ]] && version=$(_get_snell_v6_latest_version "true")
@@ -10492,27 +10272,6 @@ update_mihomo_core_custom() {
     _update_core_to_version "Mihomo" "" "$version" "vless-mihomo" "install_mihomo"
 }
 
-update_snell_v5_core_custom() {
-    _header
-    echo -e "  ${W}Snell v5 安装指定版本${NC}"
-    _line
-    _show_core_versions "snellv5"
-    _line
-
-    if ! check_cmd snell-server-v5; then
-        _warn "未检测到 Snell v5，将执行安装"
-    fi
-
-    local version
-    version=$(_select_version_from_list "surge-networks/snell" "all" "Snell v5" 10)
-    local select_rc=$?
-    if [[ $select_rc -ne 0 ]]; then
-        [[ $select_rc -eq 2 ]] && { _SKIP_PAUSE_ONCE=1; return 0; }
-        return 1
-    fi
-    _update_core_to_version "Snell v5" "" "$version" "vless-snell-v5" "install_snell_v5"
-}
-
 _update_core_with_channel_select() {
     local core_name="$1"
     local repo="$2"
@@ -10529,16 +10288,10 @@ _update_core_with_channel_select() {
     prerelease_ver=$(_get_cached_prerelease_with_fallback "$repo")
     [[ -z "$prerelease_ver" ]] && prerelease_ver="获取中..."
     
-    if [[ "$repo" == "surge-networks/snell" ]]; then
-        [[ "$stable_ver" == "获取中..." ]] && stable_ver="$SNELL_DEFAULT_VERSION"
-        [[ "$prerelease_ver" == "获取中..." ]] && prerelease_ver="无"
-        ! _is_plain_version "$stable_ver" && stable_ver="$SNELL_DEFAULT_VERSION"
-    else
-        local unavailable_file="$VERSION_CACHE_DIR/$(echo "$repo" | tr '/' '_')_unavailable"
-        if [[ -f "$unavailable_file" ]]; then
-            [[ "$stable_ver" == "获取中..." ]] && stable_ver="不可获取"
-            [[ "$prerelease_ver" == "获取中..." ]] && prerelease_ver="不可获取"
-        fi
+    local unavailable_file="$VERSION_CACHE_DIR/$(echo "$repo" | tr '/' '_')_unavailable"
+    if [[ -f "$unavailable_file" ]]; then
+        [[ "$stable_ver" == "获取中..." ]] && stable_ver="不可获取"
+        [[ "$prerelease_ver" == "获取中..." ]] && prerelease_ver="不可获取"
     fi
 
     if [[ "$core_name" == "Snell v6" ]]; then
@@ -10583,29 +10336,6 @@ _update_core_with_channel_select() {
         return 0
     fi
 
-    if [[ "$core_name" == "Snell v5" ]]; then
-        _header
-        echo -e "  ${W}${core_name} 版本选择${NC}"
-        _line
-        echo -e "  ${W}当前版本:${NC} ${G}${current_ver}${NC}"
-        echo ""
-        local stable_label="v${stable_ver}"
-        _is_version_unknown "$stable_ver" && stable_label="${stable_ver}"
-        _item "1" "稳定版 (${stable_label})"
-        _item "2" "指定版本"
-        _item "0" "返回"
-        _line
-
-        read -rp "  请选择: " channel_choice
-        case "$channel_choice" in
-            1) update_snell_v5_core "stable" ;;
-            2) update_snell_v5_core_custom ;;
-            0) return 0 ;;
-            *) _err "无效选择"; return 1 ;;
-        esac
-        return 0
-    fi
-    
     # 显示选择菜单
     _header
     echo -e "  ${W}${core_name} 版本选择${NC}"
@@ -10645,7 +10375,6 @@ _update_core_with_channel_select() {
         Xray) update_xray_core "$channel" ;;
         Sing-box) update_singbox_core "$channel" ;;
         Mihomo) update_mihomo_core "$channel" ;;
-        "Snell v5") update_snell_v5_core "$channel" ;;
     esac
 }
 
@@ -11076,6 +10805,11 @@ _mihomo_snapshot_create() {
     else
         touch "$snapshot/service-stopped"
     fi
+    if svc enabled vless-mihomo >/dev/null 2>&1; then
+        touch "$snapshot/service-enabled"
+    else
+        touch "$snapshot/service-disabled"
+    fi
     printf '%s\n' "$snapshot"
 }
 
@@ -11085,12 +10819,12 @@ _mihomo_snapshot_restore() {
     [[ -d "$snapshot" ]] || return 1
 
     if [[ -f "$snapshot/db-absent" ]]; then
-        rm -f "$DB_FILE"
+        rm -f "$DB_FILE" || return 1
     else
         cp -p "$snapshot/db.json" "$DB_FILE" || return 1
     fi
     if [[ -f "$snapshot/config-absent" ]]; then
-        rm -f "$MIHOMO_CONFIG"
+        rm -f "$MIHOMO_CONFIG" || return 1
     else
         cp -p "$snapshot/mihomo.yaml" "$MIHOMO_CONFIG" || return 1
     fi
@@ -11101,13 +10835,13 @@ _mihomo_snapshot_restore() {
         service_file="$SYSTEMD_DIR/vless-mihomo.service"
     fi
     if [[ -f "$snapshot/service-absent" ]]; then
-        rm -f "$service_file"
+        rm -f "$service_file" || return 1
     else
         mkdir -p "$(dirname "$service_file")" || return 1
         cp -p "$snapshot/service" "$service_file" || return 1
     fi
     if [[ "$DISTRO" != "alpine" ]]; then
-        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl daemon-reload >/dev/null 2>&1 || return 1
     fi
 }
 
@@ -11124,23 +10858,56 @@ _remove_mihomo_service_definition() {
         rm -f "$OPENRC_DIR/vless-mihomo"
     else
         rm -f "$SYSTEMD_DIR/vless-mihomo.service" || return 1
-        systemctl daemon-reload >/dev/null 2>&1 || true
+        systemctl daemon-reload >/dev/null 2>&1 || return 1
+    fi
+}
+
+_mihomo_restore_enable_state() {
+    local snapshot="$1"
+    if [[ -f "$snapshot/service-enabled" ]]; then
+        svc enable vless-mihomo >/dev/null 2>&1
+    else
+        svc disable vless-mihomo >/dev/null 2>&1
     fi
 }
 
 _mihomo_restore_running_state() {
     local snapshot="$1"
     if [[ -f "$snapshot/service-running" ]]; then
-        svc restart vless-mihomo >/dev/null 2>&1 || svc start vless-mihomo >/dev/null 2>&1 || true
+        svc restart vless-mihomo >/dev/null 2>&1 || svc start vless-mihomo >/dev/null 2>&1
     else
-        svc stop vless-mihomo >/dev/null 2>&1 || true
+        svc stop vless-mihomo >/dev/null 2>&1
     fi
+}
+
+# 回滚完整成功后才删除快照；任何恢复错误都保留原始副本供人工恢复。
+_mihomo_rollback() {
+    local snapshot="$1" restore_enable="${2:-false}" restore_running="${3:-false}"
+    local failed=false
+
+    if ! _mihomo_snapshot_restore "$snapshot"; then
+        printf 'Mihomo 回滚文件恢复失败，恢复快照保留在: %s\n' "$snapshot" >&2
+        return 1
+    fi
+    if [[ "$restore_enable" == "true" ]] && ! _mihomo_restore_enable_state "$snapshot"; then
+        failed=true
+    fi
+    if [[ "$restore_running" == "true" ]] && ! _mihomo_restore_running_state "$snapshot"; then
+        failed=true
+    fi
+    if [[ "$failed" == "true" ]]; then
+        printf 'Mihomo 服务状态恢复失败，恢复快照保留在: %s\n' "$snapshot" >&2
+        return 1
+    fi
+
+    rm -rf "$snapshot"
 }
 
 # 原子修改一个 Mihomo Snell 节点，并把数据库、完整配置和共享服务作为同一事务处理。
 _apply_mihomo_node_change() {
     local protocol="$1" action="$2" old_port="$3" record="$4"
     local snapshot db_tmp candidate new_port
+    local enable_changed=false running_changed=false
 
     [[ " $MIHOMO_PROTOCOLS " == *" $protocol "* ]] || return 1
     case "$action" in
@@ -11206,22 +10973,23 @@ _apply_mihomo_node_change() {
 
     if [[ $? -ne 0 ]] || ! chmod 600 "$db_tmp" || ! mv "$db_tmp" "$DB_FILE"; then
         rm -f "$db_tmp"
-        _mihomo_snapshot_restore "$snapshot" >/dev/null 2>&1 || true
-        rm -rf "$snapshot"
+        _mihomo_rollback "$snapshot" false false || return 1
         return 1
     fi
 
     if ! jq -e '[(.mihomo // {})[] | if type == "array" then .[] else . end] | length > 0' "$DB_FILE" >/dev/null 2>&1; then
-        if ! svc stop vless-mihomo || ! svc disable vless-mihomo; then
-            _mihomo_snapshot_restore "$snapshot" >/dev/null 2>&1 || true
-            _mihomo_restore_running_state "$snapshot"
-            rm -rf "$snapshot"
+        running_changed=true
+        if ! svc stop vless-mihomo; then
+            _mihomo_rollback "$snapshot" false "$running_changed" || return 1
+            return 1
+        fi
+        enable_changed=true
+        if ! svc disable vless-mihomo; then
+            _mihomo_rollback "$snapshot" "$enable_changed" "$running_changed" || return 1
             return 1
         fi
         if ! rm -f "$MIHOMO_CONFIG" || ! _remove_mihomo_service_definition; then
-            _mihomo_snapshot_restore "$snapshot" >/dev/null 2>&1 || true
-            _mihomo_restore_running_state "$snapshot"
-            rm -rf "$snapshot"
+            _mihomo_rollback "$snapshot" "$enable_changed" "$running_changed" || return 1
             return 1
         fi
         rm -rf "$snapshot"
@@ -11231,39 +10999,54 @@ _apply_mihomo_node_change() {
     candidate="$snapshot/mihomo.candidate.yaml"
     if ! generate_mihomo_config "$DB_FILE" "$candidate" ||
        ! validate_mihomo_config "$candidate" "$MIHOMO_BIN"; then
-        _mihomo_snapshot_restore "$snapshot" >/dev/null 2>&1 || true
-        rm -rf "$snapshot"
+        _mihomo_rollback "$snapshot" false false || return 1
         return 1
     fi
     if ! chmod 600 "$candidate" || ! mv "$candidate" "$MIHOMO_CONFIG"; then
-        _mihomo_snapshot_restore "$snapshot" >/dev/null 2>&1 || true
-        rm -rf "$snapshot"
+        _mihomo_rollback "$snapshot" false false || return 1
         return 1
     fi
 
-    if ! _mihomo_service_definition_exists; then
-        if ! create_mihomo_service || ! svc enable vless-mihomo; then
-            _mihomo_snapshot_restore "$snapshot" >/dev/null 2>&1 || true
-            _mihomo_restore_running_state "$snapshot"
-            rm -rf "$snapshot"
+    if ! _mihomo_service_definition_exists && ! create_mihomo_service; then
+        _mihomo_rollback "$snapshot" false false || return 1
+        return 1
+    fi
+    if [[ -f "$snapshot/service-disabled" ]]; then
+        enable_changed=true
+        if ! svc enable vless-mihomo; then
+            _mihomo_rollback "$snapshot" "$enable_changed" false || return 1
             return 1
         fi
     fi
 
+    running_changed=true
     if [[ -f "$snapshot/service-running" ]]; then
         svc restart vless-mihomo
     else
         svc start vless-mihomo
     fi
     if [[ $? -ne 0 ]] || ! svc status vless-mihomo || ! _mihomo_ports_healthy "$DB_FILE"; then
-        _mihomo_snapshot_restore "$snapshot" >/dev/null 2>&1 || true
-        _mihomo_restore_running_state "$snapshot"
-        rm -rf "$snapshot"
+        _mihomo_rollback "$snapshot" "$enable_changed" "$running_changed" || return 1
         return 1
     fi
 
     rm -rf "$snapshot"
     return 0
+}
+
+_mihomo_restore_db_config() {
+    local snapshot="$1" failed=false
+    if [[ -f "$snapshot/db-absent" ]]; then
+        rm -f "$DB_FILE" || failed=true
+    elif ! cp -p "$snapshot/db.json" "$DB_FILE"; then
+        failed=true
+    fi
+    if [[ -f "$snapshot/config-absent" ]]; then
+        rm -f "$MIHOMO_CONFIG" || failed=true
+    elif ! cp -p "$snapshot/mihomo.yaml" "$MIHOMO_CONFIG"; then
+        failed=true
+    fi
+    [[ "$failed" == false ]]
 }
 
 # 事务切换 Mihomo 日志级别：数据库与完整配置必须一起提交或回滚。
@@ -11292,29 +11075,28 @@ set_mihomo_log_level() {
     fi
 
     if ! generate_mihomo_config || ! validate_mihomo_config "$MIHOMO_CONFIG" "$MIHOMO_BIN"; then
-        cp -p "$snapshot/db.json" "$DB_FILE"
-        if [[ -f "$snapshot/config-absent" ]]; then
-            rm -f "$MIHOMO_CONFIG"
-        else
-            cp -p "$snapshot/mihomo.yaml" "$MIHOMO_CONFIG"
+        if ! _mihomo_restore_db_config "$snapshot"; then
+            printf 'Mihomo 日志级别回滚失败，恢复快照保留在: %s\n' "$snapshot" >&2
+            return 1
         fi
-        rm -rf "$snapshot"
+        rm -rf "$snapshot" || return 1
         return 1
     fi
 
     if ! svc restart vless-mihomo; then
-        cp -p "$snapshot/db.json" "$DB_FILE"
-        if [[ -f "$snapshot/config-absent" ]]; then
-            rm -f "$MIHOMO_CONFIG"
-        else
-            cp -p "$snapshot/mihomo.yaml" "$MIHOMO_CONFIG"
+        if ! _mihomo_restore_db_config "$snapshot"; then
+            printf 'Mihomo 日志级别回滚失败，恢复快照保留在: %s\n' "$snapshot" >&2
+            return 1
         fi
-        svc restart vless-mihomo >/dev/null 2>&1 || true
-        rm -rf "$snapshot"
+        if ! svc restart vless-mihomo >/dev/null 2>&1; then
+            printf 'Mihomo 服务恢复失败，恢复快照保留在: %s\n' "$snapshot" >&2
+            return 1
+        fi
+        rm -rf "$snapshot" || return 1
         return 1
     fi
 
-    rm -rf "$snapshot"
+    rm -rf "$snapshot" || return 1
     return 0
 }
 
@@ -12247,149 +12029,6 @@ _snell_alpine_diagnostics() { # _snell_alpine_diagnostics <binary>
     command -v file >/dev/null 2>&1 && echo "  文件类型: $(file -b "$binary" 2>/dev/null)"
     command -v ldd >/dev/null 2>&1 && { echo "  动态依赖:"; ldd "$binary" 2>&1 | sed 's/^/    /'; }
     _warn "建议确认 Alpine 版本、CPU 架构以及 community 仓库可用。"
-}
-
-# 安装 Snell v4
-install_snell() {
-    check_cmd snell-server && { _ok "Snell 已安装"; return 0; }
-    local sarch=$(_map_arch "amd64:aarch64:armv7l") || { _err "不支持的架构"; return 1; }
-    local version="4.1.1" expected_sha="${SNELL_V4_SHA256:-}"
-    [[ -n "$expected_sha" ]] || expected_sha=$(_snell_release_sha256 "$version" "$sarch")
-    [[ "$DISTRO" == "alpine" ]] && ensure_snell_alpine_runtime || [[ "$DISTRO" != "alpine" ]] || return 1
-    _info "安装 Snell v4..."
-    local tmp=$(mktemp -d)
-    local url="https://dl.nssurge.com/snell/snell-server-v${version}-linux-${sarch}.zip"
-    if curl -fsSLo "$tmp/snell.zip" --connect-timeout 60 -- "$url"; then
-        if ! _verify_direct_download "$tmp/snell.zip" "$url" "$expected_sha"; then
-            rm -rf "$tmp"
-            _err "Snell v4 无法通过 SHA-256 校验，已拒绝安装"
-            return 1
-        fi
-        if _archive_paths_safe "$tmp/snell.zip" zip &&
-           unzip -oq "$tmp/snell.zip" -d "$tmp/" &&
-           install -m 755 "$tmp/snell-server" /usr/local/bin/snell-server &&
-           prepare_snell_binary /usr/local/bin/snell-server; then
-            rm -rf "$tmp"; _ok "Snell v4 已安装"; return 0
-        fi
-        _snell_alpine_diagnostics /usr/local/bin/snell-server
-        rm -rf "$tmp"; _err "Snell v4 安装或兼容处理失败"; return 1
-    fi
-    rm -rf "$tmp"; _err "下载失败"; return 1
-}
-
-# 安装 Snell v5
-install_snell_v5() {
-    local channel="${1:-stable}"
-    local force="${2:-false}"
-    local version_override="${3:-}"
-    local exists=false
-    local action="安装"
-
-    if check_cmd snell-server-v5; then
-        exists=true
-        if [[ "$force" != "true" ]]; then
-            _ok "Snell v5 已安装"
-            return 0
-        fi
-    fi
-
-    [[ "$exists" == "true" ]] && action="更新"
-
-    local sarch
-    sarch=$(_map_arch "amd64:aarch64:armv7l") || {
-        _err "不支持的架构"
-        return 1
-    }
-
-    # Snell v5 当前稳定版本
-    local version="${version_override:-5.0.1}"
-
-    if [[ ! "$version" =~ ^5\.[0-9]+\.[0-9]+([A-Za-z0-9._-]*)?$ ]]; then
-        _err "无效的 Snell v5 版本号：$version"
-        return 1
-    fi
-
-    [[ "$DISTRO" == "alpine" ]] && ensure_snell_alpine_runtime || [[ "$DISTRO" != "alpine" ]] || return 1
-
-    _info "$action Snell v5 v${version}..."
-
-    local tmp
-    tmp=$(mktemp -d) || {
-        _err "创建临时目录失败"
-        return 1
-    }
-
-    local url="https://dl.nssurge.com/snell/snell-server-v${version}-linux-${sarch}.zip"
-    local expected_sha="${SNELL_V5_SHA256:-}"
-    [[ -n "$expected_sha" ]] || expected_sha=$(_snell_release_sha256 "$version" "$sarch" 2>/dev/null || true)
-
-    # 使用 -f，HTTP 404/403 时直接判定失败
-    if ! curl -fL \
-        --connect-timeout 20 \
-        --max-time 120 \
-        --retry 3 \
-        --retry-delay 2 \
-        -o "$tmp/snell.zip" \
-        "$url"; then
-        rm -rf "$tmp"
-        _err "Snell v5 下载失败：$url"
-        return 1
-    fi
-
-    if ! _verify_direct_download "$tmp/snell.zip" "$url" "$expected_sha"; then
-        rm -rf "$tmp"
-        _err "Snell v5 无法通过 SHA-256 校验，已拒绝安装"
-        return 1
-    fi
-
-    # 验证确实为 ZIP 文件
-    if ! unzip -tq "$tmp/snell.zip" >/dev/null 2>&1; then
-        echo ""
-        _err "下载文件不是有效的 ZIP 压缩包"
-        echo "下载地址：$url"
-        echo "文件类型：$(file -b "$tmp/snell.zip" 2>/dev/null)"
-        rm -rf "$tmp"
-        return 1
-    fi
-
-    if ! _archive_paths_safe "$tmp/snell.zip" zip ||
-       ! unzip -oq "$tmp/snell.zip" -d "$tmp"; then
-        rm -rf "$tmp"
-        _err "Snell v5 解压失败"
-        return 1
-    fi
-
-    if [[ ! -f "$tmp/snell-server" ]]; then
-        rm -rf "$tmp"
-        _err "压缩包内未找到 snell-server"
-        return 1
-    fi
-
-    if ! install -m 755 \
-        "$tmp/snell-server" \
-        /usr/local/bin/snell-server-v5; then
-        rm -rf "$tmp"
-        _err "Snell v5 二进制安装失败"
-        return 1
-    fi
-
-    if ! prepare_snell_binary /usr/local/bin/snell-server-v5; then
-        _snell_alpine_diagnostics /usr/local/bin/snell-server-v5
-        rm -rf "$tmp"
-        _err "Snell v5 Alpine 兼容处理失败"
-        return 1
-    fi
-
-    rm -rf "$tmp"
-
-    if [[ ! -x /usr/local/bin/snell-server-v5 ]] || ! snell_binary_works /usr/local/bin/snell-server-v5; then
-        _snell_alpine_diagnostics /usr/local/bin/snell-server-v5
-        _err "Snell v5 安装验证失败"
-        return 1
-    fi
-
-    _ok "Snell v5 v${version} 已安装"
-    return 0
 }
 
 # 安装/更新 Snell v6（稳定版优先，无稳定版时使用官方预发布版）
@@ -13425,12 +13064,8 @@ get_all_services() {
     for proto in $singbox_protos; do
         case "$proto" in
             hy2|tuic) has_singbox=true ;;
-            snell) services+="vless-snell:snell-server " ;;
-            snell-v5) services+="vless-snell-v5:snell-server-v5 " ;;
             snell-v6) services+="vless-snell-v6:snell-server-v6 " ;;
             anytls) services+="vless-anytls:anytls-server " ;;
-            snell-shadowtls) services+="vless-snell-shadowtls:shadow-tls " ;;
-            snell-v5-shadowtls) services+="vless-snell-v5-shadowtls:shadow-tls " ;;
             ss2022-shadowtls) services+="vless-ss2022-shadowtls:shadow-tls " ;;
         esac
     done
@@ -13781,6 +13416,7 @@ svc() { # svc action service_name
             stop)    rc-service "$name" stop &>/dev/null ;;
             enable)  rc-update add "$name" default &>/dev/null ;;
             disable) rc-update del "$name" default &>/dev/null ;;
+            enabled) rc-update show default 2>/dev/null | grep -Eq "^[[:space:]]*${name}[[:space:]]" ;;
             reload)  rc-service "$name" reload &>/dev/null || rc-service "$name" restart &>/dev/null ;;
             status)
                 rc-service "$name" status &>/dev/null && return 0
@@ -13797,6 +13433,7 @@ svc() { # svc action service_name
                 _svc_try systemctl "$action" "$name" || { _err "详细状态信息:"; systemctl status "$name" --no-pager -l || true; return 1; }
                 ;;
             stop|enable|disable) systemctl "$action" "$name" &>/dev/null ;;
+            enabled) systemctl is-enabled --quiet "$name" &>/dev/null ;;
             reload) systemctl reload "$name" &>/dev/null || systemctl restart "$name" &>/dev/null ;;
             status)
                 local state; state=$(systemctl is-active "$name" 2>/dev/null)
@@ -27421,19 +27058,11 @@ show_service_logs() {
             show_mihomo_diagnostics
             return
             ;;
-        snell)
-            service_name="vless-snell"
-            proc_name="snell-server"
-            ;;
-        snell-v5)
-            service_name="vless-snell-v5"
-            proc_name="snell-server-v5"
-            ;;
         snell-v6)
             service_name="vless-snell-v6"
             proc_name="snell-server-v6"
             ;;
-        snell-shadowtls|snell-v5-shadowtls|ss2022-shadowtls)
+        ss2022-shadowtls)
             service_name="vless-${selected}"
             proc_name="shadow-tls"
             ;;
