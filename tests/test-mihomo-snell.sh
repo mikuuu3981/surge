@@ -1750,6 +1750,105 @@ test_mihomo_migration_preflight_failure_restores_existing_binary() (
     [[ "$(stat -c '%a' "$MIHOMO_BIN")" == 711 ]]
 )
 
+new_mihomo_migration_proc_fixture() {
+    export VLESS_TEST_PROC_ROOT="$TEST_TMP/proc"
+    MIHOMO_MIGRATION_PROC_ROOT="$VLESS_TEST_PROC_ROOT"
+    mkdir -p "$MIHOMO_MIGRATION_PROC_ROOT"
+}
+
+write_mihomo_migration_proc_comm() {
+    local pid="$1" comm="$2"
+    mkdir -p "$MIHOMO_MIGRATION_PROC_ROOT/$pid"
+    printf '%s\n' "$comm" >"$MIHOMO_MIGRATION_PROC_ROOT/$pid/comm"
+}
+
+assert_mihomo_migration_process_scan_error() {
+    if _mihomo_migration_managed_process_running; then
+        return 1
+    else
+        [[ "$?" -eq 2 ]]
+    fi
+}
+
+test_mihomo_migration_systemd_inactive_never_scans_processes() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    new_mihomo_migration_proc_fixture
+    write_mihomo_migration_proc_comm 101 vless-mihomo
+    DISTRO=debian
+    touch "$SYSTEMD_DIR/vless-mihomo.service"
+    systemctl() { [[ "$1" == show ]] && printf '%s\n' inactive; }
+
+    [[ "$(_mihomo_migration_service_state)" == inactive ]] || return 1
+    _mihomo_migration_managed_process_running
+)
+
+test_mihomo_migration_manager_unavailable_scans_exact_active_process() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    new_mihomo_migration_proc_fixture
+    write_mihomo_migration_proc_comm 101 vless-mihomo
+    DISTRO=debian
+    touch "$SYSTEMD_DIR/vless-mihomo.service"
+    systemctl() { return 127; }
+
+    [[ "$(_mihomo_migration_service_state)" == active ]]
+)
+
+test_mihomo_migration_manager_unavailable_complete_process_scan_is_inactive() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    new_mihomo_migration_proc_fixture
+    write_mihomo_migration_proc_comm 101 unrelated-process
+    write_mihomo_migration_proc_comm 202 another-process
+    DISTRO=debian
+    touch "$SYSTEMD_DIR/vless-mihomo.service"
+    systemctl() { return 127; }
+
+    [[ "$(_mihomo_migration_service_state)" == inactive ]]
+)
+
+test_mihomo_migration_process_scan_permission_entry_is_error() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    new_mihomo_migration_proc_fixture
+    write_mihomo_migration_proc_comm 101 unrelated-process
+    chmod 000 "$MIHOMO_MIGRATION_PROC_ROOT/101/comm"
+
+    assert_mihomo_migration_process_scan_error
+)
+
+test_mihomo_migration_process_scan_vanished_entry_is_error() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    new_mihomo_migration_proc_fixture
+    mkdir -p "$MIHOMO_MIGRATION_PROC_ROOT/101"
+
+    assert_mihomo_migration_process_scan_error
+)
+
+test_mihomo_migration_uncertain_process_scan_retains_rollback_snapshot() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    prepare_migration_runtime_fixture
+    new_mihomo_migration_proc_fixture
+    mkdir -p "$MIHOMO_MIGRATION_PROC_ROOT/101"
+    DISTRO=alpine
+    touch "$OPENRC_DIR/vless-mihomo"
+    rc-service() { [[ "$2" == status ]] && return 127; }
+    MIG_FAIL_STOP_SERVICE=vless-snell
+
+    ! migrate_legacy_snell_to_mihomo || return 1
+    local snapshot
+    snapshot=$(find "$CFG" -maxdepth 1 -type d -name '.mihomo-migration.*' -print -quit)
+    [[ -n "$snapshot" && -f "$snapshot/services" ]]
+)
+
 test_mihomo_migration_service_state_distinguishes_systemd_states() (
     new_fixture
     trap cleanup_fixture EXIT
@@ -1977,6 +2076,12 @@ run_test test_mihomo_migration_cleanup_failure_restores_before_marker
 run_test test_mihomo_migration_rollback_before_mihomo_exists_restores_legacy_state
 run_test test_mihomo_migration_preflight_failure_removes_new_binary
 run_test test_mihomo_migration_preflight_failure_restores_existing_binary
+run_test test_mihomo_migration_systemd_inactive_never_scans_processes
+run_test test_mihomo_migration_manager_unavailable_scans_exact_active_process
+run_test test_mihomo_migration_manager_unavailable_complete_process_scan_is_inactive
+run_test test_mihomo_migration_process_scan_permission_entry_is_error
+run_test test_mihomo_migration_process_scan_vanished_entry_is_error
+run_test test_mihomo_migration_uncertain_process_scan_retains_rollback_snapshot
 run_test test_mihomo_migration_service_state_distinguishes_systemd_states
 run_test test_mihomo_migration_service_state_uses_openrc_exit_contract
 run_test test_mihomo_migration_exact_process_helper_is_nounset_safe

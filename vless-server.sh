@@ -11172,27 +11172,46 @@ _mihomo_migration_restore_binary() {
 }
 
 # 只接受 /proc comm 的精确进程名，不能使用 Alpine _pgrep 的 -f 回退结果。
+# 返回 0=active、1=inactive、2=无法完整检查；后者绝不能作为已停止处理。
 _mihomo_migration_managed_process_running() {
-    # vless-mihomo 的受管进程名固定；避免关联数组下标在 set -u 环境被算术展开。
-    local process="vless-mihomo" proc_dir comm
-    for proc_dir in /proc/[0-9]*; do
-        [[ -r "$proc_dir/comm" ]] || continue
-        comm=$(<"$proc_dir/comm")
+    # 仅被 source 时接受测试夹具路径；直接执行时始终检查真实 /proc。
+    local process="vless-mihomo" proc_root="/proc" proc_dir comm_path comm
+    if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+        proc_root="${VLESS_TEST_PROC_ROOT:-/proc}"
+    fi
+    [[ -d "$proc_root" && -r "$proc_root" && -x "$proc_root" ]] || return 2
+    for proc_dir in "$proc_root"/[0-9]*; do
+        if [[ ! -e "$proc_dir" ]]; then
+            # glob 未匹配时保留字面量；已列出的 PID 消失则检查不完整。
+            [[ "$proc_dir" == "$proc_root"/'[0-9]*' ]] && break
+            return 2
+        fi
+        [[ -d "$proc_dir" ]] || return 2
+        comm_path="$proc_dir/comm"
+        [[ -f "$comm_path" && -r "$comm_path" ]] || return 2
+        IFS= read -r comm <"$comm_path" || return 2
         [[ "$comm" == "$process" ]] && return 0
     done
     return 1
+}
+
+_mihomo_migration_managed_process_state() {
+    local rc
+    _mihomo_migration_managed_process_running
+    rc=$?
+    case "$rc" in
+        0) printf '%s\n' active ;;
+        1) printf '%s\n' inactive ;;
+        *) printf '%s\n' error ;;
+    esac
 }
 
 # 迁移回滚专用三态查询。普通 svc status 保持其既有二态兼容语义。
 _mihomo_migration_service_state() {
     local output state rc
     if ! _mihomo_service_definition_exists; then
-        if _mihomo_migration_managed_process_running; then
-            printf '%s\n' active
-        else
-            printf '%s\n' inactive
-        fi
-        return 0
+        _mihomo_migration_managed_process_state
+        return
     fi
 
     if [[ "$DISTRO" == "alpine" ]]; then
@@ -11202,21 +11221,21 @@ _mihomo_migration_service_state() {
         case "$rc" in
             0) printf '%s\n' active ;;
             3) printf '%s\n' inactive ;;
-            127)
-                if _mihomo_migration_managed_process_running; then printf '%s\n' active; else printf '%s\n' inactive; fi
-                ;;
+            127) _mihomo_migration_managed_process_state ;;
             *) printf '%s\n' error ;;
         esac
     else
         output=$(systemctl show --property=ActiveState --value vless-mihomo 2>&1)
         rc=$?
-        [[ "$rc" -eq 0 ]] || { printf '%s\n' error; return 0; }
+        case "$rc" in
+            0) ;;
+            127) _mihomo_migration_managed_process_state; return ;;
+            *) printf '%s\n' error; return ;;
+        esac
         state=$(printf '%s' "$output" | tr '[:upper:]' '[:lower:]')
         case "$state" in
             active|activating|reloading) printf '%s\n' active ;;
-            inactive|failed|deactivating)
-                if _mihomo_migration_managed_process_running; then printf '%s\n' active; else printf '%s\n' inactive; fi
-                ;;
+            inactive|failed|deactivating) printf '%s\n' inactive ;;
             *) printf '%s\n' error ;;
         esac
     fi
