@@ -3807,6 +3807,22 @@ protocol_db_core() {
     fi
 }
 
+# 订阅和展示优先使用已迁移的 Mihomo 记录；仅有 .xray 记录时才走旧服务。
+# 这与 protocol_db_core 的兼容写入语义分开，避免两个命名空间同时存在时重复节点。
+protocol_subscription_db_core() {
+    local protocol="$1"
+    if [[ "$(protocol_core "$protocol")" == "mihomo" ]] && db_exists "mihomo" "$protocol"; then
+        printf '%s\n' mihomo
+    else
+        protocol_db_core "$protocol"
+    fi
+}
+
+# 卸载按当前活动所有者决策：已迁移的 .mihomo 优先，只有旧记录才操作 .xray。
+protocol_uninstall_db_core() {
+    protocol_subscription_db_core "$1"
+}
+
 #═══════════════════════════════════════════════════════════════════════════════
 #  表驱动元数据 (协议/服务/进程/启动命令)
 #  说明：将 “协议差异” 集中到这里，主体流程尽量通用化
@@ -3953,6 +3969,15 @@ get_legacy_snell_protocols() {
     for protocol in $MIHOMO_PROTOCOLS; do
         grep -qx "$protocol" <<<"$installed" && printf '%s\n' "$protocol"
     done
+}
+
+# 展示不重复列出已完成迁移的旧副本；运行时旧服务发现仍使用上面的完整列表。
+get_legacy_snell_display_protocols() {
+    local protocol
+    while IFS= read -r protocol; do
+        [[ -z "$protocol" ]] && continue
+        ! db_exists "mihomo" "$protocol" && printf '%s\n' "$protocol"
+    done <<<"$(get_legacy_snell_protocols)"
 }
 get_standalone_protocols() { filter_installed "$STANDALONE_PROTOCOLS"; }
 
@@ -20026,6 +20051,7 @@ show_all_protocols_info() {
         local xray_protocols=$(get_xray_protocols)
         local singbox_protocols=$(get_singbox_protocols)
         local mihomo_protocols=$(get_mihomo_protocols)
+        local legacy_snell_protocols=$(get_legacy_snell_display_protocols)
         local standalone_protocols=$(get_standalone_protocols)
         local all_protocols=()
         local idx=1
@@ -20072,6 +20098,20 @@ show_all_protocols_info() {
             for protocol in $mihomo_protocols; do
                 local port
                 port=$(db_protocol_configs "mihomo" "$protocol" | jq -r '.port // empty' | tr '\n' ',' | sed 's/,$//')
+                if [[ -n "$port" ]]; then
+                    echo -e "    ${G}$idx${NC}) $(get_protocol_name "$protocol") - 端口: ${G}$port${NC}"
+                    all_protocols+=("$protocol")
+                    ((idx++))
+                fi
+            done
+            echo ""
+        fi
+
+        if [[ -n "$legacy_snell_protocols" ]]; then
+            echo -e "  ${Y}Snell 旧版服务 (迁移待完成):${NC}"
+            for protocol in $legacy_snell_protocols; do
+                local port
+                port=$(db_protocol_configs "xray" "$protocol" | jq -r '.port // empty' | tr '\n' ',' | sed 's/,$//')
                 if [[ -n "$port" ]]; then
                     echo -e "    ${G}$idx${NC}) $(get_protocol_name "$protocol") - 端口: ${G}$port${NC}"
                     all_protocols+=("$protocol")
@@ -20140,6 +20180,7 @@ show_all_share_links() {
     local xray_protocols=$(get_xray_protocols)
     local singbox_protocols=$(get_singbox_protocols)
     local mihomo_protocols=$(get_mihomo_protocols)
+    local legacy_snell_protocols=$(get_legacy_snell_display_protocols)
     local standalone_protocols=$(get_standalone_protocols)
     local has_links=false
     
@@ -20154,9 +20195,9 @@ show_all_share_links() {
     master_port=$(_get_master_port "")
     
     # 遍历所有协议生成链接
-    for protocol in $xray_protocols $singbox_protocols $mihomo_protocols $standalone_protocols; do
+    for protocol in $xray_protocols $singbox_protocols $mihomo_protocols $legacy_snell_protocols $standalone_protocols; do
         local core cfg_stream
-        core=$(protocol_db_core "$protocol")
+        core=$(protocol_subscription_db_core "$protocol")
         cfg_stream=$(db_protocol_configs "$core" "$protocol") || continue
         [[ -z "$cfg_stream" ]] && continue
         
@@ -20304,7 +20345,7 @@ show_single_protocol_info() {
     
     # 统一为每行一个记录，兼容旧单对象和新的多入站数组。
     local core cfg="" cfg_stream
-    core=$(protocol_db_core "$protocol")
+    core=$(protocol_subscription_db_core "$protocol")
     cfg_stream=$(db_protocol_configs "$core" "$protocol") || {
         _err "协议配置不存在: $protocol"
         return
@@ -21241,6 +21282,50 @@ select_port_to_uninstall() {
     fi
 }
 
+# 返回单个迁移前 Snell 协议实际拥有的旧服务（含 ShadowTLS 后端）。
+_legacy_snell_protocol_services() {
+    case "$1" in
+        snell) printf '%s\n' vless-snell ;;
+        snell-v5) printf '%s\n' vless-snell-v5 ;;
+        snell-shadowtls) printf '%s\n' vless-snell-shadowtls vless-snell-shadowtls-backend ;;
+        snell-v5-shadowtls) printf '%s\n' vless-snell-v5-shadowtls vless-snell-v5-shadowtls-backend ;;
+        *) return 1 ;;
+    esac
+}
+
+# 旧 .xray Snell 的端口删除不能触碰 Mihomo。最后一个端口才停止并删除
+# 该协议自己的旧前端/后端服务和配置，绝不清理其他遗留协议或外部 ShadowTLS。
+_uninstall_legacy_snell_protocol() {
+    local protocol="$1" selected_port="$2" service_name remaining
+    [[ "$(protocol_db_core "$protocol")" == xray ]] || return 1
+
+    if [[ "$selected_port" == all ]]; then
+        db_del xray "$protocol" || return 1
+    else
+        db_remove_port xray "$protocol" "$selected_port" || return 1
+    fi
+    remaining=$(db_protocol_configs xray "$protocol" | jq -r '.port // empty')
+    if [[ -n "$remaining" ]]; then
+        _ok "协议 $protocol 还有其他端口实例在运行"
+        return 0
+    fi
+
+    rm -f "$CFG/${protocol}.join"
+    while IFS= read -r service_name; do
+        [[ -z "$service_name" ]] && continue
+        svc stop "$service_name" 2>/dev/null
+        svc disable "$service_name" 2>/dev/null
+        rm -f "$SYSTEMD_DIR/${service_name}.service" "$OPENRC_DIR/$service_name"
+    done <<<"$(_legacy_snell_protocol_services "$protocol")"
+    case "$protocol" in
+        snell) rm -f "$CFG/snell.conf" ;;
+        snell-v5) rm -f "$CFG/snell-v5.conf" ;;
+        snell-shadowtls) rm -f "$CFG/snell-shadowtls.conf" ;;
+        snell-v5-shadowtls) rm -f "$CFG/snell-v5-shadowtls.conf" ;;
+    esac
+    [[ "$DISTRO" == alpine ]] || systemctl daemon-reload >/dev/null 2>&1 || return 1
+}
+
 # 卸载指定协议
 uninstall_specific_protocol() {
     local installed=$(get_installed_protocols)
@@ -21273,7 +21358,7 @@ uninstall_specific_protocol() {
     # 保留运行时分类，并确定协议记录实际所在的数据库命名空间
     local core_type core
     core_type=$(protocol_core "$selected_protocol")
-    core=$(protocol_db_core "$selected_protocol")
+    core=$(protocol_uninstall_db_core "$selected_protocol")
     
     echo -e "  将卸载: ${R}$(get_protocol_name $selected_protocol)${NC}"
     read -rp "  确认卸载? [y/N]: " confirm
@@ -21281,8 +21366,8 @@ uninstall_specific_protocol() {
     
     _info "卸载 $selected_protocol..."
     
-    # Mihomo 节点必须经共享事务删除；不能走旧 Snell 独立服务的清理路径。
-    if [[ "$core_type" == "mihomo" ]]; then
+    # 根据物理命名空间分派：.mihomo 使用共享事务，.xray 使用旧服务所有权。
+    if [[ "$core_type" == "mihomo" && "$core" == "mihomo" ]]; then
         if [[ "$SELECTED_PORT" == "all" ]]; then
             echo -e "${CYAN}卸载协议 $selected_protocol 的所有端口实例...${NC}"
         else
@@ -21295,6 +21380,11 @@ uninstall_specific_protocol() {
         if ! db_exists "mihomo" "$selected_protocol"; then
             rm -f "$CFG/${selected_protocol}.join"
         fi
+    elif [[ "$core_type" == "mihomo" && "$core" == "xray" ]]; then
+        _uninstall_legacy_snell_protocol "$selected_protocol" "$SELECTED_PORT" || {
+            _err "旧版 Snell 配置更新失败，未执行卸载"
+            return 1
+        }
     elif [[ " $XRAY_PROTOCOLS " == *" $selected_protocol "* ]]; then
         # Xray 协议：需要重新生成配置
         # 根据选择的端口进行卸载
@@ -24833,7 +24923,7 @@ gen_v2ray_sub() {
     
     for protocol in $installed; do
         local core cfg_stream
-        core=$(protocol_db_core "$protocol")
+        core=$(protocol_subscription_db_core "$protocol")
         cfg_stream=$(db_protocol_configs "$core" "$protocol") || continue
         [[ -z "$cfg_stream" ]] && continue
 
@@ -24948,7 +25038,7 @@ gen_clash_sub() {
     
     for protocol in $installed; do
         local core cfg_stream
-        core=$(protocol_db_core "$protocol")
+        core=$(protocol_subscription_db_core "$protocol")
         cfg_stream=$(db_protocol_configs "$core" "$protocol") || continue
         [[ -z "$cfg_stream" ]] && continue
 
@@ -25182,7 +25272,7 @@ gen_surge_sub() {
     for protocol in $installed; do
         # 使用统一记录流，确保 .mihomo 多入站与旧标量记录均可订阅。
         local core cfg_stream
-        core=$(protocol_db_core "$protocol")
+        core=$(protocol_subscription_db_core "$protocol")
         cfg_stream=$(db_protocol_configs "$core" "$protocol") || continue
         [[ -z "$cfg_stream" ]] && continue
 

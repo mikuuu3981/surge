@@ -2166,6 +2166,113 @@ y' >/dev/null || return 1
     [[ ! -e "$MIHOMO_CONFIG" && ! -e "$SYSTEMD_DIR/vless-mihomo.service" ]]
 )
 
+write_legacy_snell_display_db() {
+    jq -n '{
+      version:"4.0.0", singbox:{}, meta:{}, mihomo:{},
+      xray:{
+        snell:[{port:41001,psk:"legacy-v4-one",version:4},{port:41002,psk:"legacy-v4-two",version:4}],
+        "snell-v5":{port:51001,psk:"legacy-v5",version:5},
+        "snell-shadowtls":{port:42001,psk:"legacy-stls",version:4,sni:"www.microsoft.com",stls_password:"legacy-secret"},
+        vless:{port:443,uuid:"unrelated"},
+        "snell-v6":{port:61001,psk:"v6",version:6},
+        "ss2022-shadowtls":{port:62001,password:"ss"}
+      }
+    }' >"$DB_FILE"
+}
+
+# Legacy records remain renderable while a migration is pending or has failed.
+test_legacy_xray_snell_rendering_normalizes_scalar_and_arrays() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    CYAN= YELLOW= GREEN= RED= G= Y= C= D= W= NC=
+    write_legacy_snell_display_db
+    get_connection_addresses() { printf '%s\n' '203.0.113.9|'; }
+    get_ip_country() { printf '%s\n' US; }
+    get_all_external_links() { :; }
+    _line() { :; }
+
+    [[ "$(db_protocol_configs xray snell | wc -l)" -eq 2 ]] || return 1
+    [[ "$(db_protocol_configs xray snell-v5)" == '{"port":51001,"psk":"legacy-v5","version":5}' ]] || return 1
+    local info links surge
+    info=$(show_all_protocols_info <<<'0')
+    grep -Fq 'Snell 旧版服务' <<<"$info" || return 1
+    grep -Fq '41001,41002' <<<"$info" || return 1
+    links=$(show_all_share_links)
+    grep -Fq '41001' <<<"$links" || return 1
+    grep -Fq '51001' <<<"$links" || return 1
+    grep -Fq 'shadow-tls-password=legacy-secret, shadow-tls-sni=www.microsoft.com, shadow-tls-version=3' <<<"$links" || return 1
+    surge=$(gen_surge_sub)
+    grep -Fq 'US-Snell-41001 = snell, 203.0.113.9, 41001, psk=legacy-v4-one, version=4' <<<"$surge" || return 1
+    grep -Fq 'US-Snell-v5-51001 = snell, 203.0.113.9, 51001, psk=legacy-v5, version=5' <<<"$surge"
+)
+
+# A completed Mihomo copy wins explicitly, so a stale exact legacy copy cannot
+# render twice or shadow the active namespace in subscriptions.
+test_mihomo_storage_resolution_prefers_migrated_record() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    write_legacy_snell_display_db
+    jq '.mihomo.snell = [{port:41001,psk:"legacy-v4-one",version:4}]' "$DB_FILE" >"$TEST_TMP/db.next"
+    mv "$TEST_TMP/db.next" "$DB_FILE"
+    get_connection_addresses() { printf '%s\n' '203.0.113.9|'; }
+    get_ip_country() { printf '%s\n' US; }
+    get_all_external_links() { :; }
+
+    [[ "$(protocol_subscription_db_core snell)" == mihomo ]] || return 1
+    local surge
+    surge=$(gen_surge_sub)
+    [[ "$(grep -c 'US-Snell-41001 = snell' <<<"$surge")" -eq 1 ]]
+)
+
+prepare_legacy_snell_uninstall_fixture() {
+    source "$SCRIPT"
+    CYAN= YELLOW= GREEN= RED= G= Y= C= D= W= NC=
+    LOG_FILE="$TEST_TMP/vless-server.log"
+    write_legacy_snell_display_db
+    touch "$SYSTEMD_DIR/vless-snell.service" "$CFG/snell.conf"
+    svc() { printf '%s:%s\n' "$1" "$2" >>"$TEST_TMP/svc.log"; }
+    systemctl() { printf 'systemctl:%s\n' "$*" >>"$TEST_TMP/systemctl.log"; }
+    _pause() { :; }
+}
+
+# Removing one legacy array entry must leave its frontend and all unrelated
+# records intact; all removal cleans only the selected legacy protocol.
+test_legacy_xray_snell_per_port_and_all_uninstall() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    prepare_legacy_snell_uninstall_fixture
+
+    uninstall_specific_protocol <<<'1
+1
+y' >/dev/null || return 1
+    jq -e '(.xray.snell | length) == 1 and .xray.snell[0].port == 41002 and .xray["snell-v5"].port == 51001 and .xray.vless.port == 443 and .xray["snell-v6"].port == 61001 and .xray["ss2022-shadowtls"].port == 62001' "$DB_FILE" >/dev/null || return 1
+    [[ -f "$SYSTEMD_DIR/vless-snell.service" && -f "$CFG/snell.conf" ]] || return 1
+    [[ ! -f "$TEST_TMP/svc.log" ]] || ! grep -Eq '^(stop|disable):vless-snell$' "$TEST_TMP/svc.log" || return 1
+
+    uninstall_specific_protocol <<<'1
+y' >/dev/null || return 1
+    jq -e 'has("xray") and (.xray | has("snell") | not) and .xray["snell-v5"].port == 51001 and .xray.vless.port == 443' "$DB_FILE" >/dev/null || return 1
+    [[ ! -e "$SYSTEMD_DIR/vless-snell.service" && ! -e "$CFG/snell.conf" ]] || return 1
+    grep -q '^stop:vless-snell$' "$TEST_TMP/svc.log" || return 1
+    grep -q '^disable:vless-snell$' "$TEST_TMP/svc.log" || return 1
+    ! grep -q 'vless-snell-v5\|vless-snell-v6\|ss2022-shadowtls' "$TEST_TMP/svc.log"
+)
+
+test_legacy_xray_snell_all_uninstall_targets_only_selected_protocol() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    prepare_legacy_snell_uninstall_fixture
+
+    uninstall_specific_protocol <<<'1
+3
+y' >/dev/null || return 1
+    jq -e '(.xray | has("snell") | not) and .xray["snell-v5"].port == 51001 and .xray.vless.port == 443 and .xray["snell-v6"].port == 61001 and .xray["ss2022-shadowtls"].port == 62001' "$DB_FILE" >/dev/null || return 1
+    grep -q '^stop:vless-snell$' "$TEST_TMP/svc.log" || return 1
+    ! grep -q 'vless-snell-v5\|vless-snell-v6\|ss2022-shadowtls' "$TEST_TMP/svc.log"
+)
+
 # Full cleanup only touches managed Mihomo resources under the fixture paths.
 test_force_cleanup_removes_managed_mihomo_resources() (
     new_fixture
@@ -2299,5 +2406,9 @@ run_test test_mihomo_migration_cleanup_preserves_ss2022_v6_and_unmanaged_shadowt
 run_test test_mihomo_normalized_display_and_subscription_rendering
 run_test test_mihomo_protocol_uninstall_is_per_port_and_stops_final_node
 run_test test_mihomo_protocol_uninstall_stops_final_node
+run_test test_legacy_xray_snell_rendering_normalizes_scalar_and_arrays
+run_test test_mihomo_storage_resolution_prefers_migrated_record
+run_test test_legacy_xray_snell_per_port_and_all_uninstall
+run_test test_legacy_xray_snell_all_uninstall_targets_only_selected_protocol
 run_test test_force_cleanup_removes_managed_mihomo_resources
 printf '%s tests passed\n' "$PASS"
