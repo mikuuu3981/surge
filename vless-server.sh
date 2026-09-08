@@ -22,17 +22,17 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
     exit 1
 fi
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.5.13 [服务端]
+#  多协议代理一键部署脚本 v3.5.14 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
 #    • Sing-box 核心: 处理 UDP/QUIC 协议 (Hysteria2/TUIC) - 低内存高效率
-#    • Mihomo 核心: 管理 Snell v4/v5 多监听器和内置 ShadowTLS；官方 Snell 仅服务 v6
+#    • Mihomo 核心: 管理 Snell v4/v5 多监听器和内置 ShadowTLS v3；官方 Snell 核心仅服务 v6
 #  
 #  支持协议: VLESS+Reality / VLESS+Reality+XHTTP / VLESS+WS / VMess+WS / 
 #           VLESS-XTLS-Vision / SOCKS5 / SS2022 / HY2 / Trojan / 
 #           Snell v4 / Snell v5 / Snell v6 / AnyTLS / TUIC / NaïveProxy (多协议)
-#  插件支持: Snell v4/v5/v6 和 SS2022 可选启用 ShadowTLS
+#  插件支持: SS2022 保持可选外部 ShadowTLS；Snell v4/v5 使用 Mihomo 内置 ShadowTLS v3
 #  适配: Alpine/Debian/Ubuntu/CentOS
 #  
 #  
