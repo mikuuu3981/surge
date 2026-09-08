@@ -299,6 +299,19 @@ db_get() {
     echo "$config"
 }
 
+# 以紧凑的一行一个对象的形式迭代协议记录，兼容旧的单对象和新的多端口数组。
+# 参数: $1=core, $2=protocol
+# 输出: 每行一个 JSON 对象
+db_protocol_configs() {
+    local core="$1" protocol="$2"
+    [[ -f "$DB_FILE" ]] || return 1
+
+    jq -c --arg c "$core" --arg p "$protocol" '
+        .[$c][$p] // empty |
+        if type == "array" then .[] elif type == "object" then . else empty end
+    ' "$DB_FILE" 2>/dev/null
+}
+
 # 从数据库获取协议的某个字段
 db_get_field() {
     [[ ! -f "$DB_FILE" ]] && return 1
@@ -5633,6 +5646,18 @@ ensure_dual_stack_listen() {
 #═══════════════════════════════════════════════════════════════════════════════
 # 核心功能：强力清理 & 时间同步
 #═══════════════════════════════════════════════════════════════════════════════
+_cleanup_managed_mihomo_resources() {
+    # 仅删除本脚本命名并管理的 Mihomo 文件；外部 ShadowTLS 的归属另行判断。
+    local backup_dir
+    svc disable vless-mihomo 2>/dev/null
+    rm -f "$MIHOMO_CONFIG" "$MIHOMO_MIGRATION_MARKER" "$MIHOMO_BIN"
+    _remove_mihomo_service_definition 2>/dev/null || true
+    rm -f "$VERSION_CACHE_DIR"/MetaCubeX_mihomo*
+    if backup_dir=$(_get_core_backup_dir 2>/dev/null); then
+        rm -f "$backup_dir"/vless-mihomo_*
+    fi
+}
+
 force_cleanup() {
     # 停止所有 vless 相关服务
     local services="watchdog reality hy2 tuic snell snell-v5 snell-v6 anytls singbox mihomo"
@@ -5642,6 +5667,7 @@ force_cleanup() {
     
     # 清理 iptables NAT 规则
     cleanup_hy2_nat_rules
+    _cleanup_managed_mihomo_resources
 }
 
 # 清理 Hysteria2/TUIC 端口跳跃 NAT 规则
@@ -6909,6 +6935,8 @@ gen_snell_link() {
     local mode="${6:-}"
     local ip_suffix=$(get_ip_suffix "$ip")
     local name="${country:+${country}-}Snell-v${version}${ip_suffix:+-${ip_suffix}}"
+    # Mihomo 可同时承载多个 v4/v5 入站，分享名称必须包含端口。
+    [[ "$version" != "6" ]] && name+="-${port}"
     # Snell 没有标准URI格式，使用自定义格式
     local query="version=${version}"
     if [[ "$version" == "6" ]]; then
@@ -6918,13 +6946,17 @@ gen_snell_link() {
     printf '%s\n' "snell://${psk}@${ip}:${port}?${query}#${name}"
 }
 
-# 生成 Surge Snell 节点行。Snell v6 的 mode 属于协议握手参数，必须与
-# 服务端配置完全一致；v4/v5 不输出该字段。
+# 生成 Surge Snell 节点行。name 由调用者包含端口后缀，保证多入站节点唯一。
+# Snell v6 的 mode 属于协议握手参数，必须与服务端配置完全一致。
 gen_snell_surge_line() {
     local name="$1" ip="$2" port="$3" psk="$4" version="${5:-4}"
-    local mode="${6:-default}" tfo="${7:-true}" mode_arg=""
+    local mode="${6:-default}" tfo="${7:-true}" stls_password="${8:-}" sni="${9:-}"
+    local mode_arg="" stls_args=""
     [[ "$version" == "6" ]] && mode_arg=", mode=${mode}"
-    printf '%s\n' "${name} = snell, ${ip}, ${port}, psk=${psk}, version=${version}${mode_arg}, reuse=true, tfo=${tfo}"
+    if [[ -n "$stls_password" && -n "$sni" ]]; then
+        stls_args=", shadow-tls-password=${stls_password}, shadow-tls-sni=${sni}, shadow-tls-version=3"
+    fi
+    printf '%s\n' "${name} = snell, ${ip}, ${port}, psk=${psk}, version=${version}${mode_arg}, reuse=true, tfo=${tfo}${stls_args}"
 }
 
 gen_tuic_link() {
@@ -20039,7 +20071,7 @@ show_all_protocols_info() {
             echo -e "  ${Y}Mihomo 协议 (共享服务):${NC}"
             for protocol in $mihomo_protocols; do
                 local port
-                port=$(db_list_ports "mihomo" "$protocol" | tr '\n' ',' | sed 's/,$//')
+                port=$(db_protocol_configs "mihomo" "$protocol" | jq -r '.port // empty' | tr '\n' ',' | sed 's/,$//')
                 if [[ -n "$port" ]]; then
                     echo -e "    ${G}$idx${NC}) $(get_protocol_name "$protocol") - 端口: ${G}$port${NC}"
                     all_protocols+=("$protocol")
@@ -20107,6 +20139,7 @@ show_all_share_links() {
     
     local xray_protocols=$(get_xray_protocols)
     local singbox_protocols=$(get_singbox_protocols)
+    local mihomo_protocols=$(get_mihomo_protocols)
     local standalone_protocols=$(get_standalone_protocols)
     local has_links=false
     
@@ -20121,24 +20154,11 @@ show_all_share_links() {
     master_port=$(_get_master_port "")
     
     # 遍历所有协议生成链接
-    for protocol in $xray_protocols $singbox_protocols $standalone_protocols; do
-        local cfg=""
-        if db_exists "xray" "$protocol"; then
-            cfg=$(db_get "xray" "$protocol")
-        elif db_exists "singbox" "$protocol"; then
-            cfg=$(db_get "singbox" "$protocol")
-        else
-            continue
-        fi
-        [[ -z "$cfg" ]] && continue
-        
-        # 处理多端口数组
-        local cfg_stream=""
-        if echo "$cfg" | jq -e 'type == "array"' >/dev/null 2>&1; then
-            cfg_stream=$(echo "$cfg" | jq -c '.[]')
-        else
-            cfg_stream=$(echo "$cfg" | jq -c '.')
-        fi
+    for protocol in $xray_protocols $singbox_protocols $mihomo_protocols $standalone_protocols; do
+        local core cfg_stream
+        core=$(protocol_db_core "$protocol")
+        cfg_stream=$(db_protocol_configs "$core" "$protocol") || continue
+        [[ -z "$cfg_stream" ]] && continue
         
         echo -e "  ${Y}$(get_protocol_name $protocol)${NC}"
         
@@ -20201,14 +20221,9 @@ show_all_share_links() {
                     naive) link=$(gen_naive_link "$domain" "$display_port" "$username" "$password" "$country_code") ;;
                     socks) link=$(gen_socks_link "$ipv4" "$display_port" "$username" "$password" "$country_code") ;;
                     # ShadowTLS 组合协议：没有标准分享链接，显示 Surge/Loon 配置
-                    snell-shadowtls)
+                    snell-shadowtls|snell-v5-shadowtls)
                         echo -e "  ${Y}Surge:${NC}"
-                        echo -e "  ${C}${country_code}-Snell-ShadowTLS = snell, ${config_ip}, ${display_port}, psk=${psk}, version=${version:-4}, reuse=true, tfo=true, shadow-tls-password=${stls_password}, shadow-tls-sni=${sni}, shadow-tls-version=3${NC}"
-                        has_links=true
-                        ;;
-                    snell-v5-shadowtls)
-                        echo -e "  ${Y}Surge:${NC}"
-                        echo -e "  ${C}${country_code}-Snell-v5-ShadowTLS = snell, ${config_ip}, ${display_port}, psk=${psk}, version=5, reuse=true, tfo=true, shadow-tls-password=${stls_password}, shadow-tls-sni=${sni}, shadow-tls-version=3${NC}"
+                        echo -e "  ${C}$(gen_snell_surge_line "${country_code}-${protocol}-${display_port}" "$config_ip" "$display_port" "$psk" "${version:-4}" "default" "true" "$stls_password" "$sni")${NC}"
                         has_links=true
                         ;;
                     ss2022-shadowtls)
@@ -20253,14 +20268,9 @@ show_all_share_links() {
                     naive) ;; # NaïveProxy 使用域名，不需要 IPv6 链接
                     socks) link=$(gen_socks_link "$ip6" "$display_port" "$username" "$password" "$country_code") ;;
                     # ShadowTLS 组合协议 IPv6：没有标准分享链接，显示 Surge/Loon 配置
-                    snell-shadowtls)
+                    snell-shadowtls|snell-v5-shadowtls)
                         echo -e "  ${Y}Surge (IPv6):${NC}"
-                        echo -e "  ${C}${country_code}-Snell-ShadowTLS-v6 = snell, ${ipv6}, ${display_port}, psk=${psk}, version=${version:-4}, reuse=true, tfo=true, shadow-tls-password=${stls_password}, shadow-tls-sni=${sni}, shadow-tls-version=3${NC}"
-                        has_links=true
-                        ;;
-                    snell-v5-shadowtls)
-                        echo -e "  ${Y}Surge (IPv6):${NC}"
-                        echo -e "  ${C}${country_code}-Snell-v5-ShadowTLS-v6 = snell, ${ipv6}, ${display_port}, psk=${psk}, version=5, reuse=true, tfo=true, shadow-tls-password=${stls_password}, shadow-tls-sni=${sni}, shadow-tls-version=3${NC}"
+                        echo -e "  ${C}$(gen_snell_surge_line "${country_code}-${protocol}-${display_port}" "$ipv6" "$display_port" "$psk" "${version:-4}" "default" "true" "$stls_password" "$sni")${NC}"
                         has_links=true
                         ;;
                     ss2022-shadowtls)
@@ -20290,65 +20300,52 @@ show_all_share_links() {
 show_single_protocol_info() {
     local protocol="$1"
     local clear_screen="${2:-true}"
-    local specified_port="$3"
+    local specified_port="${3:-}"
     
-    # 从数据库读取配置
-    local cfg=""
-    local core="xray"
-    if db_exists "xray" "$protocol"; then
-        cfg=$(db_get "xray" "$protocol")
-    elif db_exists "singbox" "$protocol"; then
-        cfg=$(db_get "singbox" "$protocol")
-        core="singbox"
-    else
+    # 统一为每行一个记录，兼容旧单对象和新的多入站数组。
+    local core cfg="" cfg_stream
+    core=$(protocol_db_core "$protocol")
+    cfg_stream=$(db_protocol_configs "$core" "$protocol") || {
         _err "协议配置不存在: $protocol"
         return
-    fi
-    
-    # 检查是否为数组（多端口）
-    if echo "$cfg" | jq -e 'type == "array"' >/dev/null 2>&1; then
-        if [[ -n "$specified_port" ]]; then
-            # 指定了端口：直接使用该端口的配置
-            cfg=$(echo "$cfg" | jq --arg port "$specified_port" '.[] | select(.port == ($port | tonumber))')
-            if [[ -z "$cfg" || "$cfg" == "null" ]]; then
-                _err "未找到端口 $specified_port 的配置"
-                return
-            fi
+    }
+    [[ -z "$cfg_stream" ]] && { _err "协议配置不存在: $protocol"; return; }
+
+    local configs=() record
+    while IFS= read -r record; do
+        [[ -n "$record" ]] && configs+=("$record")
+    done <<<"$cfg_stream"
+    local port_count=${#configs[@]}
+    if [[ -n "$specified_port" ]]; then
+        for record in "${configs[@]}"; do
+            [[ "$(jq -r '.port // empty' <<<"$record")" == "$specified_port" ]] && { cfg="$record"; break; }
+        done
+        [[ -n "$cfg" ]] || { _err "未找到端口 $specified_port 的配置"; return; }
+    elif [[ $port_count -gt 1 ]]; then
+        echo ""
+        echo -e "${CYAN}协议 ${YELLOW}$protocol${CYAN} 有 ${port_count} 个端口实例：${NC}"
+        echo ""
+        local i=1 p
+        for record in "${configs[@]}"; do
+            p=$(jq -r '.port // empty' <<<"$record")
+            echo -e "  ${G}$i${NC}) 端口 ${G}$p${NC}"
+            ((i++))
+        done
+        echo "  0) 返回"
+        echo ""
+
+        local choice
+        read -p "$(echo -e "  ${GREEN}请选择要查看的端口 [0-$port_count]:${NC} ")" choice
+        if [[ "$choice" == "0" ]]; then
+            return
+        elif [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$port_count" ]; then
+            cfg="${configs[$((choice-1))]}"
         else
-            # 未指定端口：显示选择菜单
-            local ports=$(echo "$cfg" | jq -r '.[].port')
-            local port_array=($ports)
-            local port_count=${#port_array[@]}
-            
-            if [[ $port_count -gt 1 ]]; then
-                echo ""
-                echo -e "${CYAN}协议 ${YELLOW}$protocol${CYAN} 有 ${port_count} 个端口实例：${NC}"
-                echo ""
-                local i=1
-                for p in "${port_array[@]}"; do
-                    echo -e "  ${G}$i${NC}) 端口 ${G}$p${NC}"
-                    ((i++))
-                done
-                echo "  0) 返回"
-                echo ""
-                
-                local choice
-                read -p "$(echo -e "  ${GREEN}请选择要查看的端口 [0-$port_count]:${NC} ")" choice
-                
-                if [[ "$choice" == "0" ]]; then
-                    return
-                elif [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$port_count" ]; then
-                    # 提取选中端口的配置
-                    cfg=$(echo "$cfg" | jq ".[$((choice-1))]")
-                else
-                    _err "无效选项"
-                    return
-                fi
-            else
-                # 只有一个端口，直接使用
-                cfg=$(echo "$cfg" | jq ".[0]")
-            fi
+            _err "无效选项"
+            return
         fi
+    else
+        cfg="${configs[0]}"
     fi
     
     # 从 JSON 提取字段
@@ -20627,21 +20624,13 @@ show_single_protocol_info() {
             echo -e "  ${Y}Shadowrocket (HTTP/2):${NC}"
             echo -e "  ${C}http2://${username}:${password}@${domain}:${display_port}${NC}"
             ;;
-        snell-shadowtls)
+        snell-shadowtls|snell-v5-shadowtls)
             echo -e "  PSK: ${G}$psk${NC}"
             echo -e "  SNI: ${G}$sni${NC}"
             echo -e "  版本: ${G}v${version:-4}${NC}"
             echo ""
             echo -e "  ${Y}Surge 配置:${NC}"
-            echo -e "  ${C}${country_code}-Snell-ShadowTLS = snell, ${config_ip}, ${display_port}, psk=${psk}, version=${version:-4}, reuse=true, tfo=true, shadow-tls-password=${stls_password}, shadow-tls-sni=${sni}, shadow-tls-version=3${NC}"
-            ;;
-        snell-v5-shadowtls)
-            echo -e "  PSK: ${G}$psk${NC}"
-            echo -e "  SNI: ${G}$sni${NC}"
-            echo -e "  版本: ${G}v${version:-5}${NC}"
-            echo ""
-            echo -e "  ${Y}Surge 配置:${NC}"
-            echo -e "  ${C}${country_code}-Snell5-ShadowTLS = snell, ${config_ip}, ${display_port}, psk=${psk}, version=${version:-5}, reuse=true, tfo=true, shadow-tls-password=${stls_password}, shadow-tls-sni=${sni}, shadow-tls-version=3${NC}"
+            echo -e "  ${C}$(gen_snell_surge_line "${country_code}-${protocol}-${display_port}" "$config_ip" "$display_port" "$psk" "${version:-4}" "default" "true" "$stls_password" "$sni")${NC}"
             ;;
         ss2022-shadowtls)
             echo -e "  密码: ${G}$password${NC}"
@@ -20665,7 +20654,7 @@ show_single_protocol_info() {
             fi
             echo ""
             echo -e "  ${Y}Surge 配置 (Snell 为 Surge 专属协议):${NC}"
-            echo -e "  ${C}$(gen_snell_surge_line "${country_code}-Snell" "$config_ip" "$display_port" "$psk" "$version" "${snell_mode:-default}" "${snell_tfo:-true}")${NC}"
+            echo -e "  ${C}$(gen_snell_surge_line "${country_code}-${protocol}-${display_port}" "$config_ip" "$display_port" "$psk" "$version" "${snell_mode:-default}" "${snell_tfo:-true}")${NC}"
             ;;
         tuic)
             echo -e "  UUID: ${G}$uuid${NC}"
@@ -21095,7 +21084,7 @@ show_protocols_overview() {
         echo -e "  ${Y}Mihomo 协议 (共享服务):${NC}"
         for protocol in $mihomo_protocols; do
             local ports
-            ports=$(db_list_ports "mihomo" "$protocol")
+            ports=$(db_protocol_configs "mihomo" "$protocol" | jq -r '.port // empty')
             if [[ -n "$ports" ]]; then
                 local port_count
                 port_count=$(echo "$ports" | wc -l)
@@ -21201,8 +21190,8 @@ select_port_to_uninstall() {
     local core
     core=$(protocol_db_core "$protocol")
     
-    # 获取端口列表
-    local ports=$(db_list_ports "$core" "$protocol")
+    # 获取归一化端口列表，兼容旧单对象和多端口数组。
+    local ports=$(db_protocol_configs "$core" "$protocol" | jq -r '.port // empty')
     
     if [[ -z "$ports" ]]; then
         echo -e "${RED}错误: 未找到协议 $protocol 的端口实例${NC}"
@@ -21292,8 +21281,21 @@ uninstall_specific_protocol() {
     
     _info "卸载 $selected_protocol..."
     
-    # 停止相关服务
-    if [[ " $XRAY_PROTOCOLS " == *" $selected_protocol "* ]]; then
+    # Mihomo 节点必须经共享事务删除；不能走旧 Snell 独立服务的清理路径。
+    if [[ "$core_type" == "mihomo" ]]; then
+        if [[ "$SELECTED_PORT" == "all" ]]; then
+            echo -e "${CYAN}卸载协议 $selected_protocol 的所有端口实例...${NC}"
+        else
+            echo -e "${CYAN}卸载协议 $selected_protocol 的端口 $SELECTED_PORT...${NC}"
+        fi
+        _apply_mihomo_node_change "$selected_protocol" remove "$SELECTED_PORT" '{}' || {
+            _err "Mihomo 配置更新失败，未执行卸载"
+            return 1
+        }
+        if ! db_exists "mihomo" "$selected_protocol"; then
+            rm -f "$CFG/${selected_protocol}.join"
+        fi
+    elif [[ " $XRAY_PROTOCOLS " == *" $selected_protocol "* ]]; then
         # Xray 协议：需要重新生成配置
         # 根据选择的端口进行卸载
         if [[ "$SELECTED_PORT" == "all" ]]; then
@@ -24830,25 +24832,11 @@ gen_v2ray_sub() {
     master_port=$(_get_master_port "")
     
     for protocol in $installed; do
-        # 从数据库读取配置
-        local cfg=""
-        if db_exists "xray" "$protocol"; then
-            cfg=$(db_get "xray" "$protocol")
-        elif db_exists "singbox" "$protocol"; then
-            cfg=$(db_get "singbox" "$protocol")
-        fi
-        [[ -z "$cfg" ]] && continue
-        
-        # 检查是否为数组（多端口）
-        local cfg_stream=""
-        if echo "$cfg" | jq -e 'type == "array"' >/dev/null 2>&1; then
-            # 多端口：遍历每个端口实例
-            cfg_stream=$(echo "$cfg" | jq -c '.[]')
-        else
-            # 单端口：使用原有逻辑
-            cfg_stream=$(echo "$cfg" | jq -c '.')
-        fi
-        
+        local core cfg_stream
+        core=$(protocol_db_core "$protocol")
+        cfg_stream=$(db_protocol_configs "$core" "$protocol") || continue
+        [[ -z "$cfg_stream" ]] && continue
+
         while IFS= read -r cfg; do
             [[ -z "$cfg" ]] && continue
             
@@ -24959,25 +24947,11 @@ gen_clash_sub() {
     master_port=$(_get_master_port "")
     
     for protocol in $installed; do
-        # 从数据库读取配置
-        local cfg=""
-        if db_exists "xray" "$protocol"; then
-            cfg=$(db_get "xray" "$protocol")
-        elif db_exists "singbox" "$protocol"; then
-            cfg=$(db_get "singbox" "$protocol")
-        fi
-        [[ -z "$cfg" ]] && continue
-        
-        # 检查是否为数组（多端口）
-        local cfg_stream=""
-        if echo "$cfg" | jq -e 'type == "array"' >/dev/null 2>&1; then
-            # 多端口：遍历每个端口实例
-            cfg_stream=$(echo "$cfg" | jq -c '.[]')
-        else
-            # 单端口：使用原有逻辑
-            cfg_stream=$(echo "$cfg" | jq -c '.')
-        fi
-        
+        local core cfg_stream
+        core=$(protocol_db_core "$protocol")
+        cfg_stream=$(db_protocol_configs "$core" "$protocol") || continue
+        [[ -z "$cfg_stream" ]] && continue
+
         while IFS= read -r cfg; do
             [[ -z "$cfg" ]] && continue
             
@@ -25206,28 +25180,15 @@ gen_surge_sub() {
     fi
     
     for protocol in $installed; do
-        # 从数据库读取配置
-        local cfg=""
-        if db_exists "xray" "$protocol"; then
-            cfg=$(db_get "xray" "$protocol")
-        elif db_exists "singbox" "$protocol"; then
-            cfg=$(db_get "singbox" "$protocol")
-        fi
-        [[ -z "$cfg" ]] && continue
-        
-        # 检查是否为数组（多端口）
-        local cfg_stream=""
-        if echo "$cfg" | jq -e 'type == "array"' >/dev/null 2>&1; then
-            # 多端口：遍历每个端口实例
-            cfg_stream=$(echo "$cfg" | jq -c '.[]')
-        else
-            # 单端口：使用原有逻辑
-            cfg_stream=$(echo "$cfg" | jq -c '.')
-        fi
-        
+        # 使用统一记录流，确保 .mihomo 多入站与旧标量记录均可订阅。
+        local core cfg_stream
+        core=$(protocol_db_core "$protocol")
+        cfg_stream=$(db_protocol_configs "$core" "$protocol") || continue
+        [[ -z "$cfg_stream" ]] && continue
+
         while IFS= read -r cfg; do
             [[ -z "$cfg" ]] && continue
-            
+
             # 提取字段
             local uuid=$(echo "$cfg" | jq -r '.uuid // empty')
             local port=$(echo "$cfg" | jq -r '.port // empty')
@@ -25238,8 +25199,13 @@ gen_surge_sub() {
             local version=$(echo "$cfg" | jq -r '.version // empty')
             local snell_mode=$(echo "$cfg" | jq -r '.mode // "default"')
             local snell_tfo=$(echo "$cfg" | jq -r '.tfo // "true"')
-            
+            local stls_password=$(echo "$cfg" | jq -r '.stls_password // empty')
             local name="${country_code}-$(get_protocol_name $protocol)-${ip_suffix}"
+            case "$protocol" in
+                snell) name="${country_code}-Snell-${port}" ;;
+                snell-v5) name="${country_code}-Snell-v5-${port}" ;;
+                snell-shadowtls|snell-v5-shadowtls) name="${country_code}-${protocol}-${port}" ;;
+            esac
             local proxy=""
             
             case "$protocol" in
@@ -25262,8 +25228,7 @@ gen_surge_sub() {
                     [[ -n "$server_ip" ]] && proxy="$name = anytls, $server_ip, $port, password=$password, sni=$sni, skip-cert-verify=true"
                     ;;
                 snell|snell-v5|snell-shadowtls|snell-v5-shadowtls)
-                    # Snell 和 Snell+ShadowTLS 都使用相同的 Surge 配置格式
-                    [[ -n "$server_ip" ]] && proxy="$name = snell, $server_ip, $port, psk=$psk, version=${version:-4}"
+                    [[ -n "$server_ip" ]] && proxy=$(gen_snell_surge_line "$name" "$server_ip" "$port" "$psk" "${version:-4}" "${snell_mode:-default}" "${snell_tfo:-true}" "$stls_password" "$sni")
                     ;;
                 snell-v6)
                     # Snell v6 服务端与 Surge 客户端的 mode 必须完全一致。

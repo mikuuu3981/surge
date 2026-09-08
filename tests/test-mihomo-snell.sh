@@ -2090,6 +2090,104 @@ test_mihomo_migration_cleanup_preserves_ss2022_v6_and_unmanaged_shadowtls() (
     grep -q '/usr/local/bin/snell-server-v5' "$TEST_TMP/remove.log"
 )
 
+# Task 7: all consumers must see a compact record stream regardless of whether
+# old records are scalar objects or new records are arrays.
+test_mihomo_normalized_display_and_subscription_rendering() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    CYAN= YELLOW= GREEN= RED= G= Y= C= D= W= NC=
+    write_single_mihomo_record snell '{"port":41001,"psk":"scalar-v4","version":4}'
+    [[ "$(db_protocol_configs mihomo snell)" == '{"port":41001,"psk":"scalar-v4","version":4}' ]] || return 1
+    write_mixed_mihomo_db
+    get_connection_addresses() { printf '%s\n' '203.0.113.9|'; }
+    get_ip_country() { printf '%s\n' US; }
+    get_all_external_links() { :; }
+    _line() { :; }
+
+    [[ "$(db_protocol_configs mihomo snell | wc -l)" -eq 2 ]] || return 1
+    [[ "$(db_protocol_configs mihomo snell-v5 | wc -l)" -eq 1 ]] || return 1
+
+    local surge links single
+    surge=$(gen_surge_sub)
+    grep -Fq 'US-Snell-41001 = snell, 203.0.113.9, 41001, psk=v4-one, version=4' <<<"$surge" || return 1
+    grep -Fq 'US-Snell-41002 = snell, 203.0.113.9, 41002, psk=v4-two, version=4' <<<"$surge" || return 1
+    grep -Fq 'US-Snell-v5-51001 = snell, 203.0.113.9, 51001, psk=v5-one, version=5' <<<"$surge" || return 1
+    grep -Fq 'shadow-tls-password=stls-secret, shadow-tls-sni=www.microsoft.com, shadow-tls-version=3' <<<"$surge" || return 1
+
+    links=$(show_all_share_links)
+    grep -Fq '41001' <<<"$links" || return 1
+    grep -Fq '41002' <<<"$links" || return 1
+    grep -Fq 'shadow-tls-password=stls-secret, shadow-tls-sni=www.microsoft.com, shadow-tls-version=3' <<<"$links" || return 1
+
+    single=$(show_single_protocol_info snell false <<<'2')
+    grep -Fq '端口:' <<<"$single" || return 1
+    grep -Fq '41002' <<<"$single"
+)
+
+# The interactive removal path must use the shared Mihomo transaction, rather
+# than treating a Mihomo node as a legacy standalone Snell service.
+test_mihomo_protocol_uninstall_is_per_port_and_stops_final_node() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    prepare_mihomo_transaction_fixture
+    CYAN= YELLOW= GREEN= RED= G= Y= C= D= W= NC=
+    LOG_FILE="$TEST_TMP/vless-server.log"
+    write_mixed_mihomo_db
+    generate_mihomo_config
+    touch "$SYSTEMD_DIR/vless-mihomo.service"
+    TEST_SERVICE_RUNNING=true
+    TEST_SERVICE_ENABLED=true
+    _pause() { :; }
+
+    uninstall_specific_protocol <<<'1
+1
+y' >/dev/null || return 1
+    jq -e '(.mihomo.snell | length) == 1 and .mihomo.snell[0].port == 41002 and .mihomo["snell-v5"][0].port == 51001' "$DB_FILE" >/dev/null || return 1
+    [[ "$TEST_SERVICE_RUNNING" == true ]] || return 1
+    grep -q '^restart:vless-mihomo$' "$TEST_TMP/svc.log" || return 1
+
+)
+
+test_mihomo_protocol_uninstall_stops_final_node() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    prepare_mihomo_transaction_fixture
+    CYAN= YELLOW= GREEN= RED= G= Y= C= D= W= NC=
+    LOG_FILE="$TEST_TMP/vless-server.log"
+    _apply_mihomo_node_change snell add all '{"port":41001,"psk":"v4-one","version":4}' || return 1
+    : >"$TEST_TMP/svc.log"
+    _pause() { :; }
+
+    uninstall_specific_protocol <<<'1
+y' >/dev/null || return 1
+    jq -e '.mihomo == {}' "$DB_FILE" >/dev/null || return 1
+    [[ "$TEST_SERVICE_RUNNING" == false && "$TEST_SERVICE_ENABLED" == false ]] || return 1
+    [[ ! -e "$MIHOMO_CONFIG" && ! -e "$SYSTEMD_DIR/vless-mihomo.service" ]]
+)
+
+# Full cleanup only touches managed Mihomo resources under the fixture paths.
+test_force_cleanup_removes_managed_mihomo_resources() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    DISTRO=debian
+    mkdir -p "$VERSION_CACHE_DIR" "$TEST_TMP/backups"
+    touch "$MIHOMO_BIN" "$MIHOMO_CONFIG" "$MIHOMO_MIGRATION_MARKER" \
+        "$SYSTEMD_DIR/vless-mihomo.service" "$VERSION_CACHE_DIR/MetaCubeX_mihomo" \
+        "$VERSION_CACHE_DIR/MetaCubeX_mihomo_prerelease" "$TEST_TMP/backups/vless-mihomo_1.19.28_test"
+    _get_core_backup_dir() { printf '%s\n' "$TEST_TMP/backups"; }
+    svc() { printf '%s:%s\n' "$1" "$2" >>"$TEST_TMP/svc.log"; }
+    systemctl() { :; }
+    cleanup_hy2_nat_rules() { :; }
+
+    force_cleanup
+    [[ ! -e "$MIHOMO_BIN" && ! -e "$MIHOMO_CONFIG" && ! -e "$MIHOMO_MIGRATION_MARKER" ]] || return 1
+    [[ ! -e "$SYSTEMD_DIR/vless-mihomo.service" ]] || return 1
+    [[ ! -e "$VERSION_CACHE_DIR/MetaCubeX_mihomo" && ! -e "$TEST_TMP/backups/vless-mihomo_1.19.28_test" ]] || return 1
+    grep -q '^disable:vless-mihomo$' "$TEST_TMP/svc.log"
+)
+
 run_test test_source_does_not_run_cli
 run_test test_mihomo_supported_versions
 run_test test_mihomo_asset_names
@@ -2198,4 +2296,8 @@ run_test test_mihomo_migration_rollback_propagates_running_mihomo_stop_failure
 run_test test_external_shadowtls_detection_checks_ss2022_and_service_references
 run_test test_install_shadowtls_marks_managed_binary_ownership
 run_test test_mihomo_migration_cleanup_preserves_ss2022_v6_and_unmanaged_shadowtls
+run_test test_mihomo_normalized_display_and_subscription_rendering
+run_test test_mihomo_protocol_uninstall_is_per_port_and_stops_final_node
+run_test test_mihomo_protocol_uninstall_stops_final_node
+run_test test_force_cleanup_removes_managed_mihomo_resources
 printf '%s tests passed\n' "$PASS"
