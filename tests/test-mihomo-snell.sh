@@ -1606,6 +1606,9 @@ prepare_migration_runtime_fixture() {
     MIG_RUNNING=([vless-snell]=true [vless-snell-v5]=false [vless-snell-shadowtls]=true [vless-snell-shadowtls-backend]=false [vless-snell-v5-shadowtls]=false [vless-snell-v5-shadowtls-backend]=false [vless-mihomo]=false)
     MIG_ENABLED=([vless-snell]=true [vless-snell-v5]=true [vless-snell-shadowtls]=true [vless-snell-shadowtls-backend]=false [vless-snell-v5-shadowtls]=false [vless-snell-v5-shadowtls-backend]=false [vless-mihomo]=false)
     MIG_FAIL_START=false
+    MIG_FAIL_STOP_SERVICE=""
+    MIG_FAIL_STOP_MIHOMO=false
+    MIG_STOP_MISSING_FAIL=false
     : >"$TEST_TMP/migration.log"
     install_mihomo() { printf '%s\n' install >>"$TEST_TMP/migration.log"; touch "$MIHOMO_BIN"; chmod 700 "$MIHOMO_BIN"; }
     validate_mihomo_config() { printf '%s\n' validate >>"$TEST_TMP/migration.log"; return 0; }
@@ -1618,7 +1621,12 @@ prepare_migration_runtime_fixture() {
         case "$action" in
             status) [[ "${MIG_RUNNING[$name]:-false}" == true ]] ;;
             enabled) [[ "${MIG_ENABLED[$name]:-false}" == true ]] ;;
-            stop) MIG_RUNNING[$name]=false ;;
+            stop)
+                [[ "$name" == vless-mihomo && "${MIG_RUNNING[$name]:-false}" != true && "$MIG_STOP_MISSING_FAIL" == true ]] && return 1
+                [[ "$name" == "$MIG_FAIL_STOP_SERVICE" ]] && return 1
+                [[ "$name" == vless-mihomo && "$MIG_FAIL_STOP_MIHOMO" == true ]] && return 1
+                MIG_RUNNING[$name]=false
+                ;;
             start) [[ "$name" == vless-mihomo && "$MIG_FAIL_START" == true ]] && return 1; MIG_RUNNING[$name]=true ;;
             restart) MIG_RUNNING[$name]=true ;;
             enable) MIG_ENABLED[$name]=true ;;
@@ -1691,6 +1699,63 @@ test_mihomo_migration_cleanup_failure_restores_before_marker() (
     cmp -s "$DB_FILE" "$TEST_TMP/db.before" || return 1
     cmp -s "$MIHOMO_CONFIG" "$TEST_TMP/config.before" || return 1
     [[ "${MIG_RUNNING[vless-snell]}" == true && ! -e "$MIHOMO_MIGRATION_MARKER" ]]
+)
+
+test_mihomo_migration_rollback_before_mihomo_exists_restores_legacy_state() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    prepare_migration_runtime_fixture
+    cp "$DB_FILE" "$TEST_TMP/db.before"
+    cp "$MIHOMO_CONFIG" "$TEST_TMP/config.before"
+    MIG_RUNNING[vless-snell-v5]=true
+    MIG_FAIL_STOP_SERVICE=vless-snell-v5
+    MIG_STOP_MISSING_FAIL=true
+
+    ! migrate_legacy_snell_to_mihomo || return 1
+    cmp -s "$DB_FILE" "$TEST_TMP/db.before" || return 1
+    cmp -s "$MIHOMO_CONFIG" "$TEST_TMP/config.before" || return 1
+    [[ "${MIG_RUNNING[vless-snell]}" == true && "${MIG_ENABLED[vless-snell]}" == true ]] || return 1
+    [[ "${MIG_RUNNING[vless-snell-v5]}" == true && "${MIG_ENABLED[vless-snell-v5]}" == true ]]
+)
+
+test_mihomo_migration_preflight_failure_removes_new_binary() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    prepare_migration_runtime_fixture
+    [[ ! -e "$MIHOMO_BIN" ]] || return 1
+    validate_mihomo_config() { return 1; }
+
+    ! migrate_legacy_snell_to_mihomo || return 1
+    [[ ! -e "$MIHOMO_BIN" ]]
+)
+
+test_mihomo_migration_preflight_failure_restores_existing_binary() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    prepare_migration_runtime_fixture
+    printf '%s\n' original-mihomo >"$MIHOMO_BIN"
+    chmod 711 "$MIHOMO_BIN"
+    cp "$MIHOMO_BIN" "$TEST_TMP/mihomo.before"
+    install_mihomo() { printf '%s\n' replacement-mihomo >"$MIHOMO_BIN"; chmod 700 "$MIHOMO_BIN"; }
+    validate_mihomo_config() { return 1; }
+
+    ! migrate_legacy_snell_to_mihomo || return 1
+    cmp -s "$MIHOMO_BIN" "$TEST_TMP/mihomo.before" || return 1
+    [[ "$(stat -c '%a' "$MIHOMO_BIN")" == 711 ]]
+)
+
+test_mihomo_migration_rollback_propagates_running_mihomo_stop_failure() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    prepare_migration_runtime_fixture
+    MIG_RUNNING[vless-mihomo]=true
+    MIG_FAIL_STOP_MIHOMO=true
+    MIG_FAIL_STOP_SERVICE=vless-snell
+
+    ! migrate_legacy_snell_to_mihomo || return 1
+    local snapshot
+    snapshot=$(find "$CFG" -maxdepth 1 -type d -name '.mihomo-migration.*' -print -quit)
+    [[ -n "$snapshot" && -f "$snapshot/resource-0.path" && -f "$snapshot/services" ]]
 )
 
 test_external_shadowtls_detection_checks_ss2022_and_service_references() (
@@ -1818,6 +1883,10 @@ run_test test_mihomo_migration_preflight_validation_keeps_legacy_running
 run_test test_mihomo_migration_cutover_orders_cleanup_last_and_is_idempotent
 run_test test_mihomo_migration_start_failure_restores_files_and_prior_services
 run_test test_mihomo_migration_cleanup_failure_restores_before_marker
+run_test test_mihomo_migration_rollback_before_mihomo_exists_restores_legacy_state
+run_test test_mihomo_migration_preflight_failure_removes_new_binary
+run_test test_mihomo_migration_preflight_failure_restores_existing_binary
+run_test test_mihomo_migration_rollback_propagates_running_mihomo_stop_failure
 run_test test_external_shadowtls_detection_checks_ss2022_and_service_references
 run_test test_install_shadowtls_marks_managed_binary_ownership
 run_test test_mihomo_migration_cleanup_preserves_ss2022_v6_and_unmanaged_shadowtls

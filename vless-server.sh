@@ -11139,7 +11139,7 @@ _mihomo_migration_snapshot_create() {
     done
     for path in "$DB_FILE" "$MIHOMO_CONFIG" \
         "$CFG/snell.conf" "$CFG/snell-v5.conf" "$CFG/snell-shadowtls.conf" "$CFG/snell-v5-shadowtls.conf" \
-        "$CFG/.shadowtls-managed" "$MIHOMO_MIGRATION_MARKER" \
+        "$CFG/.shadowtls-managed" "$MIHOMO_MIGRATION_MARKER" "$MIHOMO_BIN" \
         /usr/local/bin/snell-server /usr/local/bin/snell-server-v5 /usr/local/bin/shadow-tls; do
         _mihomo_migration_snapshot_path "$snapshot" "resource-$index" "$path" || { rm -rf "$snapshot"; return 1; }
         index=$((index + 1))
@@ -11153,11 +11153,31 @@ _mihomo_migration_snapshot_create() {
     printf '%s\n' "$snapshot"
 }
 
+_mihomo_migration_restore_binary() {
+    local snapshot="$1" path_file path
+    [[ -d "$snapshot" ]] || return 1
+    for path_file in "$snapshot"/*.path; do
+        [[ -e "$path_file" ]] || continue
+        path=$(<"$path_file")
+        [[ "$path" == "$MIHOMO_BIN" ]] || continue
+        if [[ -f "${path_file%.path}.absent" ]]; then
+            rm -f "$MIHOMO_BIN"
+        else
+            mkdir -p "$(dirname "$MIHOMO_BIN")" || return 1
+            cp -p "${path_file%.path}" "$MIHOMO_BIN"
+        fi
+        return
+    done
+    return 1
+}
+
 _mihomo_migration_snapshot_restore() {
     local snapshot="$1" path_file path
     [[ -d "$snapshot" ]] || return 1
-    # 先关闭新的共享服务，避免旧监听器恢复时发生端口竞争。
-    svc stop vless-mihomo >/dev/null 2>&1 || return 1
+    # 只有当前确实在运行的 Mihomo 才需要停止；首次迁移尚无服务时不能阻断恢复。
+    if svc status vless-mihomo >/dev/null 2>&1 && ! svc stop vless-mihomo >/dev/null 2>&1; then
+        return 1
+    fi
     for path_file in "$snapshot"/*.path; do
         [[ -e "$path_file" ]] || continue
         path=$(<"$path_file")
@@ -11187,7 +11207,7 @@ _mihomo_migration_restore_service_states() {
         [[ -n "$service_name" ]] || continue
         if [[ -f "$snapshot/${service_name}.running" ]]; then
             svc start "$service_name" >/dev/null 2>&1 || failed=true
-        else
+        elif svc status "$service_name" >/dev/null 2>&1; then
             svc stop "$service_name" >/dev/null 2>&1 || failed=true
         fi
     done < <(printf '%s\n' vless-mihomo; cat "$snapshot/services")
@@ -11218,10 +11238,22 @@ migrate_legacy_snell_to_mihomo() {
        ! generate_mihomo_config "$candidate_db" "$candidate_config" ||
        ! validate_mihomo_config "$candidate_config" "$MIHOMO_BIN"; then
         rm -f "$candidate_db" "$candidate_config"
+        if ! _mihomo_migration_restore_binary "$snapshot"; then
+            printf 'Snell 自动迁移预检二进制恢复失败，恢复快照保留在: %s\n' "$snapshot" >&2
+            return 1
+        fi
         rm -rf "$snapshot"
         return 1
     fi
-    chmod 600 "$candidate_config" || { rm -f "$candidate_db" "$candidate_config"; rm -rf "$snapshot"; return 1; }
+    if ! chmod 600 "$candidate_config"; then
+        rm -f "$candidate_db" "$candidate_config"
+        if ! _mihomo_migration_restore_binary "$snapshot"; then
+            printf 'Snell 自动迁移预检二进制恢复失败，恢复快照保留在: %s\n' "$snapshot" >&2
+            return 1
+        fi
+        rm -rf "$snapshot"
+        return 1
+    fi
 
     local service_name
     for service_name in $legacy_services; do
