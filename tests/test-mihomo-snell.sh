@@ -1770,28 +1770,53 @@ test_mihomo_migration_service_state_distinguishes_systemd_states() (
     [[ "$(_mihomo_migration_service_state)" == error ]]
 )
 
-test_mihomo_migration_service_state_distinguishes_openrc_states() (
+test_mihomo_migration_service_state_uses_openrc_exit_contract() (
     new_fixture
     trap cleanup_fixture EXIT
     source "$SCRIPT"
     DISTRO=alpine
     touch "$OPENRC_DIR/vless-mihomo"
-    _pgrep() { return 1; }
+    _mihomo_migration_managed_process_running() { return 1; }
     rc-service() {
         [[ "$2" == status ]] || return 1
-        case "${MIG_OPENRC_STATE:-inactive}" in
-            active) return 0 ;;
-            inactive) printf '%s\n' 'status: stopped'; return 1 ;;
-            error) printf '%s\n' 'rc-service transport failure'; return 1 ;;
+        case "${MIG_OPENRC_STATUS_RC:-3}" in
+            0) printf '%s\n' running; return 0 ;;
+            3) printf '%s\n' stopped; return 3 ;;
+            1) printf '%s\n' 'stopped: manager transport failure'; return 1 ;;
         esac
     }
 
-    MIG_OPENRC_STATE=inactive
-    [[ "$(_mihomo_migration_service_state)" == inactive ]] || return 1
-    MIG_OPENRC_STATE=active
+    MIG_OPENRC_STATUS_RC=0
     [[ "$(_mihomo_migration_service_state)" == active ]] || return 1
-    MIG_OPENRC_STATE=error
+    MIG_OPENRC_STATUS_RC=3
+    [[ "$(_mihomo_migration_service_state)" == inactive ]] || return 1
+    MIG_OPENRC_STATUS_RC=1
     [[ "$(_mihomo_migration_service_state)" == error ]]
+)
+
+test_mihomo_migration_exact_process_helper_is_nounset_safe() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    unset SVC_PROC
+    declare -A SVC_PROC
+    _mihomo_migration_managed_process_running || true
+)
+
+test_mihomo_migration_openrc_unavailable_uses_exact_managed_process_only() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    DISTRO=alpine
+    touch "$OPENRC_DIR/vless-mihomo"
+    rc-service() { [[ "$2" == status ]] && return 127; }
+    _mihomo_migration_managed_process_running() { return 0; }
+    [[ "$(_mihomo_migration_service_state)" == active ]] || return 1
+
+    _mihomo_migration_managed_process_running() { return 1; }
+    _pgrep() { touch "$TEST_TMP/ambiguous-pgrep-called"; return 0; }
+    [[ "$(_mihomo_migration_service_state)" == inactive ]] || return 1
+    [[ ! -e "$TEST_TMP/ambiguous-pgrep-called" ]]
 )
 
 test_mihomo_migration_status_error_retains_snapshot() (
@@ -1953,7 +1978,9 @@ run_test test_mihomo_migration_rollback_before_mihomo_exists_restores_legacy_sta
 run_test test_mihomo_migration_preflight_failure_removes_new_binary
 run_test test_mihomo_migration_preflight_failure_restores_existing_binary
 run_test test_mihomo_migration_service_state_distinguishes_systemd_states
-run_test test_mihomo_migration_service_state_distinguishes_openrc_states
+run_test test_mihomo_migration_service_state_uses_openrc_exit_contract
+run_test test_mihomo_migration_exact_process_helper_is_nounset_safe
+run_test test_mihomo_migration_openrc_unavailable_uses_exact_managed_process_only
 run_test test_mihomo_migration_status_error_retains_snapshot
 run_test test_mihomo_migration_rollback_propagates_running_mihomo_stop_failure
 run_test test_external_shadowtls_detection_checks_ss2022_and_service_references

@@ -11171,11 +11171,23 @@ _mihomo_migration_restore_binary() {
     return 1
 }
 
+# 只接受 /proc comm 的精确进程名，不能使用 Alpine _pgrep 的 -f 回退结果。
+_mihomo_migration_managed_process_running() {
+    # vless-mihomo 的受管进程名固定；避免关联数组下标在 set -u 环境被算术展开。
+    local process="vless-mihomo" proc_dir comm
+    for proc_dir in /proc/[0-9]*; do
+        [[ -r "$proc_dir/comm" ]] || continue
+        comm=$(<"$proc_dir/comm")
+        [[ "$comm" == "$process" ]] && return 0
+    done
+    return 1
+}
+
 # 迁移回滚专用三态查询。普通 svc status 保持其既有二态兼容语义。
 _mihomo_migration_service_state() {
     local output state rc
     if ! _mihomo_service_definition_exists; then
-        if _pgrep vless-mihomo; then
+        if _mihomo_migration_managed_process_running; then
             printf '%s\n' active
         else
             printf '%s\n' inactive
@@ -11184,13 +11196,14 @@ _mihomo_migration_service_state() {
     fi
 
     if [[ "$DISTRO" == "alpine" ]]; then
-        output=$(rc-service vless-mihomo status 2>&1)
+        # OpenRC/LSB: 0=running，3=stopped；127 仅表示 rc-service/status 不可用。
+        rc-service vless-mihomo status >/dev/null 2>&1
         rc=$?
-        [[ "$rc" -eq 0 ]] && { printf '%s\n' active; return 0; }
-        output=$(printf '%s' "$output" | tr '[:upper:]' '[:lower:]')
-        case "$output" in
-            *stopped*|*inactive*|*"not started"*)
-                if _pgrep vless-mihomo; then printf '%s\n' active; else printf '%s\n' inactive; fi
+        case "$rc" in
+            0) printf '%s\n' active ;;
+            3) printf '%s\n' inactive ;;
+            127)
+                if _mihomo_migration_managed_process_running; then printf '%s\n' active; else printf '%s\n' inactive; fi
                 ;;
             *) printf '%s\n' error ;;
         esac
@@ -11202,7 +11215,7 @@ _mihomo_migration_service_state() {
         case "$state" in
             active|activating|reloading) printf '%s\n' active ;;
             inactive|failed|deactivating)
-                if _pgrep vless-mihomo; then printf '%s\n' active; else printf '%s\n' inactive; fi
+                if _mihomo_migration_managed_process_running; then printf '%s\n' active; else printf '%s\n' inactive; fi
                 ;;
             *) printf '%s\n' error ;;
         esac
