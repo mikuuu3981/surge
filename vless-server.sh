@@ -11171,13 +11171,54 @@ _mihomo_migration_restore_binary() {
     return 1
 }
 
-_mihomo_migration_snapshot_restore() {
-    local snapshot="$1" path_file path
-    [[ -d "$snapshot" ]] || return 1
-    # 只有当前确实在运行的 Mihomo 才需要停止；首次迁移尚无服务时不能阻断恢复。
-    if svc status vless-mihomo >/dev/null 2>&1 && ! svc stop vless-mihomo >/dev/null 2>&1; then
-        return 1
+# 迁移回滚专用三态查询。普通 svc status 保持其既有二态兼容语义。
+_mihomo_migration_service_state() {
+    local output state rc
+    if ! _mihomo_service_definition_exists; then
+        if _pgrep vless-mihomo; then
+            printf '%s\n' active
+        else
+            printf '%s\n' inactive
+        fi
+        return 0
     fi
+
+    if [[ "$DISTRO" == "alpine" ]]; then
+        output=$(rc-service vless-mihomo status 2>&1)
+        rc=$?
+        [[ "$rc" -eq 0 ]] && { printf '%s\n' active; return 0; }
+        output=$(printf '%s' "$output" | tr '[:upper:]' '[:lower:]')
+        case "$output" in
+            *stopped*|*inactive*|*"not started"*)
+                if _pgrep vless-mihomo; then printf '%s\n' active; else printf '%s\n' inactive; fi
+                ;;
+            *) printf '%s\n' error ;;
+        esac
+    else
+        output=$(systemctl show --property=ActiveState --value vless-mihomo 2>&1)
+        rc=$?
+        [[ "$rc" -eq 0 ]] || { printf '%s\n' error; return 0; }
+        state=$(printf '%s' "$output" | tr '[:upper:]' '[:lower:]')
+        case "$state" in
+            active|activating|reloading) printf '%s\n' active ;;
+            inactive|failed|deactivating)
+                if _pgrep vless-mihomo; then printf '%s\n' active; else printf '%s\n' inactive; fi
+                ;;
+            *) printf '%s\n' error ;;
+        esac
+    fi
+}
+
+_mihomo_migration_snapshot_restore() {
+    local snapshot="$1" path_file path service_state
+    [[ -d "$snapshot" ]] || return 1
+    # 缺少服务定义且无进程可安全跳过；管理器查询异常必须保留快照并中止回滚。
+    service_state=$(_mihomo_migration_service_state)
+    case "$service_state" in
+        active) svc stop vless-mihomo >/dev/null 2>&1 || return 1 ;;
+        inactive) ;;
+        *) return 1 ;;
+    esac
     for path_file in "$snapshot"/*.path; do
         [[ -e "$path_file" ]] || continue
         path=$(<"$path_file")
@@ -11207,6 +11248,12 @@ _mihomo_migration_restore_service_states() {
         [[ -n "$service_name" ]] || continue
         if [[ -f "$snapshot/${service_name}.running" ]]; then
             svc start "$service_name" >/dev/null 2>&1 || failed=true
+        elif [[ "$service_name" == "vless-mihomo" ]]; then
+            case "$(_mihomo_migration_service_state)" in
+                active) svc stop "$service_name" >/dev/null 2>&1 || failed=true ;;
+                inactive) ;;
+                *) failed=true ;;
+            esac
         elif svc status "$service_name" >/dev/null 2>&1; then
             svc stop "$service_name" >/dev/null 2>&1 || failed=true
         fi

@@ -1609,6 +1609,7 @@ prepare_migration_runtime_fixture() {
     MIG_FAIL_STOP_SERVICE=""
     MIG_FAIL_STOP_MIHOMO=false
     MIG_STOP_MISSING_FAIL=false
+    MIG_STATUS_ERROR=false
     : >"$TEST_TMP/migration.log"
     install_mihomo() { printf '%s\n' install >>"$TEST_TMP/migration.log"; touch "$MIHOMO_BIN"; chmod 700 "$MIHOMO_BIN"; }
     validate_mihomo_config() { printf '%s\n' validate >>"$TEST_TMP/migration.log"; return 0; }
@@ -1634,7 +1635,12 @@ prepare_migration_runtime_fixture() {
             *) return 1 ;;
         esac
     }
-    systemctl() { :; }
+    systemctl() {
+        if [[ "$1" == show ]]; then
+            [[ "$MIG_STATUS_ERROR" == true ]] && return 1
+            if [[ "${MIG_RUNNING[vless-mihomo]:-false}" == true ]]; then printf '%s\n' active; else printf '%s\n' inactive; fi
+        fi
+    }
 }
 
 test_mihomo_migration_preflight_validation_keeps_legacy_running() (
@@ -1744,11 +1750,71 @@ test_mihomo_migration_preflight_failure_restores_existing_binary() (
     [[ "$(stat -c '%a' "$MIHOMO_BIN")" == 711 ]]
 )
 
+test_mihomo_migration_service_state_distinguishes_systemd_states() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    DISTRO=debian
+    touch "$SYSTEMD_DIR/vless-mihomo.service"
+    _pgrep() { return 1; }
+    systemctl() {
+        [[ "$1" == show ]] || return 1
+        printf '%s\n' "${MIG_SYSTEMD_STATE:-inactive}"
+    }
+
+    MIG_SYSTEMD_STATE=inactive
+    [[ "$(_mihomo_migration_service_state)" == inactive ]] || return 1
+    MIG_SYSTEMD_STATE=active
+    [[ "$(_mihomo_migration_service_state)" == active ]] || return 1
+    systemctl() { return 1; }
+    [[ "$(_mihomo_migration_service_state)" == error ]]
+)
+
+test_mihomo_migration_service_state_distinguishes_openrc_states() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    DISTRO=alpine
+    touch "$OPENRC_DIR/vless-mihomo"
+    _pgrep() { return 1; }
+    rc-service() {
+        [[ "$2" == status ]] || return 1
+        case "${MIG_OPENRC_STATE:-inactive}" in
+            active) return 0 ;;
+            inactive) printf '%s\n' 'status: stopped'; return 1 ;;
+            error) printf '%s\n' 'rc-service transport failure'; return 1 ;;
+        esac
+    }
+
+    MIG_OPENRC_STATE=inactive
+    [[ "$(_mihomo_migration_service_state)" == inactive ]] || return 1
+    MIG_OPENRC_STATE=active
+    [[ "$(_mihomo_migration_service_state)" == active ]] || return 1
+    MIG_OPENRC_STATE=error
+    [[ "$(_mihomo_migration_service_state)" == error ]]
+)
+
+test_mihomo_migration_status_error_retains_snapshot() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    prepare_migration_runtime_fixture
+    touch "$SYSTEMD_DIR/vless-mihomo.service"
+    MIG_STATUS_ERROR=true
+    MIG_FAIL_STOP_SERVICE=vless-snell
+
+    ! migrate_legacy_snell_to_mihomo || return 1
+    ! grep -q '^stop:vless-mihomo$' "$TEST_TMP/migration.log" || return 1
+    local snapshot
+    snapshot=$(find "$CFG" -maxdepth 1 -type d -name '.mihomo-migration.*' -print -quit)
+    [[ -n "$snapshot" && -f "$snapshot/services" ]]
+)
+
 test_mihomo_migration_rollback_propagates_running_mihomo_stop_failure() (
     new_fixture
     trap cleanup_fixture EXIT
     prepare_migration_runtime_fixture
     MIG_RUNNING[vless-mihomo]=true
+    touch "$SYSTEMD_DIR/vless-mihomo.service"
     MIG_FAIL_STOP_MIHOMO=true
     MIG_FAIL_STOP_SERVICE=vless-snell
 
@@ -1886,6 +1952,9 @@ run_test test_mihomo_migration_cleanup_failure_restores_before_marker
 run_test test_mihomo_migration_rollback_before_mihomo_exists_restores_legacy_state
 run_test test_mihomo_migration_preflight_failure_removes_new_binary
 run_test test_mihomo_migration_preflight_failure_restores_existing_binary
+run_test test_mihomo_migration_service_state_distinguishes_systemd_states
+run_test test_mihomo_migration_service_state_distinguishes_openrc_states
+run_test test_mihomo_migration_status_error_retains_snapshot
 run_test test_mihomo_migration_rollback_propagates_running_mihomo_stop_failure
 run_test test_external_shadowtls_detection_checks_ss2022_and_service_references
 run_test test_install_shadowtls_marks_managed_binary_ownership
