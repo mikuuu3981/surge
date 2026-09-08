@@ -9,7 +9,7 @@ REAL_MIHOMO_BIN="${VLESS_TEST_MIHOMO_BIN:-}"
 declare -A MIG_RUNNING MIG_ENABLED
 
 run_test() {
-    local name="$1" skip_message="${2:-}" status
+    local name="$1"
     if [[ -n "${VLESS_TEST_ONLY:-}" && "$name" != "$VLESS_TEST_ONLY" ]]; then
         return 0
     fi
@@ -17,15 +17,18 @@ run_test() {
         printf 'ok - %s\n' "$name"
         PASS=$((PASS + 1))
     else
-        status=$?
-        if [[ "$status" -eq 2 && -n "$skip_message" ]]; then
-            printf 'skip - %s\n' "$skip_message"
-            SKIP=$((SKIP + 1))
-            return 0
-        fi
         printf 'not ok - %s\n' "$name" >&2
         exit 1
     fi
+}
+
+skip_test() {
+    local name="$1" message="$2"
+    if [[ -n "${VLESS_TEST_ONLY:-}" && "$name" != "$VLESS_TEST_ONLY" ]]; then
+        return 0
+    fi
+    printf 'skip - %s\n' "$message"
+    SKIP=$((SKIP + 1))
 }
 
 new_fixture() {
@@ -1369,9 +1372,6 @@ test_release_version_is_rendered_in_header() (
 )
 
 test_validate_mixed_config_with_supplied_real_mihomo() (
-    if [[ -z "$REAL_MIHOMO_BIN" ]]; then
-        return 2
-    fi
     if [[ ! -x "$REAL_MIHOMO_BIN" ]]; then
         printf '%s\n' "real Mihomo binary is not executable: $REAL_MIHOMO_BIN" >&2
         return 1
@@ -2472,7 +2472,11 @@ run_test test_mihomo_transaction_retains_snapshot_when_service_restore_fails
 run_test test_mihomo_transaction_rejects_cross_protocol_duplicate_before_service_mutation
 run_test test_snell_generators_store_only_transactional_mihomo_records
 run_test test_release_version_is_rendered_in_header
-run_test test_validate_mixed_config_with_supplied_real_mihomo "real Mihomo binary not supplied"
+if [[ -z "$REAL_MIHOMO_BIN" ]]; then
+    skip_test test_validate_mixed_config_with_supplied_real_mihomo "real Mihomo binary not supplied"
+else
+    run_test test_validate_mixed_config_with_supplied_real_mihomo
+fi
 run_test test_validate_mihomo_config_checks_json_and_binary_arguments
 run_test test_mihomo_migration_candidate_normalizes_legacy_records
 run_test test_mihomo_migration_candidate_rejects_conflicts_and_deduplicates_match
