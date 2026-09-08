@@ -3807,9 +3807,9 @@ protocol_db_core() {
     fi
 }
 
-# 订阅和展示优先使用已迁移的 Mihomo 记录；仅有 .xray 记录时才走旧服务。
-# 这与 protocol_db_core 的兼容写入语义分开，避免两个命名空间同时存在时重复节点。
-protocol_subscription_db_core() {
+# 当前活动数据所有者：已迁移的 .mihomo 优先；仅有旧记录时才使用 .xray。
+# 保持与 protocol_db_core 的兼容写入语义分离，确保展示、选择和卸载一致。
+protocol_active_db_core() {
     local protocol="$1"
     if [[ "$(protocol_core "$protocol")" == "mihomo" ]] && db_exists "mihomo" "$protocol"; then
         printf '%s\n' mihomo
@@ -3818,10 +3818,8 @@ protocol_subscription_db_core() {
     fi
 }
 
-# 卸载按当前活动所有者决策：已迁移的 .mihomo 优先，只有旧记录才操作 .xray。
-protocol_uninstall_db_core() {
-    protocol_subscription_db_core "$1"
-}
+protocol_subscription_db_core() { protocol_active_db_core "$1"; }
+protocol_uninstall_db_core() { protocol_active_db_core "$1"; }
 
 #═══════════════════════════════════════════════════════════════════════════════
 #  表驱动元数据 (协议/服务/进程/启动命令)
@@ -21227,9 +21225,9 @@ show_services_status() {
 select_port_to_uninstall() {
     local protocol="$1"
     
-    # 确定协议记录实际所在的数据库命名空间
+    # 选择列表与后续事务使用同一个活动物理命名空间。
     local core
-    core=$(protocol_db_core "$protocol")
+    core=$(protocol_active_db_core "$protocol")
     
     # 获取归一化端口列表，兼容旧单对象和多端口数组。
     local ports=$(db_protocol_configs "$core" "$protocol" | jq -r '.port // empty')
@@ -21246,6 +21244,7 @@ select_port_to_uninstall() {
     # 只有一个端口，直接选择
     if [[ $port_count -eq 1 ]]; then
         SELECTED_PORT="${port_array[0]}"
+        SELECTED_PROTOCOL_CORE="$core"
         echo -e "${CYAN}检测到协议 $protocol 只有一个端口实例: $SELECTED_PORT${NC}"
         return 0
     fi
@@ -21272,9 +21271,11 @@ select_port_to_uninstall() {
         return 1
     elif [[ "$choice" == "$i" ]]; then
         SELECTED_PORT="all"
+        SELECTED_PROTOCOL_CORE="$core"
         return 0
     elif [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -lt "$i" ]; then
         SELECTED_PORT="${port_array[$((choice-1))]}"
+        SELECTED_PROTOCOL_CORE="$core"
         return 0
     else
         echo -e "${RED}无效选项${NC}"
@@ -21359,6 +21360,10 @@ uninstall_specific_protocol() {
     local core_type core
     core_type=$(protocol_core "$selected_protocol")
     core=$(protocol_uninstall_db_core "$selected_protocol")
+    if [[ -n "${SELECTED_PROTOCOL_CORE:-}" && "$SELECTED_PROTOCOL_CORE" != "$core" ]]; then
+        _err "协议存储位置已变化，请重新选择端口"
+        return 1
+    fi
     
     echo -e "  将卸载: ${R}$(get_protocol_name $selected_protocol)${NC}"
     read -rp "  确认卸载? [y/N]: " confirm

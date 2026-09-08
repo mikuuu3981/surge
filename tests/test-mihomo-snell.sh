@@ -2273,6 +2273,70 @@ y' >/dev/null || return 1
     ! grep -q 'vless-snell-v5\|vless-snell-v6\|ss2022-shadowtls' "$TEST_TMP/svc.log"
 )
 
+write_mixed_namespace_snell_db() {
+    jq -n '{
+      version:"4.0.0", singbox:{}, meta:{},
+      xray:{snell:[{port:41001,psk:"legacy-only",version:4},{port:41002,psk:"legacy-overlap",version:4}]},
+      mihomo:{snell:[{port:42001,psk:"active-only",version:4},{port:41002,psk:"active-overlap",version:4}]}
+    }' >"$DB_FILE"
+}
+
+prepare_mixed_namespace_snell_uninstall_fixture() {
+    prepare_mihomo_transaction_fixture
+    CYAN= YELLOW= GREEN= RED= G= Y= C= D= W= NC=
+    LOG_FILE="$TEST_TMP/vless-server.log"
+    write_mixed_namespace_snell_db
+    generate_mihomo_config
+    touch "$SYSTEMD_DIR/vless-mihomo.service"
+    TEST_SERVICE_RUNNING=true
+    TEST_SERVICE_ENABLED=true
+    _pause() { :; }
+}
+
+# The selected menu port must come from the same active Mihomo namespace that
+# the subsequent transaction mutates, never from a stale legacy counterpart.
+test_mixed_namespace_uninstall_selects_and_removes_active_mihomo_port() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    prepare_mixed_namespace_snell_uninstall_fixture
+
+    local selection
+    select_port_to_uninstall snell >"$TEST_TMP/selection" <<<'1' || return 1
+    selection=$(<"$TEST_TMP/selection")
+    [[ "$SELECTED_PORT" == 42001 ]] || return 1
+    grep -Fq '42001' <<<"$selection" || return 1
+    ! grep -Fq '41001' <<<"$selection" || return 1
+
+    uninstall_specific_protocol <<<'1
+1
+y' >/dev/null || return 1
+    jq -e '(.mihomo.snell | length) == 1 and .mihomo.snell[0].port == 41002 and (.xray.snell | length) == 2 and .xray.snell[0].port == 41001 and .xray.snell[1].port == 41002' "$DB_FILE" >/dev/null || return 1
+    jq -e '([.listeners[].port] | sort) == [41002]' "$MIHOMO_CONFIG" >/dev/null || return 1
+    grep -q '^restart:vless-mihomo$' "$TEST_TMP/svc.log"
+)
+
+# `all` is likewise derived from the active list and may never delete the
+# stale .xray counterpart that migration/cleanup still owns.
+test_mixed_namespace_uninstall_all_targets_active_mihomo_only() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    prepare_mixed_namespace_snell_uninstall_fixture
+
+    local selection
+    select_port_to_uninstall snell >"$TEST_TMP/selection" <<<'3' || return 1
+    selection=$(<"$TEST_TMP/selection")
+    [[ "$SELECTED_PORT" == all ]] || return 1
+    grep -Fq '42001' <<<"$selection" || return 1
+    ! grep -Fq '41001' <<<"$selection" || return 1
+
+    uninstall_specific_protocol <<<'1
+3
+y' >/dev/null || return 1
+    jq -e '(.mihomo | has("snell") | not) and (.xray.snell | length) == 2 and .xray.snell[0].port == 41001 and .xray.snell[1].port == 41002' "$DB_FILE" >/dev/null || return 1
+    [[ "$TEST_SERVICE_RUNNING" == false && "$TEST_SERVICE_ENABLED" == false ]] || return 1
+    [[ ! -e "$MIHOMO_CONFIG" && ! -e "$SYSTEMD_DIR/vless-mihomo.service" ]]
+)
+
 # Full cleanup only touches managed Mihomo resources under the fixture paths.
 test_force_cleanup_removes_managed_mihomo_resources() (
     new_fixture
@@ -2410,5 +2474,7 @@ run_test test_legacy_xray_snell_rendering_normalizes_scalar_and_arrays
 run_test test_mihomo_storage_resolution_prefers_migrated_record
 run_test test_legacy_xray_snell_per_port_and_all_uninstall
 run_test test_legacy_xray_snell_all_uninstall_targets_only_selected_protocol
+run_test test_mixed_namespace_uninstall_selects_and_removes_active_mihomo_port
+run_test test_mixed_namespace_uninstall_all_targets_active_mihomo_only
 run_test test_force_cleanup_removes_managed_mihomo_resources
 printf '%s tests passed\n' "$PASS"
