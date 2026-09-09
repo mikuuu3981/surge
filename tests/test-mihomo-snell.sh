@@ -5,6 +5,10 @@ ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 SCRIPT="$ROOT/vless-server.sh"
 PASS=0
 SKIP=0
+REAL_MIHOMO_BIN_SUPPLIED=false
+if [[ -n "${VLESS_TEST_MIHOMO_BIN+x}" ]]; then
+    REAL_MIHOMO_BIN_SUPPLIED=true
+fi
 REAL_MIHOMO_BIN="${VLESS_TEST_MIHOMO_BIN:-}"
 declare -A MIG_RUNNING MIG_ENABLED
 
@@ -2472,7 +2476,7 @@ run_test test_mihomo_transaction_retains_snapshot_when_service_restore_fails
 run_test test_mihomo_transaction_rejects_cross_protocol_duplicate_before_service_mutation
 run_test test_snell_generators_store_only_transactional_mihomo_records
 run_test test_release_version_is_rendered_in_header
-if [[ -z "$REAL_MIHOMO_BIN" ]]; then
+if [[ "$REAL_MIHOMO_BIN_SUPPLIED" == false ]]; then
     skip_test test_validate_mixed_config_with_supplied_real_mihomo "real Mihomo binary not supplied"
 else
     run_test test_validate_mixed_config_with_supplied_real_mihomo
