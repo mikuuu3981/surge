@@ -22,7 +22,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
     exit 1
 fi
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.5.14 [服务端]
+#  多协议代理一键部署脚本 v3.5.15 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -41,7 +41,7 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.5.14"
+readonly VERSION="3.5.15"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/mikuuu3981/surge"
 readonly SCRIPT_REPO="mikuuu3981/surge"
@@ -11681,7 +11681,7 @@ migrate_legacy_snell_to_mihomo() {
     else
         svc start vless-mihomo
     fi
-    if [[ $? -ne 0 ]] || ! svc status vless-mihomo || ! _mihomo_ports_healthy "$DB_FILE" ||
+    if [[ $? -ne 0 ]] || ! _wait_for_mihomo_ready "$DB_FILE" ||
        ! _cleanup_legacy_snell_resources "$legacy_services"; then
         _mihomo_migration_rollback "$snapshot"
         return 1

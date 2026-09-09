@@ -1392,7 +1392,7 @@ test_release_version_is_rendered_in_header() (
 
     local output
     output=$(TERM=dumb _header 2>&1)
-    [[ "$output" == *"v3.5.14"* ]]
+    [[ "$output" == *"v3.5.15"* ]]
 )
 
 test_validate_mixed_config_with_supplied_real_mihomo() (
@@ -1716,6 +1716,27 @@ test_mihomo_migration_preflight_validation_keeps_legacy_running() (
     cmp -s "$MIHOMO_CONFIG" "$TEST_TMP/config.before" || return 1
     [[ "${MIG_RUNNING[vless-snell]}" == true && "${MIG_RUNNING[vless-snell-shadowtls]}" == true ]] || return 1
     ! grep -q '^stop:vless-snell' "$TEST_TMP/migration.log"
+)
+
+# Break caught: automatic migration must not delete a newly installed Mihomo
+# binary and restore the legacy database merely because cold-start listeners
+# need a few health checks before they bind.
+test_mihomo_migration_waits_for_cold_listener_startup() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    prepare_migration_runtime_fixture
+    local health_checks=0
+    sleep() { :; }
+    _mihomo_ports_healthy() {
+        health_checks=$((health_checks + 1))
+        ((health_checks >= 3))
+    }
+
+    migrate_legacy_snell_to_mihomo || return 1
+
+    [[ -x "$MIHOMO_BIN" && -f "$MIHOMO_MIGRATION_MARKER" ]] || return 1
+    jq -e '.xray["snell-v5"] == null and .mihomo["snell-v5"][0].port == 51001' "$DB_FILE" >/dev/null || return 1
+    [[ "${MIG_RUNNING[vless-mihomo]}" == true ]]
 )
 
 test_mihomo_migration_cutover_orders_cleanup_last_and_is_idempotent() (
@@ -2798,6 +2819,7 @@ run_test test_validate_mihomo_config_checks_json_and_binary_arguments
 run_test test_mihomo_migration_candidate_normalizes_legacy_records
 run_test test_mihomo_migration_candidate_rejects_conflicts_and_deduplicates_match
 run_test test_mihomo_migration_preflight_validation_keeps_legacy_running
+run_test test_mihomo_migration_waits_for_cold_listener_startup
 run_test test_mihomo_migration_cutover_orders_cleanup_last_and_is_idempotent
 run_test test_mihomo_migration_start_failure_restores_files_and_prior_services
 run_test test_mihomo_migration_cleanup_failure_restores_before_marker
