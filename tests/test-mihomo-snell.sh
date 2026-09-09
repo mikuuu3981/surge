@@ -2425,6 +2425,7 @@ prepare_mihomo_update_fixture() {
     UPDATE_RUNNING=true
     UPDATE_MANAGER_STATE=active
     UPDATE_MANAGER_ERROR_AFTER=0
+    UPDATE_MANAGER_ERROR_AT=""
     UPDATE_FAIL=""
     DISTRO=debian
     touch "$SYSTEMD_DIR/vless-mihomo.service"
@@ -2442,7 +2443,8 @@ prepare_mihomo_update_fixture() {
         [[ -s "$TEST_TMP/update-manager-count" ]] && count=$(<"$TEST_TMP/update-manager-count")
         count=$((count + 1))
         printf '%s\n' "$count" >"$TEST_TMP/update-manager-count"
-        if [[ "$UPDATE_MANAGER_ERROR_AFTER" -gt 0 && "$count" -ge "$UPDATE_MANAGER_ERROR_AFTER" ]]; then
+        if [[ "$UPDATE_MANAGER_ERROR_AFTER" -gt 0 && "$count" -ge "$UPDATE_MANAGER_ERROR_AFTER" ]] ||
+           [[ " $UPDATE_MANAGER_ERROR_AT " == *" $count "* ]]; then
             return 1
         fi
         case "$UPDATE_MANAGER_STATE" in
@@ -2473,7 +2475,10 @@ prepare_mihomo_update_fixture() {
         chmod 755 "$MIHOMO_BIN"
     }
     validate_mihomo_config() { [[ "$UPDATE_FAIL" != validation ]]; }
-    _mihomo_ports_healthy() { [[ "$UPDATE_FAIL" != ports ]]; }
+    _mihomo_ports_healthy() {
+        touch "$TEST_TMP/update-ports-checked"
+        [[ "$UPDATE_FAIL" != ports ]]
+    }
 }
 
 test_mihomo_update_service_state_distinguishes_active_inactive_and_error() (
@@ -2487,6 +2492,28 @@ test_mihomo_update_service_state_distinguishes_active_inactive_and_error() (
     [[ "$(_mihomo_service_state)" == inactive ]] || return 1
     UPDATE_MANAGER_STATE=error
     [[ "$(_mihomo_service_state)" == error ]]
+)
+
+test_mihomo_update_service_state_uses_openrc_exit_contract() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    prepare_mihomo_update_fixture
+    DISTRO=alpine
+    rm -f "$SYSTEMD_DIR/vless-mihomo.service"
+    touch "$OPENRC_DIR/vless-mihomo"
+    _mihomo_migration_managed_process_running() { touch "$TEST_TMP/update-proc-fallback-called"; return 0; }
+    rc-service() {
+        [[ "$1" == vless-mihomo && "$2" == status ]] || return 1
+        return "$UPDATE_OPENRC_STATUS_RC"
+    }
+
+    UPDATE_OPENRC_STATUS_RC=0
+    [[ "$(_mihomo_service_state)" == active ]] || return 1
+    UPDATE_OPENRC_STATUS_RC=3
+    [[ "$(_mihomo_service_state)" == inactive ]] || return 1
+    UPDATE_OPENRC_STATUS_RC=1
+    [[ "$(_mihomo_service_state)" == error ]] || return 1
+    [[ ! -e "$TEST_TMP/update-proc-fallback-called" ]]
 )
 
 test_mihomo_update_status_query_error_aborts_before_mutation() (
@@ -2505,6 +2532,19 @@ test_mihomo_update_status_query_error_aborts_before_mutation() (
     [[ "$(stat -c '%a' "$MIHOMO_BIN")" == 711 && "$UPDATE_RUNNING" == true ]] || return 1
     [[ ! -e "$TEST_TMP/update-install-called" && ! -s "$TEST_TMP/update-svc.log" ]] || return 1
     ! compgen -G "$CFG/.mihomo-update.*" >/dev/null
+)
+
+test_mihomo_update_post_restart_authoritative_error_rolls_back_and_retains_snapshot() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    prepare_mihomo_update_fixture
+    UPDATE_MANAGER_ERROR_AT="2 4"
+
+    ! _update_core_to_version Mihomo stable 1.19.29 vless-mihomo install_update_mihomo || return 1
+    [[ "$(<"$MIHOMO_BIN")" == old-mihomo && "$(stat -c '%a' "$MIHOMO_BIN")" == 711 ]] || return 1
+    [[ "$UPDATE_RUNNING" == true && "$(grep -c '^restart$' "$TEST_TMP/update-svc.log")" -eq 2 ]] || return 1
+    [[ ! -e "$TEST_TMP/update-ports-checked" ]] || return 1
+    compgen -G "$CFG/.mihomo-update.*" >/dev/null
 )
 
 test_mihomo_update_inactive_validation_rollback_does_not_mutate_service() (
@@ -2641,7 +2681,9 @@ test_mihomo_migration_process_read_failure_is_error_and_retains_snapshot() (
 run_test test_source_does_not_run_cli
 run_test test_direct_execution_pins_log_paths_but_sourcing_allows_fixtures
 run_test test_mihomo_update_service_state_distinguishes_active_inactive_and_error
+run_test test_mihomo_update_service_state_uses_openrc_exit_contract
 run_test test_mihomo_update_status_query_error_aborts_before_mutation
+run_test test_mihomo_update_post_restart_authoritative_error_rolls_back_and_retains_snapshot
 run_test test_mihomo_update_inactive_validation_rollback_does_not_mutate_service
 run_test test_mihomo_update_rollback_state_confirmation_error_retains_snapshot
 run_test test_mihomo_update_rolls_back_validation_failure

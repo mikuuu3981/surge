@@ -9895,6 +9895,7 @@ _update_mihomo_core_to_version() {
             service_mutated=true
             if ! svc restart vless-mihomo >/dev/null 2>&1 ||
                ! svc status vless-mihomo >/dev/null 2>&1 ||
+               [[ "$(_mihomo_service_state)" != active ]] ||
                ! _mihomo_ports_healthy "$DB_FILE"; then
                 _mihomo_update_rollback "$snapshot" "$service_mutated" || return 1
                 rm -rf "$snapshot"
