@@ -9815,7 +9815,7 @@ _rollback_core_binary() {
 }
 
 _mihomo_update_snapshot_create() {
-    local snapshot
+    local snapshot service_state
     mkdir -p "$CFG" || return 1
     snapshot=$(mktemp -d "$CFG/.mihomo-update.XXXXXX") || return 1
     chmod 700 "$snapshot" || { rm -rf "$snapshot"; return 1; }
@@ -9824,32 +9824,53 @@ _mihomo_update_snapshot_create() {
     else
         touch "$snapshot/binary-absent"
     fi
-    if svc status vless-mihomo >/dev/null 2>&1; then
-        touch "$snapshot/service-running"
-    else
-        touch "$snapshot/service-stopped"
-    fi
+    service_state=$(_mihomo_service_state)
+    case "$service_state" in
+        active) touch "$snapshot/service-running" || { rm -rf "$snapshot"; return 1; } ;;
+        inactive) touch "$snapshot/service-stopped" || { rm -rf "$snapshot"; return 1; } ;;
+        *) rm -rf "$snapshot"; return 1 ;;
+    esac
     printf '%s\n' "$snapshot"
 }
 
 _mihomo_update_rollback() {
-    local snapshot="$1"
+    local snapshot="$1" service_mutated="${2:-false}" expected_state current_state
     if [[ -f "$snapshot/binary-absent" ]]; then
         rm -f "$MIHOMO_BIN" || return 1
     else
         cp -p "$snapshot/binary" "$MIHOMO_BIN" || return 1
     fi
+
     if [[ -f "$snapshot/service-running" ]]; then
-        svc restart vless-mihomo >/dev/null 2>&1 || svc start vless-mihomo >/dev/null 2>&1 || return 1
+        expected_state=active
+    elif [[ -f "$snapshot/service-stopped" ]]; then
+        expected_state=inactive
     else
-        svc stop vless-mihomo >/dev/null 2>&1 || return 1
+        return 1
     fi
+    current_state=$(_mihomo_service_state)
+    case "$current_state" in
+        active|inactive) ;;
+        *) return 1 ;;
+    esac
+
+    if [[ "$expected_state" == active && "$service_mutated" == true ]]; then
+        svc restart vless-mihomo >/dev/null 2>&1 || svc start vless-mihomo >/dev/null 2>&1 || return 1
+    elif [[ "$expected_state" == active && "$current_state" == inactive ]]; then
+        svc start vless-mihomo >/dev/null 2>&1 || return 1
+    elif [[ "$expected_state" == inactive && "$current_state" == active ]]; then
+        svc stop vless-mihomo >/dev/null 2>&1 || return 1
+    else
+        return 0
+    fi
+
+    [[ "$(_mihomo_service_state)" == "$expected_state" ]]
 }
 
 # Mihomo 更新必须把新二进制、完整配置和原运行状态作为一个事务处理。
 _update_mihomo_core_to_version() {
     local channel="$1" version="$2" service="$3" install_func="$4"
-    local snapshot backup_file="" has_nodes=false was_running=false
+    local snapshot backup_file="" has_nodes=false was_running=false service_mutated=false
     [[ "$service" == "vless-mihomo" ]] || return 1
     snapshot=$(_mihomo_update_snapshot_create) || return 1
     [[ -f "$snapshot/service-running" ]] && was_running=true
@@ -9860,21 +9881,22 @@ _update_mihomo_core_to_version() {
         backup_file=""
     fi
     if ! "$install_func" "$channel" true "$version"; then
-        _mihomo_update_rollback "$snapshot" || return 1
+        _mihomo_update_rollback "$snapshot" "$service_mutated" || return 1
         rm -rf "$snapshot"
         return 1
     fi
     if [[ "$has_nodes" == true ]]; then
         if [[ ! -f "$MIHOMO_CONFIG" ]] || ! validate_mihomo_config "$MIHOMO_CONFIG" "$MIHOMO_BIN"; then
-            _mihomo_update_rollback "$snapshot" || return 1
+            _mihomo_update_rollback "$snapshot" "$service_mutated" || return 1
             rm -rf "$snapshot"
             return 1
         fi
         if [[ "$was_running" == true ]]; then
+            service_mutated=true
             if ! svc restart vless-mihomo >/dev/null 2>&1 ||
                ! svc status vless-mihomo >/dev/null 2>&1 ||
                ! _mihomo_ports_healthy "$DB_FILE"; then
-                _mihomo_update_rollback "$snapshot" || return 1
+                _mihomo_update_rollback "$snapshot" "$service_mutated" || return 1
                 rm -rf "$snapshot"
                 return 1
             fi
@@ -11493,8 +11515,8 @@ _mihomo_migration_managed_process_state() {
     esac
 }
 
-# 迁移回滚专用三态查询。普通 svc status 保持其既有二态兼容语义。
-_mihomo_migration_service_state() {
+# 事务专用三态查询。普通 svc status 保持其既有二态兼容语义。
+_mihomo_service_state() {
     local output state rc
     if ! _mihomo_service_definition_exists; then
         _mihomo_migration_managed_process_state
@@ -11526,6 +11548,11 @@ _mihomo_migration_service_state() {
             *) printf '%s\n' error ;;
         esac
     fi
+}
+
+# 保留迁移内部接口；更新事务复用同一个权威状态分类器。
+_mihomo_migration_service_state() {
+    _mihomo_service_state
 }
 
 _mihomo_migration_snapshot_restore() {

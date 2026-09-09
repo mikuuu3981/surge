@@ -2423,14 +2423,34 @@ prepare_mihomo_update_fixture() {
     printf '%s\n' old-mihomo >"$MIHOMO_BIN"
     chmod 711 "$MIHOMO_BIN"
     UPDATE_RUNNING=true
+    UPDATE_MANAGER_STATE=active
+    UPDATE_MANAGER_ERROR_AFTER=0
     UPDATE_FAIL=""
+    DISTRO=debian
+    touch "$SYSTEMD_DIR/vless-mihomo.service"
     : >"$TEST_TMP/update-status-count"
+    : >"$TEST_TMP/update-manager-count"
     : >"$TEST_TMP/update-svc.log"
     _check_core_update_deps() { return 0; }
     _confirm_core_update_version() { return 0; }
     _get_core_backup_dir() { mkdir -p "$TEST_TMP/backups"; printf '%s\n' "$TEST_TMP/backups"; }
     _show_changelog_summary() { :; }
     LOG_FILE="$TEST_TMP/vless-server.log";
+    systemctl() {
+        [[ "$1" == show ]] || return 1
+        local count=0
+        [[ -s "$TEST_TMP/update-manager-count" ]] && count=$(<"$TEST_TMP/update-manager-count")
+        count=$((count + 1))
+        printf '%s\n' "$count" >"$TEST_TMP/update-manager-count"
+        if [[ "$UPDATE_MANAGER_ERROR_AFTER" -gt 0 && "$count" -ge "$UPDATE_MANAGER_ERROR_AFTER" ]]; then
+            return 1
+        fi
+        case "$UPDATE_MANAGER_STATE" in
+            active|inactive) printf '%s\n' "$UPDATE_MANAGER_STATE" ;;
+            error) return 1 ;;
+            *) return 1 ;;
+        esac
+    }
     svc() {
         printf '%s\n' "$1" >>"$TEST_TMP/update-svc.log"
         case "$1" in
@@ -2439,21 +2459,78 @@ prepare_mihomo_update_fixture() {
                 [[ -f "$TEST_TMP/update-status-count" ]] && count=$(<"$TEST_TMP/update-status-count")
                 count=$((count + 1))
                 printf '%s\n' "$count" >"$TEST_TMP/update-status-count"
-                [[ "$UPDATE_RUNNING" == true && ( "$UPDATE_FAIL" != status || "$count" -eq 1 ) ]]
+                [[ "$UPDATE_RUNNING" == true && "$UPDATE_FAIL" != status ]]
                 ;;
-            restart) [[ "$UPDATE_FAIL" != restart ]] || return 1; UPDATE_RUNNING=true ;;
-            start) [[ "$UPDATE_FAIL" != start ]] || return 1; UPDATE_RUNNING=true ;;
-            stop) UPDATE_RUNNING=false ;;
+            restart) [[ "$UPDATE_FAIL" != restart ]] || return 1; UPDATE_RUNNING=true; UPDATE_MANAGER_STATE=active ;;
+            start) [[ "$UPDATE_FAIL" != start ]] || return 1; UPDATE_RUNNING=true; UPDATE_MANAGER_STATE=active ;;
+            stop) UPDATE_RUNNING=false; UPDATE_MANAGER_STATE=inactive ;;
             *) return 1 ;;
         esac
     }
     install_update_mihomo() {
+        touch "$TEST_TMP/update-install-called"
         printf '%s\n' new-mihomo >"$MIHOMO_BIN"
         chmod 755 "$MIHOMO_BIN"
     }
     validate_mihomo_config() { [[ "$UPDATE_FAIL" != validation ]]; }
     _mihomo_ports_healthy() { [[ "$UPDATE_FAIL" != ports ]]; }
 }
+
+test_mihomo_update_service_state_distinguishes_active_inactive_and_error() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    prepare_mihomo_update_fixture
+
+    UPDATE_MANAGER_STATE=active
+    [[ "$(_mihomo_service_state)" == active ]] || return 1
+    UPDATE_MANAGER_STATE=inactive
+    [[ "$(_mihomo_service_state)" == inactive ]] || return 1
+    UPDATE_MANAGER_STATE=error
+    [[ "$(_mihomo_service_state)" == error ]]
+)
+
+test_mihomo_update_status_query_error_aborts_before_mutation() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    prepare_mihomo_update_fixture
+    cp -p "$MIHOMO_BIN" "$TEST_TMP/binary.before"
+    cp -p "$MIHOMO_CONFIG" "$TEST_TMP/config.before"
+    cp -p "$DB_FILE" "$TEST_TMP/db.before"
+    UPDATE_MANAGER_STATE=error
+
+    ! _update_core_to_version Mihomo stable 1.19.29 vless-mihomo install_update_mihomo || return 1
+    cmp -s "$MIHOMO_BIN" "$TEST_TMP/binary.before" || return 1
+    cmp -s "$MIHOMO_CONFIG" "$TEST_TMP/config.before" || return 1
+    cmp -s "$DB_FILE" "$TEST_TMP/db.before" || return 1
+    [[ "$(stat -c '%a' "$MIHOMO_BIN")" == 711 && "$UPDATE_RUNNING" == true ]] || return 1
+    [[ ! -e "$TEST_TMP/update-install-called" && ! -s "$TEST_TMP/update-svc.log" ]] || return 1
+    ! compgen -G "$CFG/.mihomo-update.*" >/dev/null
+)
+
+test_mihomo_update_inactive_validation_rollback_does_not_mutate_service() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    prepare_mihomo_update_fixture
+    UPDATE_RUNNING=false
+    UPDATE_MANAGER_STATE=inactive
+    UPDATE_FAIL=validation
+
+    ! _update_core_to_version Mihomo stable 1.19.29 vless-mihomo install_update_mihomo || return 1
+    [[ "$(<"$MIHOMO_BIN")" == old-mihomo && "$UPDATE_RUNNING" == false ]] || return 1
+    ! grep -Eq '^(start|restart|stop)$' "$TEST_TMP/update-svc.log"
+)
+
+test_mihomo_update_rollback_state_confirmation_error_retains_snapshot() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    prepare_mihomo_update_fixture
+    UPDATE_FAIL=ports
+    UPDATE_MANAGER_ERROR_AFTER=2
+
+    ! _update_core_to_version Mihomo stable 1.19.29 vless-mihomo install_update_mihomo || return 1
+    [[ "$(<"$MIHOMO_BIN")" == old-mihomo && "$UPDATE_RUNNING" == true ]] || return 1
+    compgen -G "$CFG/.mihomo-update.*" >/dev/null
+)
 
 test_mihomo_update_rolls_back_validation_failure() (
     new_fixture
@@ -2494,12 +2571,18 @@ test_mihomo_update_running_success_and_no_node_install() (
     [[ "$(<"$MIHOMO_BIN")" == new-mihomo && "$UPDATE_RUNNING" == true ]] || return 1
     grep -qx restart "$TEST_TMP/update-svc.log" || return 1
 
-    init_db
     UPDATE_RUNNING=false
+    UPDATE_MANAGER_STATE=inactive
     : >"$TEST_TMP/update-svc.log"
     _update_core_to_version Mihomo stable 1.19.30 vless-mihomo install_update_mihomo || return 1
+    [[ "$(<"$MIHOMO_BIN")" == new-mihomo ]] || return 1
+    ! grep -Eq '^(start|restart|stop)$' "$TEST_TMP/update-svc.log" || return 1
+
+    jq '.mihomo = {}' "$DB_FILE" >"$TEST_TMP/db" && mv "$TEST_TMP/db" "$DB_FILE"
+    : >"$TEST_TMP/update-svc.log"
+    _update_core_to_version Mihomo stable 1.19.31 vless-mihomo install_update_mihomo || return 1
     [[ "$(<"$MIHOMO_BIN")" == new-mihomo ]] &&
-        ! grep -Eq '^(start|restart)$' "$TEST_TMP/update-svc.log"
+        ! grep -Eq '^(start|restart|stop)$' "$TEST_TMP/update-svc.log"
 )
 
 test_mihomo_join_files_regenerate_current_transactional_state() (
@@ -2557,6 +2640,10 @@ test_mihomo_migration_process_read_failure_is_error_and_retains_snapshot() (
 
 run_test test_source_does_not_run_cli
 run_test test_direct_execution_pins_log_paths_but_sourcing_allows_fixtures
+run_test test_mihomo_update_service_state_distinguishes_active_inactive_and_error
+run_test test_mihomo_update_status_query_error_aborts_before_mutation
+run_test test_mihomo_update_inactive_validation_rollback_does_not_mutate_service
+run_test test_mihomo_update_rollback_state_confirmation_error_retains_snapshot
 run_test test_mihomo_update_rolls_back_validation_failure
 run_test test_mihomo_update_rolls_back_startup_and_status_failures
 run_test test_mihomo_update_rolls_back_missing_listener
