@@ -22,7 +22,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
     exit 1
 fi
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.5.15 [服务端]
+#  多协议代理一键部署脚本 v3.5.16 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -41,7 +41,7 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.5.15"
+readonly VERSION="3.5.16"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/mikuuu3981/surge"
 readonly SCRIPT_REPO="mikuuu3981/surge"
@@ -187,7 +187,8 @@ init_db() {
     local now tmp
     if [[ -f "$DB_FILE" ]]; then
         chmod 600 "$DB_FILE" 2>/dev/null || true
-        if jq -e '(.xray | type) == "object" and (.singbox | type) == "object" and (.mihomo | type) == "object"' \
+        if jq -e '(.xray | type) == "object" and (.singbox | type) == "object" and
+                  (.mihomo | type) == "object" and all(.mihomo[]; . != [])' \
           "$DB_FILE" >/dev/null 2>&1; then
             _db_lock_release
             return 0
@@ -195,7 +196,8 @@ init_db() {
         tmp=$(mktemp "${DB_FILE}.upgrade.XXXXXX") || { _db_lock_release; return 1; }
         if jq '.xray = (if (.xray | type) == "object" then .xray else {} end) |
                .singbox = (if (.singbox | type) == "object" then .singbox else {} end) |
-               .mihomo = (if (.mihomo | type) == "object" then .mihomo else {} end)' \
+               .mihomo = ((if (.mihomo | type) == "object" then .mihomo else {} end) |
+                          with_entries(select(.value != [])))' \
           "$DB_FILE" >"$tmp" 2>/dev/null && chmod 600 "$tmp" && mv "$tmp" "$DB_FILE"; then
             _db_lock_release
             return 0
@@ -11347,7 +11349,9 @@ _build_mihomo_migration_db() {
                   .[0] as $first | select(any(.[]; . != $first)) ] | length) > 0 then
                 error("conflicting Mihomo protocol and port")
             else
-                .mihomo[$protocol] = ($combined | unique_by(.port))
+                ($combined | unique_by(.port)) as $deduplicated |
+                if ($deduplicated | length) == 0 then del(.mihomo[$protocol])
+                else .mihomo[$protocol] = $deduplicated end
             end
         ) |
         ([.mihomo[]? | records | .[]] | group_by(.port) |

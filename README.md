@@ -31,7 +31,7 @@ nftm
 
 - Snell v4/v5 由 Mihomo v1.19.28+ 提供；一个进程可同时监听多个端口，且每个端口可独立使用不同的 PSK 和版本。
 - Snell+ShadowTLS 使用 Mihomo 内置的 ShadowTLS v3；Snell v6 仍由官方 `snell-server-v6` 提供。
-- 旧版 Snell v4/v5 安装会自动迁移到 Mihomo；冷启动时会等待所有 listener 就绪，迁移失败则自动回滚。
+- 旧版 Snell v4/v5 安装会自动迁移到 Mihomo；冷启动时会等待所有 listener 就绪，迁移失败则自动回滚，并自动清理迁移产生的空协议记录。
 - Mihomo 已纳入核心版本管理和运行状态显示。
 
 REALITY 防偷流量说明：

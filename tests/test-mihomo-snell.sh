@@ -446,6 +446,29 @@ test_init_db_upgrades_legacy_namespaces() (
     jq -e '.mihomo == {} and (.xray | type) == "object" and (.singbox | type) == "object"' "$DB_FILE" >/dev/null
 )
 
+# Break caught: v3.5.15 migration artifacts may contain empty arrays for the
+# three Mihomo protocol kinds that were not installed; startup must repair them
+# so status and protocol management report only real listeners.
+test_init_db_repairs_empty_mihomo_protocol_arrays() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    jq -n '{
+      version:"4.0.0", xray:{}, singbox:{}, meta:{},
+      mihomo:{
+        snell:[],
+        "snell-shadowtls":[],
+        "snell-v5":[{port:22066,psk:"v5-key",version:5}],
+        "snell-v5-shadowtls":[]
+      }
+    }' >"$DB_FILE"
+
+    init_db || return 1
+
+    [[ "$(get_installed_protocols)" == "snell-v5" ]] || return 1
+    jq -e '.mihomo == {"snell-v5":[{port:22066,psk:"v5-key",version:5}]}' "$DB_FILE" >/dev/null
+)
+
 test_protocol_core_classification() (
     new_fixture
     trap cleanup_fixture EXIT
@@ -1392,7 +1415,7 @@ test_release_version_is_rendered_in_header() (
 
     local output
     output=$(TERM=dumb _header 2>&1)
-    [[ "$output" == *"v3.5.15"* ]]
+    [[ "$output" == *"v3.5.16"* ]]
 )
 
 test_validate_mixed_config_with_supplied_real_mihomo() (
@@ -1637,6 +1660,25 @@ test_mihomo_migration_candidate_normalizes_legacy_records() (
       .xray["ss2022-shadowtls"].port == 62001 and .xray["snell-v6"].port == 61001
     ' "$candidate" >/dev/null
     cmp -s "$DB_FILE" <(jq '.' "$DB_FILE") || return 1
+)
+
+# Break caught: migrating a single legacy protocol must not materialize the
+# other Mihomo protocol kinds as empty arrays that appear installed in the UI.
+test_mihomo_migration_candidate_omits_empty_protocol_keys() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    jq -n '{
+      version:"4.0.0", singbox:{}, meta:{}, mihomo:{},
+      xray:{"snell-v5":{port:22066,psk:"v5-key",version:5}}
+    }' >"$DB_FILE"
+
+    local candidate="$TEST_TMP/candidate.json"
+    _build_mihomo_migration_db "$DB_FILE" "$candidate" || return 1
+
+    jq -e '(.mihomo | keys) == ["snell-v5"] and
+        .mihomo["snell-v5"] == [{port:22066,psk:"v5-key",version:5}] and
+        .xray == {}' "$candidate" >/dev/null
 )
 
 test_mihomo_migration_candidate_rejects_conflicts_and_deduplicates_match() (
@@ -2752,6 +2794,7 @@ run_test test_install_mihomo_requires_publisher_verification
 run_test test_install_mihomo_uses_verified_official_asset
 run_test test_init_db_has_mihomo_namespace
 run_test test_init_db_upgrades_legacy_namespaces
+run_test test_init_db_repairs_empty_mihomo_protocol_arrays
 run_test test_protocol_core_classification
 run_test test_legacy_mihomo_records_use_xray_namespace
 run_test test_mihomo_list_ports_prints_every_listener_port
@@ -2817,6 +2860,7 @@ else
 fi
 run_test test_validate_mihomo_config_checks_json_and_binary_arguments
 run_test test_mihomo_migration_candidate_normalizes_legacy_records
+run_test test_mihomo_migration_candidate_omits_empty_protocol_keys
 run_test test_mihomo_migration_candidate_rejects_conflicts_and_deduplicates_match
 run_test test_mihomo_migration_preflight_validation_keeps_legacy_running
 run_test test_mihomo_migration_waits_for_cold_listener_startup
