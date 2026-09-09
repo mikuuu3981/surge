@@ -2399,7 +2399,170 @@ test_force_cleanup_removes_managed_mihomo_resources() (
     grep -q '^disable:vless-mihomo$' "$TEST_TMP/svc.log"
 )
 
+test_direct_execution_pins_log_paths_but_sourcing_allows_fixtures() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    [[ "$MIHOMO_LOG_FILE" == "$VLESS_TEST_MIHOMO_LOG_FILE" && "$SYSTEM_MESSAGES_LOG" == "$VLESS_TEST_MESSAGES_LOG" ]] || return 1
+
+    local trace
+    trace=$(VLESS_TEST_MIHOMO_LOG_FILE="$TEST_TMP/redirected.log" \
+        VLESS_TEST_MESSAGES_LOG="$TEST_TMP/redirected.messages" \
+        bash -x "$SCRIPT" --help 2>&1) || return 1
+    [[ "$trace" == *"MIHOMO_LOG_FILE=/var/log/vless/mihomo.log"* &&
+       "$trace" == *"SYSTEM_MESSAGES_LOG=/var/log/messages"* ]] || return 1
+    [[ "$trace" != *"MIHOMO_LOG_FILE=$TEST_TMP/redirected.log"* &&
+       "$trace" != *"SYSTEM_MESSAGES_LOG=$TEST_TMP/redirected.messages"* ]]
+)
+
+prepare_mihomo_update_fixture() {
+    source "$SCRIPT"
+    init_db
+    jq '.mihomo = {snell:[{port:41001,psk:"v4-one",version:4}]}' "$DB_FILE" >"$TEST_TMP/db" && mv "$TEST_TMP/db" "$DB_FILE"
+    printf '%s\n' '{"listeners":[{"port":41001}]}' >"$MIHOMO_CONFIG"
+    printf '%s\n' old-mihomo >"$MIHOMO_BIN"
+    chmod 711 "$MIHOMO_BIN"
+    UPDATE_RUNNING=true
+    UPDATE_FAIL=""
+    : >"$TEST_TMP/update-status-count"
+    : >"$TEST_TMP/update-svc.log"
+    _check_core_update_deps() { return 0; }
+    _confirm_core_update_version() { return 0; }
+    _get_core_backup_dir() { mkdir -p "$TEST_TMP/backups"; printf '%s\n' "$TEST_TMP/backups"; }
+    _show_changelog_summary() { :; }
+    LOG_FILE="$TEST_TMP/vless-server.log";
+    svc() {
+        printf '%s\n' "$1" >>"$TEST_TMP/update-svc.log"
+        case "$1" in
+            status)
+                local count=0
+                [[ -f "$TEST_TMP/update-status-count" ]] && count=$(<"$TEST_TMP/update-status-count")
+                count=$((count + 1))
+                printf '%s\n' "$count" >"$TEST_TMP/update-status-count"
+                [[ "$UPDATE_RUNNING" == true && ( "$UPDATE_FAIL" != status || "$count" -eq 1 ) ]]
+                ;;
+            restart) [[ "$UPDATE_FAIL" != restart ]] || return 1; UPDATE_RUNNING=true ;;
+            start) [[ "$UPDATE_FAIL" != start ]] || return 1; UPDATE_RUNNING=true ;;
+            stop) UPDATE_RUNNING=false ;;
+            *) return 1 ;;
+        esac
+    }
+    install_update_mihomo() {
+        printf '%s\n' new-mihomo >"$MIHOMO_BIN"
+        chmod 755 "$MIHOMO_BIN"
+    }
+    validate_mihomo_config() { [[ "$UPDATE_FAIL" != validation ]]; }
+    _mihomo_ports_healthy() { [[ "$UPDATE_FAIL" != ports ]]; }
+}
+
+test_mihomo_update_rolls_back_validation_failure() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    prepare_mihomo_update_fixture
+    UPDATE_FAIL=validation
+    ! _update_core_to_version Mihomo stable 1.19.29 vless-mihomo install_update_mihomo || return 1
+    [[ "$(<"$MIHOMO_BIN")" == old-mihomo && "$(stat -c '%a' "$MIHOMO_BIN")" == 711 && "$UPDATE_RUNNING" == true ]]
+)
+
+test_mihomo_update_rolls_back_startup_and_status_failures() (
+    local mode
+    for mode in restart status; do
+        (   new_fixture
+            trap cleanup_fixture EXIT
+            prepare_mihomo_update_fixture
+            UPDATE_FAIL="$mode"
+            ! _update_core_to_version Mihomo stable 1.19.29 vless-mihomo install_update_mihomo || exit 1
+            [[ "$(<"$MIHOMO_BIN")" == old-mihomo && "$UPDATE_RUNNING" == true ]]
+        ) || return 1
+    done
+)
+
+test_mihomo_update_rolls_back_missing_listener() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    prepare_mihomo_update_fixture
+    UPDATE_FAIL=ports
+    ! _update_core_to_version Mihomo stable 1.19.29 vless-mihomo install_update_mihomo || return 1
+    [[ "$(<"$MIHOMO_BIN")" == old-mihomo && "$UPDATE_RUNNING" == true ]]
+)
+
+test_mihomo_update_running_success_and_no_node_install() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    prepare_mihomo_update_fixture
+    _update_core_to_version Mihomo stable 1.19.29 vless-mihomo install_update_mihomo || return 1
+    [[ "$(<"$MIHOMO_BIN")" == new-mihomo && "$UPDATE_RUNNING" == true ]] || return 1
+    grep -qx restart "$TEST_TMP/update-svc.log" || return 1
+
+    init_db
+    UPDATE_RUNNING=false
+    : >"$TEST_TMP/update-svc.log"
+    _update_core_to_version Mihomo stable 1.19.30 vless-mihomo install_update_mihomo || return 1
+    [[ "$(<"$MIHOMO_BIN")" == new-mihomo ]] &&
+        ! grep -Eq '^(start|restart)$' "$TEST_TMP/update-svc.log"
+)
+
+test_mihomo_join_files_regenerate_current_transactional_state() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    prepare_mihomo_transaction_fixture
+    get_connection_addresses() { printf '%s\n' '203.0.113.9|'; }
+    get_ip_suffix() { :; }
+    printf '%s\n' unrelated >"$CFG/vless.join"
+    _apply_mihomo_node_change snell add all '{"port":41001,"psk":"v4-one","version":4}' || return 1
+    _apply_mihomo_node_change snell add all '{"port":41002,"psk":"v4-two","version":4}' || return 1
+    _apply_mihomo_node_change snell-v5 add all '{"port":51001,"psk":"v5-one","version":5}' || return 1
+    _apply_mihomo_node_change snell-shadowtls add all '{"port":42001,"psk":"stls-one","version":4,"sni":"www.example.com","stls_password":"stls-secret"}' || return 1
+    grep -Fq '41001' "$CFG/snell.join" && grep -Fq 'v4-one' "$CFG/snell.join" || return 1
+    grep -Fq '41002' "$CFG/snell.join" && grep -Fq 'v4-two' "$CFG/snell.join" || return 1
+    grep -Fq '51001' "$CFG/snell-v5.join" && grep -Fq 'v5-one' "$CFG/snell-v5.join" || return 1
+    grep -Fq '42001' "$CFG/snell-shadowtls.join" && grep -Fq 'stls-secret' "$CFG/snell-shadowtls.join" && grep -Fq 'www.example.com' "$CFG/snell-shadowtls.join" || return 1
+    grep -Fq unrelated "$CFG/join.txt" && grep -Fq 41002 "$CFG/join.txt" || return 1
+
+    _apply_mihomo_node_change snell replace 41001 '{"port":41001,"psk":"v4-replaced","version":4}' || return 1
+    grep -Fq v4-replaced "$CFG/snell.join" && ! grep -Fq v4-one "$CFG/snell.join" || return 1
+    _apply_mihomo_node_change snell remove 41002 '{}' || return 1
+    ! grep -Fq 41002 "$CFG/snell.join" && ! grep -Fq 41002 "$CFG/join.txt" || return 1
+    _apply_mihomo_node_change snell remove all '{}' || return 1
+    [[ ! -e "$CFG/snell.join" && -f "$CFG/join.txt" ]] || return 1
+    grep -Fq unrelated "$CFG/join.txt" && ! grep -Fq 41001 "$CFG/join.txt" || return 1
+    _apply_mihomo_node_change snell-v5 remove all '{}' || return 1
+    _apply_mihomo_node_change snell-shadowtls remove all '{}' || return 1
+    [[ ! -e "$CFG/snell-v5.join" && ! -e "$CFG/snell-shadowtls.join" ]] || return 1
+    [[ "$(<"$CFG/join.txt")" == unrelated && -f "$CFG/vless.join" ]]
+)
+
+test_mihomo_migration_process_read_failure_is_error_and_retains_snapshot() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    prepare_migration_runtime_fixture
+    new_mihomo_migration_proc_fixture
+    write_mihomo_migration_proc_comm 101 unrelated
+    DISTRO=alpine
+    touch "$OPENRC_DIR/vless-mihomo"
+    rc-service() { [[ "$2" == status ]] && return 127; }
+    _mihomo_migration_test_proc_observe() {
+        [[ "$1" == comm-read-opening ]] || return 0
+        mv "$MIHOMO_MIGRATION_PROC_ROOT/101/comm" "$MIHOMO_MIGRATION_PROC_ROOT/101/comm.gone"
+    }
+    # Fail after preflight so the process read happens while rollback decides whether
+    # it can safely stop Mihomo; uncertainty must retain the migration snapshot.
+    MIG_FAIL_STOP_SERVICE=vless-snell
+    ! migrate_legacy_snell_to_mihomo || return 1
+    assert_mihomo_migration_process_scan_error || return 1
+    local snapshot
+    snapshot=$(find "$CFG" -maxdepth 1 -type d -name '.mihomo-migration.*' -print -quit)
+    [[ -n "$snapshot" && -f "$snapshot/services" ]]
+)
+
 run_test test_source_does_not_run_cli
+run_test test_direct_execution_pins_log_paths_but_sourcing_allows_fixtures
+run_test test_mihomo_update_rolls_back_validation_failure
+run_test test_mihomo_update_rolls_back_startup_and_status_failures
+run_test test_mihomo_update_rolls_back_missing_listener
+run_test test_mihomo_update_running_success_and_no_node_install
+run_test test_mihomo_join_files_regenerate_current_transactional_state
+run_test test_mihomo_migration_process_read_failure_is_error_and_retains_snapshot
 run_test test_mihomo_supported_versions
 run_test test_mihomo_asset_names
 run_test test_get_mihomo_version_from_managed_binary

@@ -67,8 +67,14 @@ else
 fi
 readonly CFG MIHOMO_BIN SYSTEMD_DIR OPENRC_DIR
 readonly MIHOMO_CONFIG="$CFG/mihomo.yaml"
-readonly MIHOMO_LOG_FILE="${VLESS_TEST_MIHOMO_LOG_FILE:-/var/log/vless/mihomo.log}"
-readonly SYSTEM_MESSAGES_LOG="${VLESS_TEST_MESSAGES_LOG:-/var/log/messages}"
+if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
+    MIHOMO_LOG_FILE="${VLESS_TEST_MIHOMO_LOG_FILE:-/var/log/vless/mihomo.log}"
+    SYSTEM_MESSAGES_LOG="${VLESS_TEST_MESSAGES_LOG:-/var/log/messages}"
+else
+    MIHOMO_LOG_FILE="/var/log/vless/mihomo.log"
+    SYSTEM_MESSAGES_LOG="/var/log/messages"
+fi
+readonly MIHOMO_LOG_FILE SYSTEM_MESSAGES_LOG
 readonly MIHOMO_MIGRATION_MARKER="$CFG/.mihomo-snell-migrated-v1"
 readonly ACME_DEFAULT_EMAIL="acme@vaio.com"
 
@@ -3391,6 +3397,91 @@ _save_join_info() {
     done
 }
 
+# 将一个 Mihomo listener 追加为 JOIN 条目。每个端口独立保留其凭据；ShadowTLS
+# 的 SNI/密码也进入 JOIN 原文，供客户端导入时完整恢复。
+_mihomo_append_join_record() {
+    local join_file="$1" protocol="$2" record="$3"
+    local port psk version sni stls_password data_prefix link_func
+    port=$(jq -r '.port' <<<"$record") || return 1
+    psk=$(jq -r '.psk' <<<"$record") || return 1
+    version=$(jq -r '.version' <<<"$record") || return 1
+    case "$protocol" in
+        snell) data_prefix="SNELL"; link_func=gen_snell_link ;;
+        snell-v5) data_prefix="SNELL-V5"; link_func=gen_snell_v5_link ;;
+        snell-shadowtls) data_prefix="SNELL-SHADOWTLS"; link_func=gen_snell_link ;;
+        snell-v5-shadowtls) data_prefix="SNELL-V5-SHADOWTLS"; link_func=gen_snell_v5_link ;;
+        *) return 1 ;;
+    esac
+    if [[ "$protocol" == *shadowtls ]]; then
+        sni=$(jq -r '.sni' <<<"$record") || return 1
+        stls_password=$(jq -r '.stls_password' <<<"$record") || return 1
+    fi
+
+    local ipv4 ipv6 label ip ipfmt data code link
+    IFS='|' read -r ipv4 ipv6 <<< "$(get_connection_addresses)"
+    for label in V4 V6; do
+        ip=$([[ "$label" == V4 ]] && printf '%s' "$ipv4" || printf '%s' "$ipv6")
+        [[ -n "$ip" ]] || continue
+        ipfmt="$ip"; [[ "$label" == V6 ]] && ipfmt="[$ip]"
+        data="${data_prefix}|${ipfmt}|${port}|${psk}|${version}"
+        if [[ "$protocol" == *shadowtls ]]; then
+            data+="|${sni}|${stls_password}"
+        fi
+        code=$(printf '%s' "$data" | base64 -w 0 2>/dev/null || printf '%s' "$data" | base64) || return 1
+        link=$("$link_func" "$ipfmt" "$port" "$psk" "$version") || return 1
+        printf '# %s port %s IPv%s\nJOIN_%s=%s\n%s_%s=%s\n' \
+            "$protocol" "$port" "${label#V}" "$label" "$code" \
+            "${protocol^^}" "$label" "$link" >>"$join_file" || return 1
+        if [[ "$protocol" == *shadowtls ]]; then
+            printf 'SHADOWTLS_SNI=%s\nSHADOWTLS_PASSWORD=%s\n' "$sni" "$stls_password" >>"$join_file" || return 1
+        fi
+    done
+}
+
+# 从规范化 .mihomo 数据重建全部 Snell JOIN 文件，并以所有现存协议 JOIN 文件重建聚合。
+# 调用方已有事务快照；任一写入失败会由调用方回滚，绝不报告半成功节点变更。
+regenerate_mihomo_join_info() {
+    local db_file="${1:-$DB_FILE}" tmpdir protocol record join base aggregate
+    local protocols=(snell snell-v5 snell-shadowtls snell-v5-shadowtls)
+    [[ -f "$db_file" ]] || return 1
+    tmpdir=$(mktemp -d "$CFG/.mihomo-join.XXXXXX") || return 1
+    chmod 700 "$tmpdir" || { rm -rf "$tmpdir"; return 1; }
+    for protocol in "${protocols[@]}"; do
+        join="$tmpdir/${protocol}.join"
+        while IFS= read -r record; do
+            [[ -n "$record" ]] || continue
+            _mihomo_append_join_record "$join" "$protocol" "$record" || { rm -rf "$tmpdir"; return 1; }
+        done < <(db_protocol_configs mihomo "$protocol" 2>/dev/null)
+        [[ -s "$join" ]] || rm -f "$join"
+    done
+
+    aggregate="$tmpdir/join.txt"
+    : >"$aggregate" || { rm -rf "$tmpdir"; return 1; }
+    for join in "$CFG"/*.join; do
+        [[ -f "$join" ]] || continue
+        base=${join##*/}
+        case "$base" in
+            snell.join|snell-v5.join|snell-shadowtls.join|snell-v5-shadowtls.join) continue ;;
+        esac
+        cat "$join" >>"$aggregate" || { rm -rf "$tmpdir"; return 1; }
+    done
+    for protocol in "${protocols[@]}"; do
+        [[ -f "$tmpdir/${protocol}.join" ]] && cat "$tmpdir/${protocol}.join" >>"$aggregate" || true
+    done
+    for protocol in "${protocols[@]}"; do
+        if [[ -f "$tmpdir/${protocol}.join" ]]; then
+            chmod 600 "$tmpdir/${protocol}.join" && mv "$tmpdir/${protocol}.join" "$CFG/${protocol}.join" || { rm -rf "$tmpdir"; return 1; }
+        else
+            rm -f "$CFG/${protocol}.join" || { rm -rf "$tmpdir"; return 1; }
+        fi
+    done
+    if [[ -s "$aggregate" ]]; then
+        chmod 600 "$aggregate" && mv "$aggregate" "$CFG/join.txt" || { rm -rf "$tmpdir"; return 1; }
+    else
+        rm -f "$CFG/join.txt" || { rm -rf "$tmpdir"; return 1; }
+    fi
+    rm -rf "$tmpdir"
+}
 
 # 检测 TLS 主协议并返回外部端口（用于 WS 类回落协议）
 # 注意：Reality (vless) 不支持 WS 回落，只有 vless-vision 和 trojan 可以
@@ -7014,7 +7105,7 @@ gen_shadowtls_link() {
 }
 
 # gen_snell_v5_link 已合并到 gen_snell_link，通过 version 参数区分
-gen_snell_v5_link() { gen_snell_link "$1" "$2" "$3" "${4:-5}" "$5"; }
+gen_snell_v5_link() { gen_snell_link "$1" "$2" "$3" "${4:-5}" "${5:-}"; }
 
 gen_socks_link() {
     local ip="$1" port="$2" username="$3" password="$4" country="${5:-}"
@@ -9723,6 +9814,82 @@ _rollback_core_binary() {
     return 1
 }
 
+_mihomo_update_snapshot_create() {
+    local snapshot
+    mkdir -p "$CFG" || return 1
+    snapshot=$(mktemp -d "$CFG/.mihomo-update.XXXXXX") || return 1
+    chmod 700 "$snapshot" || { rm -rf "$snapshot"; return 1; }
+    if [[ -e "$MIHOMO_BIN" ]]; then
+        cp -p "$MIHOMO_BIN" "$snapshot/binary" || { rm -rf "$snapshot"; return 1; }
+    else
+        touch "$snapshot/binary-absent"
+    fi
+    if svc status vless-mihomo >/dev/null 2>&1; then
+        touch "$snapshot/service-running"
+    else
+        touch "$snapshot/service-stopped"
+    fi
+    printf '%s\n' "$snapshot"
+}
+
+_mihomo_update_rollback() {
+    local snapshot="$1"
+    if [[ -f "$snapshot/binary-absent" ]]; then
+        rm -f "$MIHOMO_BIN" || return 1
+    else
+        cp -p "$snapshot/binary" "$MIHOMO_BIN" || return 1
+    fi
+    if [[ -f "$snapshot/service-running" ]]; then
+        svc restart vless-mihomo >/dev/null 2>&1 || svc start vless-mihomo >/dev/null 2>&1 || return 1
+    else
+        svc stop vless-mihomo >/dev/null 2>&1 || return 1
+    fi
+}
+
+# Mihomo 更新必须把新二进制、完整配置和原运行状态作为一个事务处理。
+_update_mihomo_core_to_version() {
+    local channel="$1" version="$2" service="$3" install_func="$4"
+    local snapshot backup_file="" has_nodes=false was_running=false
+    [[ "$service" == "vless-mihomo" ]] || return 1
+    snapshot=$(_mihomo_update_snapshot_create) || return 1
+    [[ -f "$snapshot/service-running" ]] && was_running=true
+    if jq -e '[(.mihomo // {})[] | if type == "array" then .[] else . end] | length > 0' "$DB_FILE" >/dev/null 2>&1; then
+        has_nodes=true
+    fi
+    if ! backup_file=$(_backup_core_binary vless-mihomo); then
+        backup_file=""
+    fi
+    if ! "$install_func" "$channel" true "$version"; then
+        _mihomo_update_rollback "$snapshot" || return 1
+        rm -rf "$snapshot"
+        return 1
+    fi
+    if [[ "$has_nodes" == true ]]; then
+        if [[ ! -f "$MIHOMO_CONFIG" ]] || ! validate_mihomo_config "$MIHOMO_CONFIG" "$MIHOMO_BIN"; then
+            _mihomo_update_rollback "$snapshot" || return 1
+            rm -rf "$snapshot"
+            return 1
+        fi
+        if [[ "$was_running" == true ]]; then
+            if ! svc restart vless-mihomo >/dev/null 2>&1 ||
+               ! svc status vless-mihomo >/dev/null 2>&1 ||
+               ! _mihomo_ports_healthy "$DB_FILE"; then
+                _mihomo_update_rollback "$snapshot" || return 1
+                rm -rf "$snapshot"
+                return 1
+            fi
+        fi
+    fi
+    rm -rf "$snapshot"
+    _ok "Mihomo 内核已更新 (v${version})"
+    _show_changelog_summary "$MIHOMO_REPO" "$version" 8
+    if [[ -n "$backup_file" ]]; then
+        local backup_dir
+        backup_dir=$(dirname "$backup_file")
+        ls -t "$backup_dir/vless-mihomo_"* 2>/dev/null | tail -n +4 | xargs rm -f 2>/dev/null
+    fi
+}
+
 _update_core_to_version() {
     local core="$1" channel="$2" version="${3#v}" service="$4" install_func="$5"
     _check_core_update_deps || return 1
@@ -9739,6 +9906,11 @@ _update_core_to_version() {
         Mihomo) binary_name="vless-mihomo" ;;
         *) _err "未知核心: $core"; return 1 ;;
     esac
+
+    if [[ "$core" == "Mihomo" ]]; then
+        _update_mihomo_core_to_version "$channel" "$version" "$service" "$install_func"
+        return $?
+    fi
 
     # 备份当前版本
     local backup_file
@@ -10853,6 +11025,13 @@ _mihomo_snapshot_create() {
     else
         touch "$snapshot/config-absent"
     fi
+    mkdir "$snapshot/joins" || { rm -rf "$snapshot"; return 1; }
+    local join_file
+    for join_file in "$CFG"/snell.join "$CFG"/snell-v5.join "$CFG"/snell-shadowtls.join "$CFG"/snell-v5-shadowtls.join "$CFG/join.txt"; do
+        if [[ -f "$join_file" ]]; then
+            cp -p "$join_file" "$snapshot/joins/${join_file##*/}" || { rm -rf "$snapshot"; return 1; }
+        fi
+    done
 
     local service_file
     if [[ "$DISTRO" == "alpine" ]]; then
@@ -10893,6 +11072,14 @@ _mihomo_snapshot_restore() {
     else
         cp -p "$snapshot/mihomo.yaml" "$MIHOMO_CONFIG" || return 1
     fi
+    local join_file
+    for join_file in snell.join snell-v5.join snell-shadowtls.join snell-v5-shadowtls.join join.txt; do
+        if [[ -f "$snapshot/joins/$join_file" ]]; then
+            cp -p "$snapshot/joins/$join_file" "$CFG/$join_file" || return 1
+        else
+            rm -f "$CFG/$join_file" || return 1
+        fi
+    done
 
     if [[ "$DISTRO" == "alpine" ]]; then
         service_file="$OPENRC_DIR/vless-mihomo"
@@ -11053,7 +11240,8 @@ _apply_mihomo_node_change() {
             _mihomo_rollback "$snapshot" "$enable_changed" "$running_changed" || return 1
             return 1
         fi
-        if ! rm -f "$MIHOMO_CONFIG" || ! _remove_mihomo_service_definition; then
+        if ! rm -f "$MIHOMO_CONFIG" || ! _remove_mihomo_service_definition ||
+           ! regenerate_mihomo_join_info "$DB_FILE"; then
             _mihomo_rollback "$snapshot" "$enable_changed" "$running_changed" || return 1
             return 1
         fi
@@ -11090,7 +11278,8 @@ _apply_mihomo_node_change() {
     else
         svc start vless-mihomo
     fi
-    if [[ $? -ne 0 ]] || ! svc status vless-mihomo || ! _mihomo_ports_healthy "$DB_FILE"; then
+    if [[ $? -ne 0 ]] || ! svc status vless-mihomo || ! _mihomo_ports_healthy "$DB_FILE" ||
+       ! regenerate_mihomo_join_info "$DB_FILE"; then
         _mihomo_rollback "$snapshot" "$enable_changed" "$running_changed" || return 1
         return 1
     fi
@@ -11269,10 +11458,20 @@ _mihomo_migration_managed_process_running() {
             ! -L "$comm_path" && -f "$comm_path" && -r "$comm_path" && \
             "$(_mihomo_migration_proc_path_identity "$comm_path")" == "$comm_identity" ]] || return 2
 
-        comm=""
-        IFS= read -r -d '' comm <"$comm_path"
-        read_rc=$?
-        [[ "$read_rc" -eq 1 ]] || return 2
+        # 在子 shell 中使用固定 FD，避免影响调用者；cat 的状态可区分 EOF 与读失败。
+        _mihomo_migration_proc_observe comm-read-opening "$proc_dir" "$comm_path" || return 2
+        if ! comm=$( (
+            exec 9<"$comm_path" || exit 2
+            cat <&9
+            read_rc=$?
+            exec 9<&- || exit 2
+            [[ "$read_rc" -eq 0 ]] || exit 2
+            # 命令替换会剥离尾随换行，使用哨兵保留 comm 的完整字节序列。
+            printf '\001'
+        ) 2>/dev/null ); then
+            return 2
+        fi
+        comm=${comm%$'\001'}
         _mihomo_migration_proc_observe comm-read "$proc_dir" "$comm_path" || return 2
         [[ ! -L "$proc_dir" && -d "$proc_dir" && \
             "$(_mihomo_migration_proc_path_identity "$proc_dir")" == "$pid_identity" && \
@@ -12976,9 +13175,6 @@ gen_snell_server_config() {
     _apply_mihomo_node_change "snell" "${INSTALL_MODE:-add}" "${REPLACE_PORT:-all}" "$record" || return 1
     unset INSTALL_MODE REPLACE_PORT
 
-    _save_join_info "snell" "SNELL|%s|$port|$psk|$version" \
-        gen_snell_link "%s" "$port" "$psk" "$version"
-    cp "$CFG/snell.join" "$CFG/join.txt" 2>/dev/null
     echo "server" > "$CFG/role"
 }
 
@@ -13337,9 +13533,6 @@ gen_snell_v5_server_config() {
     _apply_mihomo_node_change "snell-v5" "${INSTALL_MODE:-add}" "${REPLACE_PORT:-all}" "$record" || return 1
     unset INSTALL_MODE REPLACE_PORT
 
-    _save_join_info "snell-v5" "SNELL-V5|%s|$port|$psk|$version" \
-        gen_snell_v5_link "%s" "$port" "$psk" "$version"
-    cp "$CFG/snell-v5.join" "$CFG/join.txt" 2>/dev/null
     echo "server" > "$CFG/role"
 }
 
