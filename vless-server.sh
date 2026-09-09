@@ -11031,6 +11031,20 @@ _mihomo_ports_healthy() {
     [[ -z "$missing" ]]
 }
 
+# Mihomo 首次启动可能先进入 active，再完成 listener 绑定；按实际就绪条件等待。
+_wait_for_mihomo_ready() {
+    local db_file="${1:-$DB_FILE}" max_attempts="${2:-10}" attempt
+    [[ "$max_attempts" =~ ^[1-9][0-9]*$ ]] || return 1
+
+    for ((attempt=1; attempt<=max_attempts; attempt++)); do
+        if svc status vless-mihomo >/dev/null 2>&1 && _mihomo_ports_healthy "$db_file"; then
+            return 0
+        fi
+        ((attempt < max_attempts)) && sleep 1
+    done
+    return 1
+}
+
 # 创建 Mihomo 节点变更快照。服务状态只记录，不在此处修改。
 _mihomo_snapshot_create() {
     local snapshot
@@ -11301,7 +11315,7 @@ _apply_mihomo_node_change() {
     else
         svc start vless-mihomo
     fi
-    if [[ $? -ne 0 ]] || ! svc status vless-mihomo || ! _mihomo_ports_healthy "$DB_FILE" ||
+    if [[ $? -ne 0 ]] || ! _wait_for_mihomo_ready "$DB_FILE" ||
        ! regenerate_mihomo_join_info "$DB_FILE"; then
         _mihomo_rollback "$snapshot" "$enable_changed" "$running_changed" || return 1
         return 1

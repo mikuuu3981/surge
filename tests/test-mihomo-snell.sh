@@ -1156,6 +1156,26 @@ test_mihomo_transaction_adds_multiple_protocol_port_records() (
     [[ "$(<"$TEST_TMP/svc.log")" == $'status:vless-mihomo\nenabled:vless-mihomo\nvalidate\ncreate\nenable:vless-mihomo\nstart:vless-mihomo\nstatus:vless-mihomo\nhealth\nstatus:vless-mihomo\nenabled:vless-mihomo\nvalidate\nrestart:vless-mihomo\nstatus:vless-mihomo\nhealth\nstatus:vless-mihomo\nenabled:vless-mihomo\nvalidate\nrestart:vless-mihomo\nstatus:vless-mihomo\nhealth' ]]
 )
 
+# Break caught: a cold first Mihomo launch may report the service active before
+# its Snell listener is bound; one immediate health check must not roll back a
+# valid first installation.
+test_mihomo_transaction_waits_for_cold_listener_startup() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    prepare_mihomo_transaction_fixture
+    local health_checks=0
+    sleep() { :; }
+    _mihomo_ports_healthy() {
+        health_checks=$((health_checks + 1))
+        ((health_checks >= 3))
+    }
+
+    _apply_mihomo_node_change snell add all '{"port":41001,"psk":"cold-start","version":4}' || return 1
+
+    jq -e '.mihomo.snell == [{port:41001,psk:"cold-start",version:4}]' "$DB_FILE" >/dev/null || return 1
+    [[ -f "$MIHOMO_CONFIG" && -f "$SYSTEMD_DIR/vless-mihomo.service" ]]
+)
+
 test_mihomo_transaction_replaces_only_selected_port() (
     new_fixture
     trap cleanup_fixture EXIT
@@ -2756,6 +2776,7 @@ run_test test_generate_mihomo_config_rejects_empty_listener_set_atomically
 run_test test_generate_mihomo_config_accepts_scalar_record_and_debug_log_level
 run_test test_generate_mihomo_config_falls_back_from_invalid_log_level
 run_test test_mihomo_transaction_adds_multiple_protocol_port_records
+run_test test_mihomo_transaction_waits_for_cold_listener_startup
 run_test test_mihomo_transaction_replaces_only_selected_port
 run_test test_mihomo_transaction_removes_only_selected_port
 run_test test_mihomo_transaction_removes_final_node_and_shared_service
