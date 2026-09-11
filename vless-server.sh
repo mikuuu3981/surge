@@ -11280,7 +11280,7 @@ _apply_mihomo_node_change() {
             return 1
         fi
         if ! rm -f "$MIHOMO_CONFIG" || ! _remove_mihomo_service_definition ||
-           ! regenerate_mihomo_join_info "$DB_FILE"; then
+           ! regenerate_mihomo_join_info "$DB_FILE" || ! rm -f "$MIHOMO_BIN"; then
             _mihomo_rollback "$snapshot" "$enable_changed" "$running_changed" || return 1
             return 1
         fi

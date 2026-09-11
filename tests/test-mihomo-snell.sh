@@ -1232,7 +1232,8 @@ test_mihomo_transaction_removes_only_selected_port() (
         .mihomo["snell-v5"][0].port == 51001' "$DB_FILE" >/dev/null || return 1
     jq -e '([.listeners[].port] | index(41002)) == null and
         ([.listeners[].port] | index(41001)) != null and
-        ([.listeners[].port] | index(51001)) != null' "$MIHOMO_CONFIG" >/dev/null
+        ([.listeners[].port] | index(51001)) != null' "$MIHOMO_CONFIG" >/dev/null || return 1
+    [[ -x "$MIHOMO_BIN" ]]
 )
 
 test_mihomo_transaction_removes_final_node_and_shared_service() (
@@ -1248,6 +1249,19 @@ test_mihomo_transaction_removes_final_node_and_shared_service() (
     [[ ! -e "$MIHOMO_CONFIG" && ! -e "$SYSTEMD_DIR/vless-mihomo.service" ]] || return 1
     [[ "$TEST_SERVICE_RUNNING" == false ]] || return 1
     [[ "$(<"$TEST_TMP/svc.log")" == $'status:vless-mihomo\nenabled:vless-mihomo\nstop:vless-mihomo\ndisable:vless-mihomo' ]]
+)
+
+# Removing the final Mihomo-backed protocol must also remove the now-unused
+# managed core binary, matching the lifecycle of the other shared cores.
+test_mihomo_transaction_removes_unused_core_binary() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    prepare_mihomo_transaction_fixture
+    _apply_mihomo_node_change snell add all '{"port":41001,"psk":"v4-one","version":4}' || return 1
+
+    _apply_mihomo_node_change snell remove all '{}' || return 1
+
+    [[ ! -e "$MIHOMO_BIN" ]]
 )
 
 test_mihomo_transaction_validation_failure_restores_exact_bytes() (
@@ -2844,6 +2858,7 @@ run_test test_mihomo_transaction_waits_for_cold_listener_startup
 run_test test_mihomo_transaction_replaces_only_selected_port
 run_test test_mihomo_transaction_removes_only_selected_port
 run_test test_mihomo_transaction_removes_final_node_and_shared_service
+run_test test_mihomo_transaction_removes_unused_core_binary
 run_test test_mihomo_transaction_validation_failure_restores_exact_bytes
 run_test test_mihomo_transaction_restart_failure_restores_and_restarts_previous_state
 run_test test_mihomo_transaction_enables_existing_disabled_service
