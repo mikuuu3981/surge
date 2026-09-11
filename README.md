@@ -11,6 +11,28 @@ wget -O vless-server.sh https://raw.githubusercontent.com/mikuuu3981/surge/main/
 ```bash
 vless
 ```
+
+## 脚本更新渠道
+
+在主菜单选择“检查脚本更新”后，可选择：
+
+- 稳定版：跟随 `main` 分支，按发布版本升级（默认）。
+- 测试版：跟随 `dev` 分支；即使版本号相同，只要脚本内容有变化也可以升级。
+
+仓库发布 `dev` 分支后，已安装用户可直接检查并升级测试版：
+
+```bash
+vless --update-dev
+```
+
+首次直接使用测试版：
+
+```bash
+wget -O vless-server.sh https://raw.githubusercontent.com/mikuuu3981/surge/dev/vless-server.sh && chmod +x vless-server.sh && bash vless-server.sh
+```
+
+如果远端尚未发布 `dev` 分支，测试版升级会安全失败，不会替换当前脚本。测试版可能包含尚未稳定的功能。升级前会校验 GitHub Blob SHA 和 Bash 语法，并在原脚本旁保留 `.bak` 备份；更新渠道不会被永久记住，下次仍默认稳定版。
+
 ![image](https://tc.mozisen.com/i/29701fc8-b1bb-44a1-996f-afb172199829.png)
 
 ![image](https://tc.mozisen.com/i/db7cd00e-62ab-40a8-ab37-06b9dbf8084b.png)

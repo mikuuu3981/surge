@@ -8,7 +8,7 @@ umask 077
 if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) )); then
     if [[ "${1:-}" == "--help" || "${1:-}" == "-h" ]]; then
         echo "用法: $0 [选项]"
-        echo "选项: --sync-traffic, --show-traffic, --tg-bot-poll, --check-expire, --setup-expire-cron, --help"
+        echo "选项: --update-dev, --sync-traffic, --show-traffic, --tg-bot-poll, --check-expire, --setup-expire-cron, --help"
         echo "运行功能需要 Bash 4.1 或更高版本。"
         if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
             return 0
@@ -46,14 +46,15 @@ readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/mikuuu3981/surge"
 readonly SCRIPT_REPO="mikuuu3981/surge"
 readonly SCRIPT_SOURCE_REPO="mikuuu3981/surge"
-SCRIPT_SOURCE_REF="${VLESS_SCRIPT_SOURCE_REF:-main}"
+readonly SCRIPT_STABLE_REF="main"
+readonly SCRIPT_TEST_REF="dev"
+SCRIPT_SOURCE_REF="${VLESS_SCRIPT_SOURCE_REF:-$SCRIPT_STABLE_REF}"
 if [[ ! "$SCRIPT_SOURCE_REF" =~ ^[A-Za-z0-9._/-]+$ ]]; then
     echo "错误: VLESS_SCRIPT_SOURCE_REF 格式无效" >&2
     exit 1
 fi
 readonly SCRIPT_SOURCE_REF
 readonly SCRIPT_SOURCE_PATH="vless-server.sh"
-readonly SCRIPT_RAW_URL="https://raw.githubusercontent.com/${SCRIPT_SOURCE_REPO}/${SCRIPT_SOURCE_REF}/${SCRIPT_SOURCE_PATH}"
 if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
     CFG="${VLESS_TEST_CFG:-/etc/vless-reality}"
     MIHOMO_BIN="${VLESS_TEST_MIHOMO_BIN:-/usr/local/bin/vless-mihomo}"
@@ -8343,29 +8344,40 @@ _verify_github_blob() {
     [[ "$actual" == "$expected" ]]
 }
 
+_script_update_ref() {
+    case "$1" in
+        stable) printf '%s\n' "$SCRIPT_STABLE_REF" ;;
+        dev) printf '%s\n' "$SCRIPT_TEST_REF" ;;
+        *) return 1 ;;
+    esac
+}
+
 _verify_script_blob() {
-    local file="$1"
-    _verify_github_blob "$SCRIPT_SOURCE_REPO" "$SCRIPT_SOURCE_REF" "$SCRIPT_SOURCE_PATH" "$file" &&
+    local file="$1" ref="${2:-$SCRIPT_SOURCE_REF}"
+    _verify_github_blob "$SCRIPT_SOURCE_REPO" "$ref" "$SCRIPT_SOURCE_PATH" "$file" &&
         bash -n "$file"
 }
 
 _fetch_script_tmp() {
     local connect_timeout="${1:-10}"
     local max_time="${2:-}"
-    local tmp_file
+    local ref="${3:-$SCRIPT_SOURCE_REF}"
+    local tmp_file raw_url
+    [[ "$ref" =~ ^[A-Za-z0-9._/-]+$ ]] || return 1
+    raw_url="https://raw.githubusercontent.com/${SCRIPT_SOURCE_REPO}/${ref}/${SCRIPT_SOURCE_PATH}"
     tmp_file=$(mktemp 2>/dev/null) || return 1
     if [[ -n "$max_time" ]]; then
-        if ! curl -sL --connect-timeout "$connect_timeout" --max-time "$max_time" -o "$tmp_file" "$SCRIPT_RAW_URL"; then
+        if ! curl -sL --connect-timeout "$connect_timeout" --max-time "$max_time" -o "$tmp_file" "$raw_url"; then
             rm -f "$tmp_file"
             return 1
         fi
     else
-        if ! curl -sL --connect-timeout "$connect_timeout" -o "$tmp_file" "$SCRIPT_RAW_URL"; then
+        if ! curl -sL --connect-timeout "$connect_timeout" -o "$tmp_file" "$raw_url"; then
             rm -f "$tmp_file"
             return 1
         fi
     fi
-    if ! _verify_script_blob "$tmp_file"; then
+    if ! _verify_script_blob "$tmp_file" "$ref"; then
         rm -f "$tmp_file"
         _err "脚本下载内容与 GitHub 仓库 blob 校验不一致" >&2
         return 1
@@ -8414,8 +8426,8 @@ _get_latest_tag_version() {
 }
 
 _get_latest_script_version_from_raw() {
-    local version tmp_file
-    tmp_file=$(_fetch_script_tmp 5 10) || return 1
+    local ref="${1:-$SCRIPT_SOURCE_REF}" version tmp_file
+    tmp_file=$(_fetch_script_tmp 5 10 "$ref") || return 1
     version=$(_extract_script_version "$tmp_file")
     rm -f "$tmp_file"
     [[ -z "$version" ]] && return 1
@@ -8426,6 +8438,7 @@ _get_latest_script_version_from_raw() {
 _get_latest_script_version() {
     local use_cache="${1:-true}"
     local force="${2:-false}"
+    local raw_ref="${3:-$SCRIPT_SOURCE_REF}"
     local version=""
 
     _init_version_cache
@@ -8448,7 +8461,7 @@ _get_latest_script_version() {
         version=$(_get_latest_tag_version "$SCRIPT_REPO")
     fi
     if [[ -z "$version" ]]; then
-        version=$(_get_latest_script_version_from_raw)
+        version=$(_get_latest_script_version_from_raw "$raw_ref")
     fi
     [[ -z "$version" ]] && return 1
 
@@ -30475,87 +30488,223 @@ manage_port_forwarding_backends() {
 # 脚本更新与主入口
 #═══════════════════════════════════════════════════════════════════════════════
 
-do_update() {
+select_script_update_channel() {
     _header
-    echo -e "  ${W}脚本更新${NC}"
+    echo -e "  ${W}脚本更新渠道${NC}"
     _line
-    
-    echo -e "  当前版本: ${G}v${VERSION}${NC}"
-    _info "检查最新版本..."
-    
-    _init_version_cache
-    local tmp_file="" remote_ver=""
-    remote_ver=$(_get_latest_script_version "true" "false")
-    if [[ -z "$remote_ver" ]]; then
-        _err "无法获取远程版本信息"
+    _item "1" "稳定版 ${D}(main，默认)${NC}"
+    _item "2" "测试版 ${Y}(dev)${NC}"
+    _item "0" "返回"
+    _line
+
+    local choice
+    while true; do
+        read -rp "  请选择更新渠道 [1]: " choice || return 1
+        choice="${choice:-1}"
+        case "$choice" in
+            1) SELECTED_SCRIPT_UPDATE_CHANNEL="stable"; return 0 ;;
+            2) SELECTED_SCRIPT_UPDATE_CHANNEL="dev"; return 0 ;;
+            0) return 1 ;;
+            *) _err "无效选择" ;;
+        esac
+    done
+}
+
+_current_script_path() {
+    readlink -f "$0" 2>/dev/null
+}
+
+_system_script_path() {
+    printf '%s\n' /usr/local/bin/vless-server.sh
+}
+
+_script_update_is_available() {
+    local channel="$1" current_file="$2" remote_file="$3" remote_ver="$4"
+    case "$channel" in
+        stable) _version_gt "$remote_ver" "$VERSION" ;;
+        dev) ! cmp -s "$current_file" "$remote_file" ;;
+        *) return 1 ;;
+    esac
+}
+
+# 在目标文件所在目录创建已校验的更新副本，确保最终 mv 不跨文件系统。
+_stage_script_update() {
+    local source_file="$1" target_file="$2" mode="${3:-755}" staged
+    staged=$(mktemp "${target_file}.update.XXXXXX" 2>/dev/null) || return 1
+    if [[ "$mode" == preserve ]]; then
+        cp -p "$source_file" "$staged" 2>/dev/null || { rm -f "$staged"; return 1; }
+    elif [[ "$mode" =~ ^[0-7]{3,4}$ ]]; then
+        install -m "$mode" "$source_file" "$staged" 2>/dev/null || { rm -f "$staged"; return 1; }
+    else
+        rm -f "$staged"
         return 1
     fi
-    
-    echo -e "  最新版本: ${C}v${remote_ver}${NC}"
-    
-    # 比较版本 - 只有远程版本更新时才提示更新
-    if ! _version_gt "$remote_ver" "$VERSION"; then
-        _ok "已是最新版本"
-        return 0
+    if ! bash -n "$staged"; then
+        rm -f "$staged"
+        return 1
     fi
-    
+    printf '%s\n' "$staged"
+}
+
+# 返回 0 表示已更新，2 表示无需更新或用户取消，1 表示更新失败。
+_update_script_from_channel() {
+    local channel="$1" ref channel_label prompt
+    local tmp_file="" remote_ver="" downloaded_ver="" script_path system_script system_target
+    local script_stage="" system_stage="" rollback_stage="" resolved_system="" sync_system=false
+    ref=$(_script_update_ref "$channel") || { _err "未知脚本更新渠道: $channel"; return 1; }
+    [[ "$channel" == dev ]] && channel_label="测试版 (dev)" || channel_label="稳定版 (main)"
+
+    _header
+    echo -e "  ${W}脚本更新 - ${channel_label}${NC}"
     _line
-    read -rp "  发现新版本，是否更新? [Y/n]: " confirm
-    if [[ "$confirm" =~ ^[nN]$ ]]; then
-        return 0
+    echo -e "  当前版本: ${G}v${VERSION}${NC}"
+    _info "检查${channel_label}..."
+
+    script_path=$(_current_script_path)
+    if [[ -z "$script_path" || ! -f "$script_path" ]]; then
+        _err "无法确定当前脚本路径"
+        return 1
     fi
-    
+
+    if [[ "$channel" == stable ]]; then
+        _init_version_cache
+        remote_ver=$(_get_latest_script_version "true" "false" "$ref")
+        if [[ -z "$remote_ver" ]]; then
+            _err "无法获取远程版本信息"
+            return 1
+        fi
+        echo -e "  最新版本: ${C}v${remote_ver}${NC}"
+        if ! _script_update_is_available "$channel" "$script_path" "$script_path" "$remote_ver"; then
+            _ok "已是最新稳定版"
+            return 2
+        fi
+        prompt="发现新稳定版本，是否更新? [Y/n]: "
+    else
+        tmp_file=$(_fetch_script_tmp 10 "" "$ref")
+        if [[ -z "$tmp_file" || ! -f "$tmp_file" ]]; then
+            _err "下载测试版失败，请检查网络连接或 dev 分支"
+            return 1
+        fi
+        remote_ver=$(_extract_script_version "$tmp_file")
+        if [[ -z "$remote_ver" || ! "$remote_ver" =~ ^[0-9A-Za-z._-]+$ ]]; then
+            rm -f "$tmp_file"
+            _err "测试版脚本缺少有效版本标识，已拒绝更新"
+            return 1
+        fi
+        echo -e "  测试渠道: ${Y}dev${NC}"
+        echo -e "  远程版本: ${C}v${remote_ver}${NC}"
+        if ! _script_update_is_available "$channel" "$script_path" "$tmp_file" "$remote_ver"; then
+            rm -f "$tmp_file"
+            _ok "当前脚本内容已与 dev 分支一致"
+            return 2
+        fi
+        _warn "测试版可能包含尚未稳定的功能，请确认已了解风险"
+        prompt="发现 dev 分支新内容，是否更新? [Y/n]: "
+    fi
+
+    _line
+    local confirm=""
+    if ! read -rp "  $prompt" confirm; then
+        [[ -n "$tmp_file" ]] && rm -f "$tmp_file"
+        _warn "未读取到更新确认，已取消"
+        return 2
+    fi
+    if [[ "$confirm" =~ ^[nN]$ ]]; then
+        [[ -n "$tmp_file" ]] && rm -f "$tmp_file"
+        return 2
+    fi
+
     _info "更新中..."
-    tmp_file=$(_fetch_script_tmp 10)
+    if [[ -z "$tmp_file" ]]; then
+        tmp_file=$(_fetch_script_tmp 10 "" "$ref")
+    fi
     if [[ -z "$tmp_file" || ! -f "$tmp_file" ]]; then
         _err "下载失败，请检查网络连接"
         return 1
     fi
-    local downloaded_ver
     downloaded_ver=$(_extract_script_version "$tmp_file")
     if [[ -z "$downloaded_ver" || ! "$downloaded_ver" =~ ^[0-9A-Za-z._-]+$ ]]; then
         rm -f "$tmp_file"
         _err "下载脚本缺少有效版本标识，已拒绝更新"
         return 1
     fi
-    if [[ -n "$downloaded_ver" && "$downloaded_ver" != "$remote_ver" ]]; then
-        remote_ver="$downloaded_ver"
-        echo "$remote_ver" > "$SCRIPT_VERSION_CACHE_FILE" 2>/dev/null
-    fi
-    
-    # 获取当前脚本路径
-    local script_path=$(readlink -f "$0")
-    local script_dir=$(dirname "$script_path")
-    local script_name=$(basename "$script_path")
-    
-    # 系统目录的脚本路径
-    local system_script="/usr/local/bin/vless-server.sh"
-    
-    # 备份当前脚本
-    cp "$script_path" "${script_path}.bak" 2>/dev/null
-    
-    # 替换当前运行的脚本
-    if mv "$tmp_file" "$script_path" && chmod +x "$script_path"; then
-        # 如果当前脚本不是系统目录的脚本，也更新系统目录
-        if [[ "$script_path" != "$system_script" && -f "$system_script" ]]; then
-            cp -f "$script_path" "$system_script" 2>/dev/null
-            chmod +x "$system_script" 2>/dev/null
-            _info "已同步更新系统目录脚本"
-        fi
-        
-        _ok "更新成功! v${VERSION} -> v${remote_ver}"
-        echo ""
-        echo -e "  ${C}请重新运行脚本以使用新版本${NC}"
-        echo -e "  ${D}备份文件: ${script_path}.bak${NC}"
-        _line
-        exit 0
-    else
-        # 恢复备份
-        [[ -f "${script_path}.bak" ]] && mv "${script_path}.bak" "$script_path"
+    if [[ "$channel" == stable ]] && ! _version_gt "$downloaded_ver" "$VERSION"; then
         rm -f "$tmp_file"
-        _err "更新失败"
+        _ok "下载内容不是更高版本，已取消替换"
+        return 2
+    fi
+    remote_ver="$downloaded_ver"
+    [[ "$channel" == stable ]] && echo "$remote_ver" > "$SCRIPT_VERSION_CACHE_FILE" 2>/dev/null
+
+    system_script=$(_system_script_path)
+    system_target="$system_script"
+    if [[ -e "$system_script" || -L "$system_script" ]]; then
+        resolved_system=$(readlink -f "$system_script" 2>/dev/null || true)
+        [[ -n "$resolved_system" ]] && system_target="$resolved_system"
+        if [[ "$system_target" != "$script_path" && -f "$system_target" ]]; then
+            sync_system=true
+        fi
+    fi
+
+    script_stage=$(_stage_script_update "$tmp_file" "$script_path") || {
+        rm -f "$tmp_file"
+        _err "无法在当前脚本目录暂存更新"
+        return 1
+    }
+    if [[ "$sync_system" == true ]]; then
+        system_stage=$(_stage_script_update "$tmp_file" "$system_target") || {
+            rm -f "$tmp_file" "$script_stage"
+            _err "无法在系统脚本目录暂存更新"
+            return 1
+        }
+    fi
+    if ! cp -p "$script_path" "${script_path}.bak" 2>/dev/null; then
+        rm -f "$tmp_file" "$script_stage" "$system_stage"
+        _err "无法备份当前脚本，已取消更新"
         return 1
     fi
+    rm -f "$tmp_file"
+
+    if ! mv -f "$script_stage" "$script_path"; then
+        rm -f "$script_stage" "$system_stage"
+        _err "当前脚本替换失败"
+        return 1
+    fi
+    if [[ "$sync_system" == true ]] && ! mv -f "$system_stage" "$system_target"; then
+        rm -f "$system_stage"
+        rollback_stage=$(_stage_script_update "${script_path}.bak" "$script_path" preserve 2>/dev/null || true)
+        if [[ -n "$rollback_stage" ]] && mv -f "$rollback_stage" "$script_path"; then
+            _err "系统目录脚本同步失败，当前脚本已回滚"
+        else
+            rm -f "$rollback_stage"
+            _err "系统目录脚本同步与自动回滚均失败，原脚本备份位于 ${script_path}.bak"
+        fi
+        return 1
+    fi
+    [[ "$sync_system" == true ]] && _info "已同步更新系统目录脚本"
+
+    _ok "更新成功! v${VERSION} -> v${remote_ver} (${channel_label})"
+    echo ""
+    echo -e "  ${C}请重新运行脚本以使用新版本${NC}"
+    echo -e "  ${D}备份文件: ${script_path}.bak${NC}"
+    _line
+    return 0
+}
+
+do_update() {
+    local channel="${1:-}" rc
+    if [[ -z "$channel" ]]; then
+        select_script_update_channel || return 0
+        channel="$SELECTED_SCRIPT_UPDATE_CHANNEL"
+    fi
+
+    if _update_script_from_channel "$channel"; then
+        exit 0
+    else
+        rc=$?
+    fi
+    [[ $rc -eq 2 ]] && return 0
+    return "$rc"
 }
 
 main_menu() {
@@ -30774,10 +30923,18 @@ dispatch_cli() {
         install_expire_check_cron
         exit 0
         ;;
+    --update-dev)
+        # 从 dev 分支检查并安装测试版脚本。
+        check_root
+        init_log
+        do_update dev
+        exit $?
+        ;;
     --help|-h)
         echo "用法: $0 [选项]"
         echo ""
         echo "选项:"
+        echo "  --update-dev         从 dev 分支检查并升级测试版脚本"
         echo "  --sync-traffic       同步流量数据到数据库 (用于定时任务)"
         echo "  --show-traffic       显示实时流量统计"
         echo "  --tg-bot-poll        处理 Telegram 用户机器人消息 (用于定时任务)"

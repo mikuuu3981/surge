@@ -136,6 +136,275 @@ test_source_does_not_run_cli() (
     declare -F main_menu >/dev/null
 )
 
+test_script_update_channel_refs() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+
+    [[ "$(_script_update_ref stable)" == main ]] || return 1
+    [[ "$(_script_update_ref dev)" == dev ]] || return 1
+    ! _script_update_ref unknown >/dev/null 2>&1
+)
+
+test_script_update_channel_selection_defaults_to_stable_and_supports_dev() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    CYAN= YELLOW= GREEN= RED= G= Y= C= D= W= NC=
+    _header() { :; }
+    _line() { :; }
+    _item() { :; }
+
+    select_script_update_channel <<<'2' || return 1
+    [[ "$SELECTED_SCRIPT_UPDATE_CHANNEL" == dev ]] || return 1
+    select_script_update_channel <<<'' || return 1
+    [[ "$SELECTED_SCRIPT_UPDATE_CHANNEL" == stable ]]
+)
+
+test_dev_script_fetch_uses_dev_ref_and_blob_verification() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    curl() {
+        local output="" url=""
+        while (($#)); do
+            case "$1" in
+                -o) output="$2"; shift 2 ;;
+                --connect-timeout|--max-time) shift 2 ;;
+                -sL) shift ;;
+                *) url="$1"; shift ;;
+            esac
+        done
+        printf '%s\n' '#!/bin/bash' 'readonly VERSION="3.5.16"' >"$output"
+        printf '%s\n' "$url" >"$TEST_TMP/fetch-url"
+    }
+    _verify_github_blob() {
+        printf '%s|%s|%s\n' "$1" "$2" "$3" >"$TEST_TMP/verified-blob"
+    }
+
+    local tmp_file
+    tmp_file=$(_fetch_script_tmp 5 10 dev) || return 1
+    [[ "$(<"$TEST_TMP/fetch-url")" == "https://raw.githubusercontent.com/mikuuu3981/surge/dev/vless-server.sh" ]] || return 1
+    [[ "$(<"$TEST_TMP/verified-blob")" == "mikuuu3981/surge|dev|vless-server.sh" ]] || return 1
+    rm -f "$tmp_file"
+)
+
+test_dev_script_fetch_removes_unverified_download() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    curl() {
+        local output=""
+        while (($#)); do
+            case "$1" in
+                -o) output="$2"; shift 2 ;;
+                --connect-timeout|--max-time) shift 2 ;;
+                *) shift ;;
+            esac
+        done
+        printf '%s\n' '#!/bin/bash' 'readonly VERSION="3.5.16"' >"$output"
+        printf '%s\n' "$output" >"$TEST_TMP/staged-path"
+    }
+    _verify_github_blob() {
+        printf '%s\n' "$2" >"$TEST_TMP/failed-ref"
+        return 1
+    }
+    _err() { :; }
+
+    ! _fetch_script_tmp 5 10 dev >/dev/null || return 1
+    [[ "$(<"$TEST_TMP/failed-ref")" == dev ]] || return 1
+    [[ ! -e "$(<"$TEST_TMP/staged-path")" ]]
+)
+
+test_dev_script_fetch_rejects_syntax_errors_and_removes_download() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    curl() {
+        local output=""
+        while (($#)); do
+            case "$1" in
+                -o) output="$2"; shift 2 ;;
+                --connect-timeout|--max-time) shift 2 ;;
+                *) shift ;;
+            esac
+        done
+        printf '%s\n' '#!/bin/bash' 'if then' >"$output"
+        printf '%s\n' "$output" >"$TEST_TMP/syntax-staged-path"
+    }
+    _verify_github_blob() { return 0; }
+    _err() { :; }
+
+    ! _fetch_script_tmp 5 10 dev >/dev/null 2>&1 || return 1
+    [[ ! -e "$(<"$TEST_TMP/syntax-staged-path")" ]]
+)
+
+test_dev_script_update_detects_same_version_content_changes() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    local current="$TEST_TMP/current.sh" remote="$TEST_TMP/remote.sh"
+    printf '%s\n' '#!/bin/bash' 'readonly VERSION="3.5.16"' 'echo stable' >"$current"
+    printf '%s\n' '#!/bin/bash' 'readonly VERSION="3.5.16"' 'echo dev' >"$remote"
+
+    _script_update_is_available dev "$current" "$remote" 3.5.16 || return 1
+    ! _script_update_is_available stable "$current" "$remote" 3.5.16 || return 1
+    cp "$remote" "$current"
+    ! _script_update_is_available dev "$current" "$remote" 3.5.16
+)
+
+test_dev_script_update_installs_changed_same_version_script() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    CYAN= YELLOW= GREEN= RED= G= Y= C= D= W= NC=
+    local current="$TEST_TMP/current.sh" remote="$TEST_TMP/remote.sh" system="$TEST_TMP/system.sh"
+    printf '%s\n' '#!/bin/bash' 'readonly VERSION="3.5.16"' 'echo stable' >"$current"
+    printf '%s\n' '#!/bin/bash' 'readonly VERSION="3.5.16"' 'echo dev' >"$remote"
+    cp "$current" "$system"
+    chmod 755 "$current" "$remote" "$system"
+    _current_script_path() { printf '%s\n' "$current"; }
+    _system_script_path() { printf '%s\n' "$system"; }
+    _fetch_script_tmp() {
+        [[ "${3:-}" == dev ]] || return 1
+        cp "$remote" "$TEST_TMP/staged.sh"
+        printf '%s\n' "$TEST_TMP/staged.sh"
+    }
+    _header() { :; }
+    _line() { :; }
+    _info() { :; }
+    _ok() { :; }
+    _warn() { :; }
+    _err() { :; }
+
+    _update_script_from_channel dev <<<'' >/dev/null || return 1
+    grep -qx 'echo dev' "$current" || return 1
+    grep -qx 'echo dev' "$system" || return 1
+    grep -qx 'echo stable' "${current}.bak"
+)
+
+test_stable_script_update_downloads_from_main() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    CYAN= YELLOW= GREEN= RED= G= Y= C= D= W= NC=
+    local current="$TEST_TMP/current.sh" remote="$TEST_TMP/remote.sh"
+    printf '%s\n' '#!/bin/bash' 'readonly VERSION="3.5.16"' 'echo stable-old' >"$current"
+    printf '%s\n' '#!/bin/bash' 'readonly VERSION="3.5.17"' 'echo stable-new' >"$remote"
+    chmod 755 "$current" "$remote"
+    _current_script_path() { printf '%s\n' "$current"; }
+    _system_script_path() { printf '%s\n' "$TEST_TMP/system.sh"; }
+    _get_latest_script_version() {
+        printf '%s\n' "$3" >"$TEST_TMP/stable-version-ref"
+        printf '%s\n' 3.5.17
+    }
+    _fetch_script_tmp() {
+        printf '%s\n' "$3" >"$TEST_TMP/stable-fetch-ref"
+        cp "$remote" "$TEST_TMP/staged-stable.sh"
+        printf '%s\n' "$TEST_TMP/staged-stable.sh"
+    }
+    _header() { :; }
+    _line() { :; }
+    _info() { :; }
+    _ok() { :; }
+    _warn() { :; }
+    _err() { :; }
+
+    _update_script_from_channel stable <<<'' >/dev/null || return 1
+    [[ "$(<"$TEST_TMP/stable-version-ref")" == main ]] || return 1
+    [[ "$(<"$TEST_TMP/stable-fetch-ref")" == main ]] || return 1
+    grep -qx 'echo stable-new' "$current"
+)
+
+test_dev_script_update_rolls_back_when_system_sync_fails() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    CYAN= YELLOW= GREEN= RED= G= Y= C= D= W= NC=
+    local current="$TEST_TMP/current.sh" remote="$TEST_TMP/remote.sh" system="$TEST_TMP/system.sh"
+    printf '%s\n' '#!/bin/bash' 'readonly VERSION="3.5.16"' 'echo stable' >"$current"
+    printf '%s\n' '#!/bin/bash' 'readonly VERSION="3.5.16"' 'echo dev' >"$remote"
+    cp "$current" "$system"
+    chmod 711 "$current"
+    chmod 755 "$remote" "$system"
+    _current_script_path() { printf '%s\n' "$current"; }
+    _system_script_path() { printf '%s\n' "$system"; }
+    _fetch_script_tmp() {
+        cp "$remote" "$TEST_TMP/staged-sync-failure.sh"
+        printf '%s\n' "$TEST_TMP/staged-sync-failure.sh"
+    }
+    _header() { :; }
+    _line() { :; }
+    _info() { :; }
+    _ok() { :; }
+    _warn() { :; }
+    _err() { :; }
+    cp() {
+        local target="${!#}"
+        [[ "$target" == "$system" ]] && return 1
+        command cp "$@"
+    }
+    mv() {
+        local target="${!#}"
+        [[ "$target" == "$system" ]] && return 1
+        command mv "$@"
+    }
+
+    ! _update_script_from_channel dev <<<'' >/dev/null || return 1
+    grep -qx 'echo stable' "$current" || return 1
+    grep -qx 'echo stable' "$system" || return 1
+    grep -qx 'echo stable' "${current}.bak" || return 1
+    [[ "$(stat -c %a "$current")" == 711 ]]
+)
+
+test_dev_script_update_requires_explicit_confirmation_input() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    CYAN= YELLOW= GREEN= RED= G= Y= C= D= W= NC=
+    local current="$TEST_TMP/current.sh" remote="$TEST_TMP/remote.sh"
+    printf '%s\n' '#!/bin/bash' 'readonly VERSION="3.5.16"' 'echo stable' >"$current"
+    printf '%s\n' '#!/bin/bash' 'readonly VERSION="3.5.16"' 'echo dev' >"$remote"
+    chmod 755 "$current" "$remote"
+    _current_script_path() { printf '%s\n' "$current"; }
+    _system_script_path() { printf '%s\n' "$TEST_TMP/system.sh"; }
+    _fetch_script_tmp() {
+        cp "$remote" "$TEST_TMP/staged-no-confirm.sh"
+        printf '%s\n' "$TEST_TMP/staged-no-confirm.sh"
+    }
+    _header() { :; }
+    _line() { :; }
+    _info() { :; }
+    _ok() { :; }
+    _warn() { :; }
+    _err() { :; }
+
+    ! _update_script_from_channel dev </dev/null >/dev/null || return 1
+    grep -qx 'echo stable' "$current" || return 1
+    [[ ! -e "${current}.bak" ]]
+)
+
+test_update_dev_cli_dispatches_dev_channel() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    check_root() { :; }
+    init_log() { :; }
+    do_update() { printf '%s\n' "$1" >"$TEST_TMP/update-channel"; }
+
+    (dispatch_cli --update-dev) || return 1
+    [[ "$(<"$TEST_TMP/update-channel")" == dev ]]
+)
+
+test_script_update_wrapper_propagates_channel_failure() (
+    new_fixture
+    trap cleanup_fixture EXIT
+    source "$SCRIPT"
+    _update_script_from_channel() { return 1; }
+
+    ! (do_update dev)
+)
+
 test_mihomo_supported_versions() (
     new_fixture
     trap cleanup_fixture EXIT
@@ -2789,6 +3058,18 @@ run_test test_mihomo_update_rolls_back_missing_listener
 run_test test_mihomo_update_running_success_and_no_node_install
 run_test test_mihomo_join_files_regenerate_current_transactional_state
 run_test test_mihomo_migration_process_read_failure_is_error_and_retains_snapshot
+run_test test_script_update_channel_refs
+run_test test_script_update_channel_selection_defaults_to_stable_and_supports_dev
+run_test test_dev_script_fetch_uses_dev_ref_and_blob_verification
+run_test test_dev_script_fetch_removes_unverified_download
+run_test test_dev_script_fetch_rejects_syntax_errors_and_removes_download
+run_test test_dev_script_update_detects_same_version_content_changes
+run_test test_dev_script_update_installs_changed_same_version_script
+run_test test_stable_script_update_downloads_from_main
+run_test test_dev_script_update_rolls_back_when_system_sync_fails
+run_test test_dev_script_update_requires_explicit_confirmation_input
+run_test test_update_dev_cli_dispatches_dev_channel
+run_test test_script_update_wrapper_propagates_channel_failure
 run_test test_mihomo_supported_versions
 run_test test_mihomo_asset_names
 run_test test_get_mihomo_version_from_managed_binary
