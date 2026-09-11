@@ -289,14 +289,14 @@ test_stable_script_update_downloads_from_main() (
     source "$SCRIPT"
     CYAN= YELLOW= GREEN= RED= G= Y= C= D= W= NC=
     local current="$TEST_TMP/current.sh" remote="$TEST_TMP/remote.sh"
-    printf '%s\n' '#!/bin/bash' 'readonly VERSION="3.5.16"' 'echo stable-old' >"$current"
-    printf '%s\n' '#!/bin/bash' 'readonly VERSION="3.5.17"' 'echo stable-new' >"$remote"
+    printf '%s\n' '#!/bin/bash' 'readonly VERSION="3.5.17"' 'echo stable-old' >"$current"
+    printf '%s\n' '#!/bin/bash' 'readonly VERSION="3.5.18"' 'echo stable-new' >"$remote"
     chmod 755 "$current" "$remote"
     _current_script_path() { printf '%s\n' "$current"; }
     _system_script_path() { printf '%s\n' "$TEST_TMP/system.sh"; }
     _get_latest_script_version() {
         printf '%s\n' "$3" >"$TEST_TMP/stable-version-ref"
-        printf '%s\n' 3.5.17
+        printf '%s\n' 3.5.18
     }
     _fetch_script_tmp() {
         printf '%s\n' "$3" >"$TEST_TMP/stable-fetch-ref"
@@ -1698,7 +1698,7 @@ test_release_version_is_rendered_in_header() (
 
     local output
     output=$(TERM=dumb _header 2>&1)
-    [[ "$output" == *"v3.5.16"* ]]
+    [[ "$output" == *"v3.5.17"* ]]
 )
 
 test_validate_mixed_config_with_supplied_real_mihomo() (
