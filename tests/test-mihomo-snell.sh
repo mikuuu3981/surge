@@ -289,14 +289,14 @@ test_stable_script_update_downloads_from_main() (
     source "$SCRIPT"
     CYAN= YELLOW= GREEN= RED= G= Y= C= D= W= NC=
     local current="$TEST_TMP/current.sh" remote="$TEST_TMP/remote.sh"
-    printf '%s\n' '#!/bin/bash' 'readonly VERSION="3.5.17"' 'echo stable-old' >"$current"
-    printf '%s\n' '#!/bin/bash' 'readonly VERSION="3.5.18"' 'echo stable-new' >"$remote"
+    printf '%s\n' '#!/bin/bash' 'readonly VERSION="3.5.18"' 'echo stable-old' >"$current"
+    printf '%s\n' '#!/bin/bash' 'readonly VERSION="3.5.19"' 'echo stable-new' >"$remote"
     chmod 755 "$current" "$remote"
     _current_script_path() { printf '%s\n' "$current"; }
     _system_script_path() { printf '%s\n' "$TEST_TMP/system.sh"; }
     _get_latest_script_version() {
         printf '%s\n' "$3" >"$TEST_TMP/stable-version-ref"
-        printf '%s\n' 3.5.18
+        printf '%s\n' 3.5.19
     }
     _fetch_script_tmp() {
         printf '%s\n' "$3" >"$TEST_TMP/stable-fetch-ref"
@@ -1392,7 +1392,7 @@ prepare_mihomo_transaction_fixture() {
     cat >"$MIHOMO_BIN" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' validate >>"$MIHOMO_TX_LOG"
-[[ "$1" == "-t" && "$2" == "-f" && -f "$3" ]] || exit 1
+[[ "$1" == "-t" && "$2" == "-d" && "$3" == "$VLESS_TEST_CFG" && "$4" == "-f" && -f "$5" ]] || exit 1
 [[ "$TEST_FAIL_VALIDATION" == false ]]
 EOF
     chmod 700 "$MIHOMO_BIN"
@@ -1698,7 +1698,7 @@ test_release_version_is_rendered_in_header() (
 
     local output
     output=$(TERM=dumb _header 2>&1)
-    [[ "$output" == *"v3.5.17"* ]]
+    [[ "$output" == *"v3.5.18"* ]]
 )
 
 test_validate_mixed_config_with_supplied_real_mihomo() (
@@ -1726,13 +1726,13 @@ test_validate_mihomo_config_checks_json_and_binary_arguments() (
     cat >"$VLESS_TEST_MIHOMO_BIN" <<'EOF'
 #!/usr/bin/env bash
 printf '%s\n' "$*" >"$MIHOMO_TEST_ARGS_FILE"
-[[ "$1" == "-t" && "$2" == "-f" && "$3" == "$MIHOMO_TEST_CONFIG" ]]
+[[ "$1" == "-t" && "$2" == "-d" && "$3" == "$VLESS_TEST_CFG" && "$4" == "-f" && "$5" == "$MIHOMO_TEST_CONFIG" ]]
 EOF
     chmod 700 "$VLESS_TEST_MIHOMO_BIN"
     export MIHOMO_TEST_ARGS_FILE="$args_file" MIHOMO_TEST_CONFIG="$config"
 
     validate_mihomo_config "$config" "$VLESS_TEST_MIHOMO_BIN"
-    [[ "$(<"$args_file")" == "-t -f $config" ]]
+    [[ "$(<"$args_file")" == "-t -d $CFG -f $config" ]]
 
     rm -f "$args_file"
     printf '%s\n' 'not-json' >"$config"

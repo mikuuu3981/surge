@@ -55,6 +55,20 @@ nftm
 - Snell+ShadowTLS 使用 Mihomo 内置的 ShadowTLS v3；Snell v6 仍由官方 `snell-server-v6` 提供。
 - 旧版 Snell v4/v5 安装会自动迁移到 Mihomo；冷启动时会等待所有 listener 就绪，迁移失败则自动回滚，并自动清理迁移产生的空协议记录。
 - Mihomo 已纳入核心版本管理和运行状态显示。
+- Mihomo 服务端共用“分流管理”中的规则，支持预设 GeoSite/GeoIP、自定义域名/IP、广告及访问限制、IPv4/IPv6 匹配、直连、WARP 和链式代理；修改规则后会校验配置并重启生效。升级后进入脚本会自动同步旧版全部直连的配置，未配置规则时仍默认直连。
+- WARP 支持 WGCF 与官方 SOCKS5 模式；官方模式的 UDP 保持直连。GeoSite/GeoIP 首次使用需要从 GitHub 下载规则库，之后每 24 小时更新。
+- Instagram/INS 服务端分流：安装 Mihomo 协议后，在“分流管理 → 配置分流规则 → 添加分流规则”选择 `i) Instagram/INS (仅 Mihomo)`，再选择出口和 IPv4/IPv6 匹配范围。使用 [Yuu-rules 的 Instagram 域名规则集](https://github.com/Yuu518/Yuu-rules/blob/rule-set/mihomo/geosite/instagram.list)（包含 `instagram.com`、`cdninstagram.com`、`ig.me` 等），以 `.mrs` 格式下载并每 24 小时更新，缓存位于 `/etc/vless-reality/rule-providers/yuu-instagram.mrs`。此选项不是默认启用，添加、覆盖或删除只更新 Mihomo；Xray/Sing-box 不应用这条规则，客户端订阅也不因此增加规则。首次下载需能访问 `raw.githubusercontent.com`。
+- Mihomo 负载均衡：`leastPing` 对应最低延迟，`roundRobin`/`random` 对应轮询，`leastLoad` 对应一致性哈希（不等同于 Xray 的最低负载）。不支持的链式协议（如 NaiveProxy）或缺失的出口会报错并保留原配置，不会静默改为直连。
+
+安全回归测试（仅临时配置，不安装服务或修改防火墙）：
+
+```bash
+bash tests/test-mihomo-routing.sh
+# 可选：使用已有 Mihomo 二进制做配置校验及回环流量测试（需要 Python 3）
+VLESS_TEST_MIHOMO_BIN=/path/to/mihomo bash tests/test-mihomo-routing.sh
+# Instagram 专属选项、规则集和跨内核隔离测试
+bash tests/test-mihomo-instagram.sh
+```
 
 REALITY 防偷流量说明：
 

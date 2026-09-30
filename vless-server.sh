@@ -22,7 +22,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
     exit 1
 fi
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.5.17 [服务端]
+#  多协议代理一键部署脚本 v3.5.18 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -41,7 +41,7 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.5.17"
+readonly VERSION="3.5.18"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/mikuuu3981/surge"
 readonly SCRIPT_REPO="mikuuu3981/surge"
@@ -4211,8 +4211,8 @@ generate_xray_config() {
     local balancers="[]"
     local has_routing=false
     
-    # 获取分流规则
-    local rules=$(db_get_routing_rules)
+    # 获取此内核适用的分流规则
+    local rules=$(db_get_routing_rules xray)
     
     if [[ -n "$rules" && "$rules" != "[]" ]]; then
         # 收集所有用到的出口 (支持多出口)
@@ -11779,7 +11779,7 @@ set_mihomo_log_level() {
 # 从数据库重建 Mihomo 的完整配置；JSON 同时是有效 YAML。
 generate_mihomo_config() {
     local db_file="${1:-$DB_FILE}" output_file="${2:-$MIHOMO_CONFIG}"
-    local listen_addr log_level listeners protocol records record listener port config tmp
+    local listen_addr log_level listeners protocol records record listener port config tmp routing
     local success_count=0
     local -A seen_ports=()
 
@@ -11811,13 +11811,19 @@ generate_mihomo_config() {
     done
     [[ "$success_count" -gt 0 ]] || return 1
 
-    config=$(jq -n --arg log_level "$log_level" --argjson listeners "$listeners" '{
+    routing=$(gen_mihomo_routing_config "$db_file") || return 1
+    config=$(jq -n --arg log_level "$log_level" --argjson listeners "$listeners" --argjson routing "$routing" '{
         mode: "rule",
         "log-level": $log_level,
         ipv6: true,
         listeners: $listeners,
-        rules: ["MATCH,DIRECT"]
-    }') || return 1
+        sniffer: {
+            enable: true,
+            "parse-pure-ip": true,
+            "override-destination": false,
+            sniff: {HTTP:{ports:[80,8080,8880]},TLS:{ports:[443,8443]}}
+        }
+    } + $routing') || return 1
 
     mkdir -p "$(dirname "$output_file")" || return 1
     tmp=$(mktemp "${output_file}.tmp.XXXXXX") || return 1
@@ -11835,7 +11841,8 @@ validate_mihomo_config() {
     local binary="${2:-$MIHOMO_BIN}"
     jq empty "$config_file" >/dev/null 2>&1 || return 1
     [[ -x "$binary" ]] || return 1
-    "$binary" -t -f "$config_file" >/dev/null 2>&1
+    # 与 systemd/OpenRC 实际启动使用同一个目录，确保 GeoData 校验不读错缓存。
+    "$binary" -t -d "$CFG" -f "$config_file" >/dev/null 2>&1
 }
 
 # 生成 Sing-box 统一配置 (Hy2 + TUIC 共用一个进程)
@@ -11900,8 +11907,8 @@ generate_singbox_config() {
     local warp_has_endpoint=false
     local warp_endpoint_data=""
     
-    # 获取分流规则
-    local rules=$(db_get_routing_rules)
+    # 获取此内核适用的分流规则
+    local rules=$(db_get_routing_rules singbox)
     
     if [[ -n "$rules" && "$rules" != "[]" ]]; then
         # 收集所有用到的出口 (支持多出口)
@@ -14332,7 +14339,21 @@ ensure_mihomo_runtime_consistency() {
     elif ! svc status vless-mihomo >/dev/null 2>&1 || ! _mihomo_ports_healthy "$DB_FILE"; then
         need_repair=true
     fi
-    [[ "$need_repair" == "false" ]] && return 0
+    if [[ "$need_repair" == "false" ]]; then
+        # 旧版本 MATCH,DIRECT 也是合法配置；校验成功并不代表与数据库分流一致。
+        local expected
+        expected=$(gen_mihomo_routing_config "$DB_FILE") || return 1
+        if jq -e --argjson expected "$expected" '
+            {proxies:(.proxies // []),"proxy-groups":(.["proxy-groups"] // []),
+             "rule-providers":(.["rule-providers"] // {}),rules:.rules} ==
+            ($expected | {proxies,"proxy-groups","rule-providers":(.["rule-providers"] // {}),rules})
+        ' "$MIHOMO_CONFIG" >/dev/null 2>&1; then
+            return 0
+        fi
+        _info "检测到 Mihomo 分流配置与数据库不一致，正在同步..."
+        _regenerate_mihomo_routing_config
+        return $?
+    fi
 
     _info "检测到 Mihomo 配置或监听异常，正在自动修复..."
     generate_mihomo_config || return 1
@@ -15599,6 +15620,7 @@ declare -A ROUTING_PRESETS=(
     [telegram]="geosite:telegram"
     [google]="geosite:google"
     [ads]="geosite:category-ads-all"
+    [mihomo-instagram]="rule-set:yuu-instagram"
 )
 
 # 需要同时匹配 IP 的预设规则 (这些服务客户端会直连 IP)
@@ -15621,6 +15643,7 @@ declare -A ROUTING_PRESET_NAMES=(
     [telegram]="Telegram"
     [google]="Google"
     [ads]="广告屏蔽"
+    [mihomo-instagram]="Instagram/INS (仅 Mihomo)"
 )
 
 # 数据库：添加分流规则
@@ -15715,10 +15738,14 @@ db_del_routing_rule() {
     fi
 }
 
-# 数据库：获取所有分流规则
+# 数据库：获取分流规则；不指定内核时用于菜单展示全部规则。
+# Mihomo 专属规则不能进入其他内核的规则/出口收集阶段。
 db_get_routing_rules() {
-    [[ ! -f "$DB_FILE" ]] && echo "[]" && return
-    jq -r '.routing_rules // []' "$DB_FILE" 2>/dev/null
+    local core="${1:-all}" db_file="${2:-$DB_FILE}"
+    [[ ! -f "$db_file" ]] && printf '%s\n' '[]' && return
+    jq --arg core "$core" '[.routing_rules[]? |
+        select($core == "all" or $core == "mihomo" or .type != "mihomo-instagram")
+    ]' "$db_file" 2>/dev/null
 }
 
 # 数据库：检查规则是否存在
@@ -16190,7 +16217,7 @@ gen_xray_ip_routing_rules() {
 
 # 生成 Xray 分流路由配置 (支持多出口)
 gen_xray_routing_rules() {
-    local rules=$(db_get_routing_rules)
+    local rules=$(db_get_routing_rules xray)
     [[ -z "$rules" || "$rules" == "[]" ]] && return
     
     local result="[]"
@@ -16341,7 +16368,7 @@ gen_xray_routing_rules() {
 
 # 生成 Sing-box 分流路由配置 (支持多出口)
 gen_singbox_routing_rules() {
-    local rules=$(db_get_routing_rules)
+    local rules=$(db_get_routing_rules singbox)
     [[ -z "$rules" || "$rules" == "[]" ]] && return
     
     local result="[]"
@@ -16479,6 +16506,227 @@ gen_singbox_routing_rules() {
     
     result=$(echo "$result" | jq --argjson v6 "$all_ipv6" --argjson v4 "$all_ipv4" --argjson other "$all_other" '. + $v6 + $v4 + $other')
     [[ "$result" != "[]" ]] && echo "$result"
+}
+
+# Mihomo 出口使用独立名称，避免与内置 DIRECT/REJECT 冲突。
+_mihomo_outbound_name() {
+    local outbound="$1" ip_version="${2:-prefer_ipv4}"
+    case "$outbound" in
+        block) printf '%s\n' REJECT ;;
+        direct|warp|chain:*|balancer:*)
+            # 规则语法以逗号和括号分隔，不能直接嵌入这些字符。
+            [[ "$outbound" != *[,$'\r\n'\(\)]* ]] || return 1
+            printf '%s\n' "${outbound/:/-}-${ip_version}"
+            ;;
+        *) printf 'Mihomo 不支持分流出口: %s\n' "$outbound" >&2; return 1 ;;
+    esac
+}
+
+_mihomo_ip_version() {
+    case "$1" in
+        ipv4|ipv4_only) printf '%s\n' ipv4 ;;
+        ipv6|ipv6_only) printf '%s\n' ipv6 ;;
+        prefer_ipv4) printf '%s\n' ipv4-prefer ;;
+        prefer_ipv6) printf '%s\n' ipv6-prefer ;;
+        as_is|asis) printf '%s\n' dual ;;
+        *) return 1 ;;
+    esac
+}
+
+# 将数据库中的链式节点转换成 Mihomo 原生代理，不复用客户端订阅转换器。
+gen_mihomo_chain_outbound() {
+    local node_name="$1" tag="$2" ip_version="$3" node
+    node=$(jq -c --arg name "$node_name" '.chain_proxy.nodes[]? | select(.name == $name)' "${4:-$DB_FILE}") || return 1
+    [[ -n "$node" && "$node" != null ]] || { printf 'Mihomo 分流节点不存在: %s\n' "$node_name" >&2; return 1; }
+    printf '%s\n' "$node" | jq -e --arg tag "$tag" --arg ip "$ip_version" '
+        . as $n |
+        {name:$tag, type:.type, server:.server, port:(.port | tonumber), "ip-version":$ip, udp:true} |
+        if .server == null or .port < 1 or .port > 65535 then error("invalid proxy address") else . end |
+        if $n.type == "socks" or $n.type == "http" then
+            .type = (if $n.type == "socks" then "socks5" else "http" end) |
+            if ($n.username // "") != "" then .username=$n.username | .password=($n.password // "") else . end
+        elif $n.type == "shadowsocks" then
+            .type="ss" | .cipher=$n.method | .password=$n.password
+        elif $n.type == "vmess" or $n.type == "vless" then
+            .uuid=$n.uuid |
+            if $n.type == "vmess" then
+                .alterId=(($n.alterId // 0) | tonumber) | .cipher="auto" | .tls=($n.tls == "tls")
+            else
+                .tls=($n.security == "tls" or $n.security == "reality") |
+                if ($n.encryption // "none") != "none" and ($n.encryption // "") != "" then
+                    .encryption=$n.encryption
+                else . end |
+                if ($n.flow // "") != "" then .flow=$n.flow else . end |
+                if $n.security == "reality" then
+                    .["reality-opts"]={"public-key":$n.publicKey,"short-id":($n.shortId // "")} |
+                    .["client-fingerprint"]=($n.fingerprint // "chrome")
+                else . end
+            end |
+            .servername=(if ($n.sni // "") != "" then $n.sni else $n.server end) |
+            if ($n.network // "tcp") == "ws" then
+                .network="ws" | .["ws-opts"]={path:($n.wsPath // "/"),headers:{Host:($n.wsHost // $n.server)}}
+            elif ($n.network // "tcp") == "grpc" then
+                .network="grpc" | .["grpc-opts"]={"grpc-service-name":($n.serviceName // "")}
+            elif ($n.network // "tcp") != "tcp" then error("unsupported Mihomo transport") else . end
+        elif $n.type == "trojan" or $n.type == "hysteria2" then
+            .password=$n.password | .sni=(if ($n.sni // "") != "" then $n.sni else $n.server end) |
+            .["skip-cert-verify"]=($n.insecure == "1" or $n.insecure == 1 or $n.insecure == true)
+        else error("unsupported Mihomo chain protocol: " + $n.type) end |
+        if $n.via_warp == true then .["dialer-proxy"]="warp-as_is" else . end
+    '
+}
+
+# WARP 支持官方 SOCKS5 和 WGCF；缺少配置时拒绝生成，不能静默直连。
+gen_mihomo_warp_outbound() {
+    local tag="$1" ip_version="$2" mode
+    mode=$(jq -r '.routing.warp_mode // "wgcf"' "${3:-$DB_FILE}") || return 1
+    if [[ "$mode" == official ]]; then
+        [[ "$WARP_OFFICIAL_PORT" =~ ^[0-9]+$ ]] && ((WARP_OFFICIAL_PORT > 0 && WARP_OFFICIAL_PORT < 65536)) || return 1
+        jq -n --arg tag "$tag" --arg ip "$ip_version" --argjson port "$WARP_OFFICIAL_PORT" \
+            '{name:$tag,type:"socks5",server:"127.0.0.1",port:$port,udp:false,"ip-version":$ip}'
+    elif [[ "$mode" == wgcf && -f "$WARP_CONF_FILE" ]]; then
+        jq -e --arg tag "$tag" --arg ip "$ip_version" '
+            .endpoint as $ep |
+            ($ep | capture("^(?:\\[(?<host6>[^]]+)\\]|(?<host4>[^:]+)):(?<port>[0-9]+)$")) as $addr |
+            {name:$tag,type:"wireguard",server:($addr.host6 // $addr.host4),port:($addr.port | tonumber),
+             ip:(.address_v4 | split("/")[0]),ipv6:(.address_v6 | split("/")[0]),
+             "private-key":.private_key,"public-key":.public_key,mtu:1280,udp:true,"ip-version":$ip} |
+            if .port < 1 or .port > 65535 or .["private-key"] == null or .["public-key"] == null then
+                error("invalid WARP configuration") else . end
+        ' "$WARP_CONF_FILE"
+    else
+        printf '%s\n' 'Mihomo 分流引用了 WARP，但 WARP 未配置' >&2
+        return 1
+    fi
+}
+
+# 输出可与基础配置合并的 JSON；数据库数组顺序即规则优先级，all 最后匹配。
+gen_mihomo_routing_config() {
+    local db_file="${1:-$DB_FILE}"
+    local rules proxies='[]' groups='[]' requests='[]' names='[]'
+    local rule outbound version tag ip proxy group node node_tag members strategy routing direct_version=as_is
+    local has_warp=false
+    rules=$(db_get_routing_rules mihomo "$db_file") || return 1
+    [[ -n "$rules" ]] || return 1
+
+    # 为每个实际引用的出口/IP 策略建立独立代理。
+    requests=$(printf '%s\n' "$rules" | jq '[.[] | {outbound,ip_version:(.ip_version // "prefer_ipv4")}] | unique') || return 1
+    while IFS= read -r rule; do
+        outbound=$(printf '%s\n' "$rule" | jq -r '.outbound') || return 1
+        version=$(printf '%s\n' "$rule" | jq -r '.ip_version') || return 1
+        tag=$(_mihomo_outbound_name "$outbound" "$version") || return 1
+        ip=$(_mihomo_ip_version "$version") || return 1
+        case "$outbound" in
+            block) continue ;;
+            direct) proxy=$(jq -n --arg tag "$tag" --arg ip "$ip" '{name:$tag,type:"direct","ip-version":$ip}') || return 1 ;;
+            warp) proxy=$(gen_mihomo_warp_outbound "$tag" "$ip" "$db_file") || return 1; has_warp=true ;;
+            chain:*) proxy=$(gen_mihomo_chain_outbound "${outbound#chain:}" "$tag" "$ip" "$db_file") || return 1 ;;
+            balancer:*)
+                group=$(jq -c --arg name "${outbound#balancer:}" '.balancer_groups[]? | select(.name == $name)' "$db_file") || return 1
+                [[ -n "$group" && "$group" != null ]] || { printf 'Mihomo 负载均衡组不存在: %s\n' "$outbound" >&2; return 1; }
+                members='[]'
+                while IFS= read -r node; do
+                    node_tag=$(_mihomo_outbound_name "chain:$node" "$version") || return 1
+                    proxy=$(gen_mihomo_chain_outbound "$node" "$node_tag" "$ip" "$db_file") || return 1
+                    proxies=$(printf '%s\n' "$proxies" | jq --argjson p "$proxy" '. + [$p]') || return 1
+                    members=$(printf '%s\n' "$members" | jq --arg tag "$node_tag" '. + [$tag]') || return 1
+                done < <(printf '%s\n' "$group" | jq -r '.nodes[]?')
+                [[ "$members" != '[]' ]] || return 1
+                strategy=$(printf '%s\n' "$group" | jq -r '.strategy') || return 1
+                # Mihomo 无 Xray 的 random/leastLoad：分别映射轮询/一致性哈希。
+                group=$(jq -n --arg tag "$tag" --arg strategy "$strategy" --argjson members "$members" '
+                    {name:$tag,proxies:$members,url:"https://www.gstatic.com/generate_204",interval:300} |
+                    if $strategy == "leastPing" then .type="url-test"
+                    elif $strategy == "leastLoad" then .type="load-balance" | .strategy="consistent-hashing"
+                    elif $strategy == "random" or $strategy == "roundRobin" then .type="load-balance" | .strategy="round-robin"
+                    else error("unsupported balancer strategy") end') || return 1
+                groups=$(printf '%s\n' "$groups" | jq --argjson g "$group" '. + [$g]') || return 1
+                continue ;;
+        esac
+        proxies=$(printf '%s\n' "$proxies" | jq --argjson p "$proxy" '. + [$p]') || return 1
+    done < <(printf '%s\n' "$requests" | jq -c '.[]')
+
+    # 双层链式代理需要一个不受目标 IP 匹配策略限制的 WARP dialer。
+    if printf '%s\n' "$proxies" | jq -e 'any(.[]; .["dialer-proxy"] == "warp-as_is")' >/dev/null; then
+        proxy=$(gen_mihomo_warp_outbound warp-as_is dual "$db_file") || return 1
+        proxies=$(printf '%s\n' "$proxies" | jq --argjson p "$proxy" '. + [$p]') || return 1
+        has_warp=true
+    fi
+    [[ ! -f "$CFG/direct_ip_version" ]] || read -r direct_version <"$CFG/direct_ip_version"
+    ip=$(_mihomo_ip_version "$direct_version") || return 1
+    local fallback=DIRECT
+    if [[ "$ip" != dual ]]; then
+        fallback=direct-default
+        proxies=$(printf '%s\n' "$proxies" | jq --arg ip "$ip" '. + [{name:"direct-default",type:"direct","ip-version":$ip}]') || return 1
+    fi
+    names=$(jq -n --argjson p "$proxies" --argjson g "$groups" '[$p[].name,$g[].name,"DIRECT","REJECT"] | unique') || return 1
+
+    # 预设的额外 IP 匹配（Google/Netflix/Telegram）和域名规则为 OR 关系。
+    local preset_ips
+    preset_ips='{"google":"geoip:google","netflix":"geoip:netflix","telegram":"geoip:telegram"}'
+    routing=$(printf '%s\n' "$rules" | jq -e --argjson names "$names" --argjson ips "$preset_ips" --arg fallback "$fallback" '
+        def policy:
+            if .outbound == "block" then "REJECT"
+            else (.outbound | sub(":";"-")) + "-" + (.ip_version // "prefer_ipv4") end;
+        def family:
+            if .ip_version == "ipv4_only" then "IP-CIDR,0.0.0.0/0"
+            elif .ip_version == "ipv6_only" then "IP-CIDR6,::/0" else null end;
+        def emit($match;$family;$tag):
+            if $family == null then $match + "," + $tag
+            else "AND,((" + $match + "),(" + $family + "))," + $tag end;
+        def matcher:
+            if startswith("geosite:") then "GEOSITE," + ltrimstr("geosite:")
+            elif startswith("geoip:") then "GEOIP," + ltrimstr("geoip:")
+            elif test("^[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+(/[0-9]+)?$") then
+                "IP-CIDR," + . + (if contains("/") then "" else "/32" end)
+            elif test("^[0-9a-fA-F:]+(/[0-9]+)?$") and contains(":") then
+                "IP-CIDR6," + . + (if contains("/") then "" else "/128" end)
+            else "DOMAIN-SUFFIX," + . end;
+        # 和其他内核一致，所有流量规则按 IPv6/IPv4/不限制排列在末尾。
+        ([.[] | select(.type != "all")] +
+         [.[] | select(.type == "all" and .ip_version == "ipv6_only")] +
+         [.[] | select(.type == "all" and .ip_version == "ipv4_only")] +
+         [.[] | select(.type == "all" and .ip_version != "ipv4_only" and .ip_version != "ipv6_only")]) |
+        [ .[] | . as $r | policy as $tag | family as $family |
+          if ($names | index($tag)) == null then error("undefined routing policy: " + $tag) else . end |
+          if .type == "all" then ($family // "MATCH") + "," + $tag
+          elif .type == "mihomo-instagram" then emit("RULE-SET,yuu-instagram";$family;$tag)
+          else
+            (((.domains // "") | split(",")) + [($ips[.type] // empty)])[] |
+            select(. != "") |
+            if test("[\\r\\n()]") then error("invalid routing matcher") else . end |
+            matcher | emit(.;$family;$tag)
+          end
+        ] + ["MATCH," + $fallback]
+    ') || return 1
+
+    if [[ "$has_warp" == true ]]; then
+        local protection='["IP-CIDR,10.0.0.0/8,DIRECT","IP-CIDR,172.16.0.0/12,DIRECT","IP-CIDR,192.168.0.0/16,DIRECT","IP-CIDR,127.0.0.0/8,DIRECT"]'
+        if [[ "$(jq -r '.routing.warp_mode // "wgcf"' "$db_file")" == official ]]; then
+            protection=$(printf '%s\n' "$protection" | jq '["NETWORK,UDP,DIRECT"] + .') || return 1
+        else
+            protection=$(printf '%s\n' "$protection" | jq '["DOMAIN,engage.cloudflareclient.com,DIRECT"] + . +
+                ["IP-CIDR,169.254.0.0/16,DIRECT","IP-CIDR,224.0.0.0/4,DIRECT","IP-CIDR,240.0.0.0/4,DIRECT","IP-CIDR6,fc00::/7,DIRECT","IP-CIDR6,fe80::/10,DIRECT"]') || return 1
+        fi
+        routing=$(printf '%s\n' "$routing" | jq --argjson p "$protection" '$p + .') || return 1
+    fi
+    jq -n --argjson proxies "$proxies" --argjson groups "$groups" --argjson rules "$routing" '
+        {proxies:($proxies | unique_by(.name)),"proxy-groups":$groups,rules:$rules} |
+        if any($rules[]; contains("RULE-SET,yuu-instagram")) then
+            .["rule-providers"]={"yuu-instagram":{
+                type:"http",behavior:"domain",format:"mrs",
+                path:"./rule-providers/yuu-instagram.mrs",
+                url:"https://raw.githubusercontent.com/Yuu518/Yuu-rules/rule-set/mihomo/geosite/instagram.mrs",
+                interval:86400,proxy:"DIRECT"
+            }}
+        else . end |
+        if any($rules[]; contains("GEOSITE,") or contains("GEOIP,")) then
+            .["geodata-mode"]=true | .["geo-auto-update"]=true | .["geo-update-interval"]=24 |
+            .["geox-url"]={
+                geosite:"https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geosite.dat",
+                geoip:"https://github.com/MetaCubeX/meta-rules-dat/releases/download/latest/geoip.dat"}
+        else . end
+    '
 }
 
 # 生成 Sing-box WARP outbound 配置 (支持 WireGuard 和 SOCKS5 双模式)
@@ -17019,6 +17267,9 @@ _add_routing_rule() {
     _item "8" "Google"
     _item "9" "AI服务(国际)"
     _item "d" "MyTVSuper"
+    local mihomo_protocols
+    mihomo_protocols=$(get_mihomo_protocols) || :
+    [[ -z "$mihomo_protocols" ]] || _item "i" "Instagram/INS (仅 Mihomo)"
     _item "c" "自定义域名"
     _item "b" "广告屏蔽 (geosite)"
     _item "a" "所有流量"
@@ -17039,6 +17290,15 @@ _add_routing_rule() {
         8) rule_type="google" ;;
         9) rule_type="ai-intl" ;;
         d|D) rule_type="mytvsuper" ;;
+        i|I)
+            if [[ -z "$mihomo_protocols" ]]; then
+                _warn "Instagram/INS 分流仅支持 Mihomo，请先安装 Mihomo 协议"
+                _pause
+                return
+            fi
+            rule_type="mihomo-instagram"
+            _info "使用 Yuu-rules Instagram 域名规则集，每 24 小时更新，仅对 Mihomo 生效"
+            ;;
         c|C)
             rule_type="custom"
             echo ""
@@ -17072,7 +17332,7 @@ _add_routing_rule() {
         db_add_routing_rule "$rule_type" "block"
         _ok "已添加规则: 广告屏蔽 → 拦截"
         _info "更新代理配置..."
-        _regenerate_proxy_configs
+        _regenerate_proxy_configs || { _pause; return 1; }
         _ok "配置已更新"
         _pause
         return
@@ -17148,9 +17408,13 @@ _add_routing_rule() {
     
     _ok "已添加规则: ${rule_name} → ${outbound_name}${ip_version_mark}"
     
-    # 更新配置
+    # Mihomo 专属规则只应用到 Mihomo，不重启其他内核。
     _info "更新代理配置..."
-    _regenerate_proxy_configs
+    if [[ "$rule_type" == "mihomo-instagram" ]]; then
+        _regenerate_mihomo_routing_config || { _pause; return 1; }
+    else
+        _regenerate_proxy_configs || { _pause; return 1; }
+    fi
     _ok "配置已更新"
     _pause
 }
@@ -17213,12 +17477,56 @@ _del_routing_rule() {
     read -rp "  输入序号删除 (0 返回): " del_choice
     
     if [[ "$del_choice" =~ ^[0-9]+$ ]] && [[ "$del_choice" -ge 1 && "$del_choice" -le ${#rule_ids[@]} ]]; then
-        local del_id="${rule_ids[$((del_choice-1))]}"
+        local del_id="${rule_ids[$((del_choice-1))]}" del_type
+        del_type=$(printf '%s\n' "$rules" | jq -r --arg id "$del_id" '.[] | select(.id == $id) | .type')
         db_del_routing_rule "$del_id"
-        _regenerate_proxy_configs
+        if [[ "$del_type" == "mihomo-instagram" ]]; then
+            local mihomo_protocols
+            mihomo_protocols=$(get_mihomo_protocols) || :
+            if [[ -n "$mihomo_protocols" ]]; then
+                _regenerate_mihomo_routing_config || { _pause; return 1; }
+            fi
+        else
+            _regenerate_proxy_configs || { _pause; return 1; }
+        fi
         _ok "已删除规则"
     fi
     _pause
+}
+
+# Mihomo 分流事务：候选配置校验通过后才切换；重启失败恢复旧配置。
+_regenerate_mihomo_routing_config() {
+    local snapshot candidate
+    snapshot=$(mktemp -d "$CFG/.mihomo-routing.XXXXXX") || return 1
+    candidate="$snapshot/candidate.json"
+    if ! generate_mihomo_config "$DB_FILE" "$candidate" ||
+       ! validate_mihomo_config "$candidate" "$MIHOMO_BIN"; then
+        rm -rf "$snapshot"
+        _err "Mihomo 分流配置生成或校验失败，保留原配置"
+        return 1
+    fi
+    if [[ -f "$MIHOMO_CONFIG" ]] && ! cp -p "$MIHOMO_CONFIG" "$snapshot/previous.json"; then
+        rm -rf "$snapshot"
+        return 1
+    fi
+    if ! mv "$candidate" "$MIHOMO_CONFIG"; then
+        rm -rf "$snapshot"
+        return 1
+    fi
+    if ! svc restart vless-mihomo || ! _wait_for_mihomo_ready "$DB_FILE"; then
+        if [[ -f "$snapshot/previous.json" ]]; then
+            if ! cp -p "$snapshot/previous.json" "$MIHOMO_CONFIG" ||
+               ! svc restart vless-mihomo || ! _wait_for_mihomo_ready "$DB_FILE"; then
+                _err "Mihomo 分流重启及恢复失败，恢复快照保留在: $snapshot"
+                return 1
+            fi
+        else
+            rm -f "$MIHOMO_CONFIG"
+        fi
+        rm -rf "$snapshot"
+        return 1
+    fi
+    rm -rf "$snapshot"
 }
 
 # 重新生成代理配置的辅助函数
@@ -17233,6 +17541,12 @@ _regenerate_proxy_configs() {
     if [[ -n "$singbox_protocols" ]]; then
         generate_singbox_config
         svc restart vless-singbox 2>/dev/null
+    fi
+
+    local mihomo_protocols
+    mihomo_protocols=$(get_mihomo_protocols)
+    if [[ -n "$mihomo_protocols" ]]; then
+        _regenerate_mihomo_routing_config || return 1
     fi
 }
 
@@ -17429,21 +17743,8 @@ configure_direct_outbound() {
     echo "$new_setting" > "$CFG/direct_ip_version"
     _ok "直连出口已设置为: $new_setting"
     
-    # 重新生成配置
-    local xray_protocols=$(get_xray_protocols)
-    if [[ -n "$xray_protocols" ]]; then
-        _info "重新生成 Xray 配置..."
-        svc stop vless-reality 2>/dev/null
-        generate_xray_config
-        svc start vless-reality 2>/dev/null
-    fi
-    
-    local singbox_protocols=$(get_singbox_protocols)
-    if [[ -n "$singbox_protocols" ]]; then
-        _info "重新生成 Sing-box 配置..."
-        svc stop vless-singbox 2>/dev/null
-        generate_singbox_config
-    fi
+    # 三个内核统一重建，包含 Mihomo 的默认直连出口。
+    _regenerate_proxy_configs || return 1
 }
 
 # WARP → 落地 双层链式代理一键配置
