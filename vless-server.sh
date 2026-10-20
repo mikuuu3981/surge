@@ -8287,8 +8287,8 @@ readonly SCRIPT_VERSION_CACHE_FILE="$VERSION_CACHE_DIR/.script_version"
 readonly MIHOMO_REPO="MetaCubeX/mihomo"
 readonly MIHOMO_MIN_VERSION="1.19.28"
 readonly SNELL_V6_REPO="passeway/Snell"
-# GitHub 镜像尚未收录 RC2 时，至少使用 Surge 官方发布说明中的 RC2。
-readonly SNELL_V6_DEFAULT_VERSION="6.0.0rc2"
+# GitHub 镜像尚未同步时，使用 Surge 官方发布说明中的正式版。
+readonly SNELL_V6_DEFAULT_VERSION="6.0.0"
 readonly SNELL_V6_INSTALLED_VERSION_FILE="$CFG/.snell-v6-installed-version"
 
 # 获取文件修改时间戳（跨平台兼容）
@@ -8905,27 +8905,25 @@ _get_snell_v6_channel_version() {
         cat "$cache_file" 2>/dev/null
         return 0
     fi
-    # 网络失败时允许使用过期缓存；没有缓存则由推荐版本函数使用固定 RC 回退。
+    # 网络失败时允许使用过期缓存；没有缓存则由稳定版本函数使用官方正式版回退。
     [[ -f "$cache_file" ]] && cat "$cache_file" 2>/dev/null
 }
 
 _get_snell_v6_stable_version() {
-    _get_snell_v6_channel_version stable "${1:-true}" "${2:-false}"
+    local detected
+    detected=$(_get_snell_v6_channel_version stable "${1:-true}" "${2:-false}" 2>/dev/null || true)
+    if [[ "$detected" =~ ^6\.[0-9]+\.[0-9]+$ ]]; then
+        echo "$detected"
+    else
+        echo "$SNELL_V6_DEFAULT_VERSION"
+    fi
 }
 
 _get_snell_v6_prerelease_version() {
-    local detected
-    detected=$(_get_snell_v6_channel_version prerelease "${1:-true}" "${2:-false}" 2>/dev/null || true)
-
-    # passeway/Snell 当前只收录到 6.0.0rc，而 Surge 官方发布说明已提供 RC2。
-    # 不让镜像中的旧 Beta/RC 覆盖本项目已验证的 RC2；未来 RC3 等新版本仍可透传。
-    case "$detected" in
-        ""|无|6.0.0b*|6.0.0rc|6.0.0rc1) echo "$SNELL_V6_DEFAULT_VERSION" ;;
-        *) echo "$detected" ;;
-    esac
+    _get_snell_v6_channel_version prerelease "${1:-true}" "${2:-false}"
 }
 
-# 推荐版本优先使用 v6 稳定版；尚无 v6 稳定版时使用 RC2 或更新的预发布版。
+# 推荐版本优先使用 v6 稳定版；镜像未同步时仍使用官方正式版。
 _get_snell_v6_latest_version() {
     local use_cache="${1:-true}" force="${2:-false}"
     local stable_version prerelease_version
@@ -9089,6 +9087,8 @@ _snell_release_sha256() {
         6.0.0rc:aarch64) pinned="2b47d111d648648cf6845886433a7a93404ffe8d68a8e447058de6f7eca0d1a7" ;;
         6.0.0rc2:amd64)  pinned="8a9c4463ca87cfa5eaa37c6af0d37ab93ea275aa12391985bb2a375ca3abd7f2" ;;
         6.0.0rc2:aarch64) pinned="a0b2915cbc77dc3baf8fa069e741c20808d8a10c3a8a93e709a0a580645c3bd7" ;;
+        6.0.0:amd64)  pinned="8a9c4463ca87cfa5eaa37c6af0d37ab93ea275aa12391985bb2a375ca3abd7f2" ;;
+        6.0.0:aarch64) pinned="a0b2915cbc77dc3baf8fa069e741c20808d8a10c3a8a93e709a0a580645c3bd7" ;;
     esac
 
     if [[ -n "$pinned" ]]; then
@@ -13603,7 +13603,7 @@ gen_snell_v5_server_config() {
 }
 
 # Snell v6 服务端配置
-# v6.0.0rc 支持 listen、mode、dns、dns-ip-preference 和 egress-interface。
+# v6.0.0 支持 listen、mode、dns、dns-ip-preference 和 egress-interface。
 gen_snell_v6_server_config() {
     local psk="$1" port="$2" version="${3:-6}"
     local dns_pref="${4:-default}" dns_servers="${5:-}" mode="${6:-default}"

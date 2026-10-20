@@ -53,6 +53,7 @@ nftm
 
 - Snell v4/v5 由 Mihomo v1.19.28+ 提供；一个进程可同时监听多个端口，且每个端口可独立使用不同的 PSK 和版本。
 - Snell+ShadowTLS 使用 Mihomo 内置的 ShadowTLS v3；Snell v6 仍由官方 `snell-server-v6` 提供。
+- Snell v6 默认使用官方 `v6.0.0` 正式版下载链接（[官方发布说明](https://kb.nssurge.com/surge-knowledge-base/release-notes/snell)），已核对 amd64/aarch64 安装包与 RC2 的 SHA-256 一致；GitHub 镜像未同步时也会使用正式版。
 - 旧版 Snell v4/v5 安装会自动迁移到 Mihomo；冷启动时会等待所有 listener 就绪，迁移失败则自动回滚，并自动清理迁移产生的空协议记录。
 - Mihomo 已纳入核心版本管理和运行状态显示。
 - Mihomo 服务端共用“分流管理”中的规则，支持预设 GeoSite/GeoIP、自定义域名/IP、广告及访问限制、IPv4/IPv6 匹配、直连、WARP 和链式代理；修改规则后会校验配置并重启生效。升级后进入脚本会自动同步旧版全部直连的配置，未配置规则时仍默认直连。
