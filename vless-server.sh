@@ -22,12 +22,12 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
     exit 1
 fi
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.5.18 [服务端]
+#  多协议代理一键部署脚本 v3.5.19 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
-#    • Sing-box 核心: 处理 UDP/QUIC 协议 (Hysteria2/TUIC) - 低内存高效率
-#    • Mihomo 核心: 管理 Snell v4/v5 多监听器和内置 ShadowTLS v3；官方 Snell 核心仅服务 v6
+#    • Sing-box 核心: Hysteria2/TUIC/AnyTLS 与可选 Snell v6，共用服务和分流
+#    • Mihomo 核心: Snell v4/v5 与内置 ShadowTLS v3；Snell v6 也可选官方独立服务
 #  
 #  支持协议: VLESS+Reality / VLESS+Reality+XHTTP / VLESS+WS / VMess+WS / 
 #           VLESS-XTLS-Vision / SOCKS5 / SS2022 / HY2 / Trojan / 
@@ -41,7 +41,7 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.5.18"
+readonly VERSION="3.5.19"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/mikuuu3981/surge"
 readonly SCRIPT_REPO="mikuuu3981/surge"
@@ -650,7 +650,8 @@ get_protocol_name() {
         ss2022-shadowtls) echo "SS2022+ShadowTLS" ;;
         snell) echo "Snell" ;;
         snell-v5) echo "Snell v5" ;;
-        snell-v6) echo "Snell v6" ;;
+        snell-v6) echo "Snell v6 (官方)" ;;
+        snell-v6-singbox) echo "Snell v6 (Sing-box)" ;;
         snell-shadowtls) echo "Snell+ShadowTLS" ;;
         snell-v5-shadowtls) echo "Snell v5+ShadowTLS" ;;
         trojan) echo "Trojan" ;;
@@ -898,8 +899,8 @@ db_add_user() {
     fi
     
     # 检查是否为独立协议（不支持多用户）
-    if is_standalone_protocol "$proto"; then
-        _err "独立协议 $proto 不支持添加用户"
+    if is_standalone_protocol "$proto" || [[ "$proto" == snell-v6-singbox ]]; then
+        _err "协议 $proto 使用固定 PSK，不支持添加用户"
         return 1
     fi
     
@@ -3868,7 +3869,8 @@ fi
 SINGBOX_V2RAY_API_PORT="10086"
 XRAY_PROTOCOLS="vless vless-xhttp vless-xhttp-cdn vless-ws vless-ws-notls vmess-ws vless-vision trojan trojan-ws socks ss2022 ss-legacy"
 # Sing-box 管理的协议 (原独立协议，现统一由 Sing-box 处理)
-SINGBOX_PROTOCOLS="hy2 tuic anytls"
+SINGBOX_PROTOCOLS="hy2 tuic anytls snell-v6-singbox"
+readonly SINGBOX_SNELL_MIN_VERSION="1.14.0"
 # Mihomo 统一管理的 Snell v4/v5 协议
 MIHOMO_PROTOCOLS="snell snell-v5 snell-shadowtls snell-v5-shadowtls"
 # 仍需独立进程的协议
@@ -3931,16 +3933,16 @@ for _p in $XRAY_PROTOCOLS; do
     PROTO_KIND[$_p]="xray"
 done
 
-# Sing-box 统一服务：hy2/tuic 由 vless-singbox 统一管理
+# Sing-box 统一服务：HY2/TUIC/AnyTLS/Snell v6 共用 vless-singbox
 PROTO_SVC[hy2]="vless-singbox";  PROTO_BIN[hy2]="sing-box"; PROTO_KIND[hy2]="singbox"
 PROTO_SVC[tuic]="vless-singbox"; PROTO_BIN[tuic]="sing-box"; PROTO_KIND[tuic]="singbox"
 PROTO_SVC[anytls]="vless-singbox"; PROTO_BIN[anytls]="sing-box"; PROTO_KIND[anytls]="singbox"
+PROTO_SVC[snell-v6-singbox]="vless-singbox"; PROTO_BIN[snell-v6-singbox]="sing-box"; PROTO_KIND[snell-v6-singbox]="singbox"
 
-# Snell v6 继续使用官方独立进程；v4/v5 仅由下方 Mihomo 元数据注册。
+# 官方 Snell v6 保持独立进程，可与上面的 Sing-box 版同时运行。
 PROTO_SVC[snell-v6]="vless-snell-v6"; PROTO_EXEC[snell-v6]="/usr/local/bin/snell-server-v6 -c $CFG/snell-v6.conf"; PROTO_BIN[snell-v6]="snell-server-v6"; PROTO_KIND[snell-v6]="snell"
 
 # 动态命令：运行时从数据库取参数
-PROTO_SVC[anytls]="vless-anytls"; PROTO_KIND[anytls]="anytls"
 PROTO_SVC[naive]="vless-naive"; PROTO_KIND[naive]="naive"
 
 # SS2022+ShadowTLS 继续使用外部主服务和后端；Snell v4/v5 使用 Mihomo 内置 ShadowTLS。
@@ -6030,26 +6032,16 @@ check_domain_dns() {
 # 检查脚本内部记录的端口占用 (从数据库读取)
 # 返回 0 表示被占用，1 表示未被占用
 is_internal_port_occupied() {
-    local check_port="$1"
-    
-    # 遍历 Xray 协议
-    local xray_protos=$(db_list_protocols "xray")
-    for proto in $xray_protos; do
-        local used_port=$(db_get_field "xray" "$proto" "port")
-        if [[ "$used_port" == "$check_port" ]]; then
-            echo "$proto"
-            return 0
-        fi
-    done
-    
-    # 遍历 Singbox 协议
-    local singbox_protos=$(db_list_protocols "singbox")
-    for proto in $singbox_protos; do
-        local used_port=$(db_get_field "singbox" "$proto" "port")
-        if [[ "$used_port" == "$check_port" ]]; then
-            echo "$proto"
-            return 0
-        fi
+    local check_port="$1" core proto ports
+    # 单对象和多端口数组都要检查，包括未启动的实例。
+    for core in xray singbox mihomo; do
+        for proto in $(db_list_protocols "$core"); do
+            ports=$(db_list_ports "$core" "$proto") || return 1
+            if grep -qxF "$check_port" <<<"$ports"; then
+                printf '%s\n' "$proto"
+                return 0
+            fi
+        done
     done
     
     return 1
@@ -7050,11 +7042,15 @@ gen_ss_legacy_link() {
 
 gen_snell_link() {
     local ip="$1" port="$2" psk="$3" version="${4:-4}" country="${5:-}"
-    local mode="${6:-}"
+    local mode="${6:-}" implementation="${7:-}"
     local ip_suffix=$(get_ip_suffix "$ip")
     local name="${country:+${country}-}Snell-v${version}${ip_suffix:+-${ip_suffix}}"
     # Mihomo 可同时承载多个 v4/v5 入站，分享名称必须包含端口。
-    [[ "$version" != "6" ]] && name+="-${port}"
+    if [[ "$version" != 6 ]]; then
+        name+="-${port}"
+    elif [[ -n "$implementation" ]]; then
+        name+="-${implementation}-${port}"
+    fi
     # Snell 没有标准URI格式，使用自定义格式
     local query="version=${version}"
     if [[ "$version" == "6" ]]; then
@@ -9267,6 +9263,12 @@ _install_binary() {
         return 1
     fi
 
+    if [[ "$install_kind" == singbox ]] && db_exists singbox snell-v6-singbox &&
+       ! _singbox_supports_snell_version "$version"; then
+        _err "已安装 Snell v6，Sing-box 不能降级到不支持的版本 v$version"
+        return 1
+    fi
+
     local arch=$(uname -m)
     local tmp
     tmp=$(mktemp -d) || { _err "创建临时目录失败"; return 1; }
@@ -9314,7 +9316,7 @@ _install_binary() {
             local singbox_bin
             singbox_bin=$(find "$tmp" -name sing-box -type f -print -quit) &&
             [[ -n "$singbox_bin" ]] &&
-            install -m 755 "$singbox_bin" /usr/local/bin/sing-box &&
+            _install_checked_singbox_binary "$singbox_bin" &&
             install_ok=true
             ;;
         mihomo)
@@ -9364,13 +9366,68 @@ install_xray() {
 }
 
 #═══════════════════════════════════════════════════════════════════════════════
-# Sing-box 核心 - 统一管理 UDP/QUIC 协议 (Hy2/TUIC)
+# Sing-box 核心 - 统一管理 Hy2/TUIC/AnyTLS/Snell v6
 #═══════════════════════════════════════════════════════════════════════════════
+
+# 使用待安装的核心生成和校验完整共享配置；升级不能先破坏正在使用的核心。
+_replace_singbox_binary() {
+    local source="$1" target="$2" staged
+    # 同目录 rename 避免覆盖正在执行的 inode（ETXTBSY），也避免半写入文件。
+    staged=$(mktemp "${target}.new.XXXXXX") || return 1
+    if ! install -m 755 "$source" "$staged" || ! mv -f "$staged" "$target"; then
+        rm -f "$staged"
+        return 1
+    fi
+}
+
+_install_checked_singbox_binary() {
+    local binary="$1" candidate="" backup="" target
+    local SINGBOX_CONFIG_BINARY="$binary"
+    target=$(_core_binary_path sing-box) || return 1
+    mkdir -p "$CFG" || return 1
+    chmod 755 "$binary" || return 1
+    if [[ -n "$(get_singbox_protocols)" ]]; then
+        candidate=$(mktemp "$CFG/.singbox-upgrade.XXXXXX") || return 1
+        if ! generate_singbox_config "$candidate"; then
+            rm -f "$candidate"
+            return 1
+        fi
+    fi
+    if [[ -f "$target" ]]; then
+        backup=$(mktemp "$CFG/.singbox-binary.XXXXXX") || { rm -f "$candidate"; return 1; }
+        cp -p "$target" "$backup" || { rm -f "$candidate" "$backup"; return 1; }
+    fi
+    if ! _replace_singbox_binary "$binary" "$target"; then
+        if [[ -n "$backup" ]] && ! _replace_singbox_binary "$backup" "$target"; then
+            _err "Sing-box 二进制恢复失败，备份保留: $backup"
+            rm -f "$candidate"
+            return 1
+        fi
+        rm -f "$candidate" "$backup"
+        return 1
+    fi
+    if [[ -n "$candidate" ]] && ! mv "$candidate" "$CFG/singbox.json"; then
+        if [[ -n "$backup" ]]; then
+            _replace_singbox_binary "$backup" "$target" || { _err "Sing-box 二进制恢复失败，备份保留: $backup"; return 1; }
+        else
+            rm -f "$target" || return 1
+        fi
+        rm -f "$candidate" "$backup"
+        return 1
+    fi
+    rm -f "$backup"
+}
 
 install_singbox() {
     local channel="${1:-stable}"
     local force="${2:-false}"
     local version_override="${3:-}"
+    # 所有更新入口（包括自定义版本）都必须保护已经安装的 Snell v6 入站。
+    if db_exists singbox snell-v6-singbox && [[ -n "$version_override" ]] &&
+       ! _singbox_supports_snell_version "$version_override"; then
+        _err "Snell v6 需要 Sing-box ${SINGBOX_SNELL_MIN_VERSION}+，拒绝降级到 $version_override"
+        return 1
+    fi
     local sarch=$(_map_arch "amd64:arm64:armv7") || { _err "不支持的架构"; return 1; }
     # Alpine 需要安装 gcompat 兼容层来运行 glibc 编译的二进制
     if [[ "$DISTRO" == "alpine" ]]; then
@@ -9380,6 +9437,33 @@ install_singbox() {
         'https://github.com/SagerNet/sing-box/releases/download/v$version/sing-box-$version-linux-${sarch}.tar.gz' \
         singbox \
         "$channel" "$force" "$version_override"
+}
+
+_singbox_supports_snell_version() {
+    local version="${1#v}"
+    [[ "$version" =~ ^([0-9]+)\.([0-9]+)\.([0-9]+)([-.][A-Za-z0-9.-]+)?$ ]] || return 1
+    if (( 10#${BASH_REMATCH[1]} > 1 ||
+          (10#${BASH_REMATCH[1]} == 1 && 10#${BASH_REMATCH[2]} > 14) )); then
+        return 0
+    fi
+    (( 10#${BASH_REMATCH[1]} == 1 && 10#${BASH_REMATCH[2]} == 14 )) || return 1
+    (( 10#${BASH_REMATCH[3]} > 0 )) || [[ -z "${BASH_REMATCH[4]}" ]]
+}
+
+ensure_singbox_snell_support() {
+    local version
+    version=$(sing-box version 2>/dev/null | awk 'NR == 1 {print $3}')
+    if ! _singbox_supports_snell_version "$version"; then
+        _warn "Snell v6 需要 Sing-box ${SINGBOX_SNELL_MIN_VERSION}+（当前: ${version:-未安装}）"
+        local confirm
+        read -rp "  是否安装/升级 Sing-box 稳定版? [Y/n]: " confirm || return 1
+        [[ ! "$confirm" =~ ^[nN]$ ]] || return 1
+        version=$(_get_singbox_target_version stable) || return 1
+        _singbox_supports_snell_version "$version" || { _err "稳定版不支持 Snell v6，请稍后重试"; return 1; }
+        _update_singbox_core_to_version stable "$version" || return 1
+        version=$(sing-box version 2>/dev/null | awk 'NR == 1 {print $3}')
+    fi
+    _singbox_supports_snell_version "$version" || { _err "Sing-box 版本不支持 Snell v6"; return 1; }
 }
 
 install_mihomo() {
@@ -9931,6 +10015,11 @@ _update_mihomo_core_to_version() {
 _update_core_to_version() {
     local core="$1" channel="$2" version="${3#v}" service="$4" install_func="$5"
     _check_core_update_deps || return 1
+    if [[ "$core" == Sing-box ]] && db_exists singbox snell-v6-singbox &&
+       ! _singbox_supports_snell_version "$version"; then
+        _err "已安装 Snell v6，Sing-box 最低版本为 $SINGBOX_SNELL_MIN_VERSION"
+        return 1
+    fi
     if [[ "$core" == "Mihomo" ]] && ! _is_mihomo_supported_version "$version"; then
         _err "Mihomo 版本 v${version} 不受支持（最低稳定功能集为 v${MIHOMO_MIN_VERSION}）"
         return 1
@@ -9947,6 +10036,10 @@ _update_core_to_version() {
 
     if [[ "$core" == "Mihomo" ]]; then
         _update_mihomo_core_to_version "$channel" "$version" "$service" "$install_func"
+        return $?
+    fi
+    if [[ "$core" == Sing-box ]]; then
+        _update_singbox_core_to_version "$channel" "$version" "$install_func"
         return $?
     fi
 
@@ -10348,56 +10441,93 @@ update_xray_core() {
     return 1
 }
 
+_get_singbox_target_version() {
+    local channel="$1" version=""
+    if [[ "$channel" == prerelease || "$channel" == test || "$channel" == beta ]]; then
+        version=$(_get_latest_prerelease_version SagerNet/sing-box true 2>/dev/null || true)
+        [[ -n "$version" ]] || version=$(_force_get_cached_prerelease_version SagerNet/sing-box 2>/dev/null || true)
+    else
+        version=$(_get_latest_version SagerNet/sing-box true 2>/dev/null || true)
+        [[ -n "$version" ]] || version=$(_force_get_cached_version SagerNet/sing-box 2>/dev/null || true)
+    fi
+    version="${version#v}"
+    [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+([-.][A-Za-z0-9.-]+)?$ ]] || { _err "无法获取 Sing-box 版本"; return 1; }
+    printf '%s\n' "$version"
+}
+
+# 升级时同时保存核心和完整配置；先下载/校验，再重启共享服务。
+_update_singbox_core_to_version() {
+    local channel="$1" version="$2" install_func="${3:-install_singbox}"
+    local snapshot binary had_binary=false was_running=false success=false installed=false
+    if db_exists singbox snell-v6-singbox && ! _singbox_supports_snell_version "$version"; then
+        _err "已安装 Snell v6，Sing-box 最低版本为 $SINGBOX_SNELL_MIN_VERSION"
+        return 1
+    fi
+    mkdir -p "$CFG" || return 1
+    binary=$(_core_binary_path sing-box) || return 1
+    snapshot=$(mktemp -d "$CFG/.singbox-core.XXXXXX") || return 1
+    if [[ -f "$binary" ]]; then
+        cp -p "$binary" "$snapshot/binary" || { rmdir "$snapshot"; return 1; }
+        had_binary=true
+    fi
+    if [[ -f "$CFG/singbox.json" ]] && ! cp -p "$CFG/singbox.json" "$snapshot/config"; then
+        rm -rf "$snapshot"
+        return 1
+    fi
+    svc status vless-singbox >/dev/null 2>&1 && was_running=true
+    if "$install_func" "$channel" true "$version"; then
+        installed=true
+        if [[ "$was_running" != true ]] || { svc restart vless-singbox && _wait_for_singbox_ready; }; then
+            success=true
+        fi
+    fi
+    if [[ "$success" == true ]]; then
+        rm -rf "$snapshot"
+        _ok "Sing-box 内核已更新 (v$version)"
+        return 0
+    fi
+    # 下载或候选校验失败且文件未变化时，不打断仍在运行的旧核心。
+    if [[ "$installed" == false ]] &&
+       { [[ "$had_binary" == true ]] && cmp -s "$snapshot/binary" "$binary" ||
+         [[ "$had_binary" == false && ! -e "$binary" ]]; } &&
+       { [[ -f "$snapshot/config" ]] && cmp -s "$snapshot/config" "$CFG/singbox.json" ||
+         [[ ! -f "$snapshot/config" && ! -e "$CFG/singbox.json" ]]; }; then
+        rm -rf "$snapshot"
+        _err "Sing-box 更新失败，原核心与配置未变化"
+        return 1
+    fi
+    if [[ "$was_running" == true ]] && ! svc stop vless-singbox; then
+        _err "Sing-box 停止失败，恢复快照保留: $snapshot"
+        return 1
+    fi
+    if [[ "$had_binary" == true ]]; then
+        _replace_singbox_binary "$snapshot/binary" "$binary" || { _err "Sing-box 恢复失败，快照保留: $snapshot"; return 1; }
+    else
+        rm -f "$binary" || return 1
+    fi
+    if [[ -f "$snapshot/config" ]]; then
+        cp -p "$snapshot/config" "$CFG/singbox.json" || { _err "Sing-box 配置恢复失败，快照保留: $snapshot"; return 1; }
+    else
+        rm -f "$CFG/singbox.json" || return 1
+    fi
+    if [[ "$was_running" == true ]] && ! { svc start vless-singbox && _wait_for_singbox_ready; }; then
+        _err "Sing-box 服务恢复失败，快照保留: $snapshot"
+        return 1
+    fi
+    rm -rf "$snapshot"
+    _err "Sing-box 更新失败，已恢复原核心与配置"
+    return 1
+}
+
 update_singbox_core() {
     local channel="${1:-stable}"
     _check_core_update_deps || return 1
     _confirm_core_update "Sing-box" "$channel" || return 1
 
-    local is_new_install=false
-    if ! check_cmd sing-box; then
-        _warn "未检测到 Sing-box，将执行安装"
-        is_new_install=true
-    fi
-
-    local need_restart=false service_running=false
-    if svc status vless-singbox 2>/dev/null; then
-        service_running=true
-        need_restart=true
-        _info "停止 vless-singbox 服务..."
-        if ! svc stop vless-singbox 2>/dev/null; then
-            _warn "停止服务失败，继续更新"
-        fi
-    fi
-
-    if install_singbox "$channel" "true"; then
-        _ok "Sing-box 内核已更新"
-        local new_version
-        new_version=$(sing-box version 2>/dev/null | awk '{print $3}')
-        if [[ -n "$new_version" && "$is_new_install" != "true" ]]; then
-            _show_changelog_summary "SagerNet/sing-box" "$new_version" 10
-        fi
-        if [[ "$need_restart" == "true" ]]; then
-            _info "重新启动 vless-singbox 服务..."
-            if svc start vless-singbox 2>/dev/null; then
-                _ok "服务已启动"
-            else
-                _err "服务启动失败，请手动检查配置: svc start vless-singbox"
-                return 1
-            fi
-        fi
-        return 0
-    fi
-
-    _err "Sing-box 内核更新失败"
-    if [[ "$service_running" == "true" ]]; then
-        _warn "尝试恢复服务..."
-        if svc start vless-singbox 2>/dev/null; then
-            _ok "服务已恢复"
-        else
-            _err "服务恢复失败，请手动检查: svc start vless-singbox"
-        fi
-    fi
-    return 1
+    local version
+    version=$(_get_singbox_target_version "$channel") || return 1
+    _update_singbox_core_to_version "$channel" "$version" || return 1
+    _show_changelog_summary SagerNet/sing-box "$version" 10
 }
 
 update_mihomo_core() {
@@ -10806,7 +10936,7 @@ out = {'version': 3, 'rules': [rule] if rule else []}
 out_path.write_text(json.dumps(out, ensure_ascii=False, indent=2))
 PY
 
-    sing-box rule-set compile "$source_path" -o "$output_path" >/dev/null 2>&1
+    "${SINGBOX_CONFIG_BINARY:-sing-box}" rule-set compile "$source_path" -o "$output_path" >/dev/null 2>&1
 }
 
 _build_singbox_geoip_ruleset() {
@@ -10851,7 +10981,7 @@ out = {'version': 3, 'rules': [{'ip_cidr': ips}] if ips else []}
 out_path.write_text(json.dumps(out, ensure_ascii=False, indent=2))
 PY
 
-    sing-box rule-set compile "$source_path" -o "$output_path" >/dev/null 2>&1
+    "${SINGBOX_CONFIG_BINARY:-sing-box}" rule-set compile "$source_path" -o "$output_path" >/dev/null 2>&1
 }
 
 _build_singbox_ruleset() {
@@ -11845,9 +11975,31 @@ validate_mihomo_config() {
     "$binary" -t -d "$CFG" -f "$config_file" >/dev/null 2>&1
 }
 
-# 生成 Sing-box 统一配置 (Hy2 + TUIC 共用一个进程)
+# 校验单 PSK Snell v6 入站；不隐式启用需要 userkey 的多用户模式。
+_validate_singbox_snell_record() {
+    jq -e '
+        type == "object" and
+        (.port | type == "number" and . == floor and . >= 1 and . <= 65535) and
+        .version == 6 and
+        (.psk | type == "string" and test("^[A-Za-z0-9]{16,255}$")) and
+        ((if .mode == null then "default" else .mode end) | . == "default" or . == "unshaped" or . == "unsafe-raw") and
+        ((.tfo // "true") | . == "true" or . == "false" or . == true or . == false) and
+        ((.users // []) | length == 0)
+    ' <<<"$1" >/dev/null 2>&1 || { _err "无效的 Sing-box Snell v6 配置"; return 1; }
+}
+
+# 生成 Sing-box 统一配置；可写入候选文件，校验成功前不覆盖运行配置。
 generate_singbox_config() {
-    _ensure_singbox_default_users
+    local output_file="${1:-$CFG/singbox.json}"
+    if db_exists singbox snell-v6-singbox; then
+        local snell_core_version
+        snell_core_version=$("${SINGBOX_CONFIG_BINARY:-sing-box}" version 2>/dev/null | awk 'NR == 1 {print $3}')
+        _singbox_supports_snell_version "$snell_core_version" || {
+            _err "Snell v6 需要 Sing-box ${SINGBOX_SNELL_MIN_VERSION}+，请先升级核心"
+            return 1
+        }
+    fi
+    _ensure_singbox_default_users || return 1
     local singbox_protocols=$(db_list_protocols "singbox")
     [[ -z "$singbox_protocols" ]] && return 1
     
@@ -12112,7 +12264,7 @@ generate_singbox_config() {
             done < <(echo "$balancer_groups" | jq -c '.[]')
         fi
 
-        routing_rules=$(gen_singbox_routing_rules)
+        routing_rules=$(gen_singbox_routing_rules) || return 1
         if [[ -n "$routing_rules" && "$routing_rules" != "[]" ]]; then
             if [[ "$warp_has_endpoint" == "true" ]]; then
                 routing_rules=$(echo "$routing_rules" | jq 'map(if ((.outbound // "") | startswith("warp")) then .outbound = "warp" else . end)')
@@ -12223,9 +12375,17 @@ generate_singbox_config() {
     local inbounds="[]"
     local success_count=0
     
-    for proto in $singbox_protocols; do
-        local cfg=$(db_get "singbox" "$proto")
+    # 展开每个协议的单对象或多端口数组，完整重建所有共享入站。
+    local protocol_records proto cfg
+    protocol_records=$(jq -r '(.singbox // {}) | to_entries[] | .key as $proto |
+        .value | (if type == "array" then .[] else . end) |
+        $proto + "|" + tojson
+    ' "$DB_FILE") || return 1
+    while IFS='|' read -r proto cfg; do
         [[ -z "$cfg" ]] && continue
+        if [[ "$proto" == snell-v6-singbox ]]; then
+            _validate_singbox_snell_record "$cfg" || return 1
+        fi
         
         local port=$(echo "$cfg" | jq -r '.port // empty')
         [[ -z "$port" ]] && continue
@@ -12233,6 +12393,13 @@ generate_singbox_config() {
         local inbound=""
         
         case "$proto" in
+            snell-v6-singbox)
+                inbound=$(jq --arg listen "$listen_addr" '{
+                    type:"snell", tag:("snell-v6-" + (.port | tostring)),
+                    listen:$listen, listen_port:.port, version:6, psk:.psk,
+                    mode:(.mode // "default")
+                }' <<<"$cfg") || return 1
+                ;;
             hy2)
                 local password=$(echo "$cfg" | jq -r '.password // empty')
                 local sni=$(echo "$cfg" | jq -r '.sni // "www.bing.com"')
@@ -12250,15 +12417,8 @@ generate_singbox_config() {
                 
                 # 构建用户列表：从数据库读取用户，如果没有则使用默认用户
                 local users_json="[]"
-                local db_users=$(jq -r --arg p "$proto" '
-                    .singbox[$p] as $cfg |
-                    if $cfg == null then empty
-                    elif ($cfg | type) == "array" then
-                        [$cfg[].users // [] | .[]] | unique_by(.name)
-                    else
-                        $cfg.users // []
-                    end
-                ' "$DB_FILE" 2>/dev/null)
+                local db_users
+                db_users=$(jq '.users // []' <<<"$cfg") || return 1
                 
                 if [[ -n "$db_users" && "$db_users" != "[]" && "$db_users" != "null" ]]; then
                     # 有自定义用户，为每个用户生成 {name, password}
@@ -12303,15 +12463,8 @@ generate_singbox_config() {
                 
                 # 构建用户列表：从数据库读取用户，如果没有则使用默认用户
                 local users_json="[]"
-                local db_users=$(jq -r --arg p "$proto" '
-                    .singbox[$p] as $cfg |
-                    if $cfg == null then empty
-                    elif ($cfg | type) == "array" then
-                        [$cfg[].users // [] | .[]] | unique_by(.name)
-                    else
-                        $cfg.users // []
-                    end
-                ' "$DB_FILE" 2>/dev/null)
+                local db_users
+                db_users=$(jq '.users // []' <<<"$cfg") || return 1
                 
                 if [[ -n "$db_users" && "$db_users" != "[]" && "$db_users" != "null" ]]; then
                     # TUIC 用户的 uuid 字段存储的是真正用户 UUID；name 使用协议隔离后的内部统计键
@@ -12347,19 +12500,15 @@ generate_singbox_config() {
                 local sni=$(echo "$cfg" | jq -r '.sni // "www.bing.com"')
                 local cert_path="$CFG/certs/server.crt"
                 local key_path="$CFG/certs/server.key"
-                [[ ! -f "$cert_path" || ! -f "$key_path" ]] && continue
+                if [[ ! -f "$cert_path" || ! -f "$key_path" ]]; then
+                    _err "AnyTLS 证书缺失，拒绝生成不完整的共享配置"
+                    return 1
+                fi
 
                 # 构建用户列表：从数据库读取用户，如果没有则使用默认用户
                 local users_json="[]"
-                local db_users=$(jq -r --arg p "$proto" '
-                    .singbox[$p] as $cfg |
-                    if $cfg == null then empty
-                    elif ($cfg | type) == "array" then
-                        [$cfg[].users // [] | .[]] | unique_by(.name)
-                    else
-                        $cfg.users // []
-                    end
-                ' "$DB_FILE" 2>/dev/null)
+                local db_users
+                db_users=$(jq '.users // []' <<<"$cfg") || return 1
 
                 if [[ -n "$db_users" && "$db_users" != "[]" && "$db_users" != "null" ]]; then
                     # AnyTLS 用户的 uuid 字段存储的是真正用户密码；name 使用协议隔离后的内部统计键
@@ -12413,10 +12562,14 @@ generate_singbox_config() {
         esac
         
         if [[ -n "$inbound" ]]; then
+            # 兼容其他协议已有的多端口记录；单端口保留原 tag。
+            if [[ "$proto" != snell-v6-singbox && "$(db_list_ports singbox "$proto" | wc -l)" -gt 1 ]]; then
+                inbound=$(jq --arg port "$port" '.tag += ("-" + $port)' <<<"$inbound") || return 1
+            fi
             inbounds=$(echo "$inbounds" | jq --argjson ib "$inbound" '. += [$ib]')
-            ((success_count++))
+            success_count=$((success_count + 1))
         fi
-    done
+    done <<<"$protocol_records"
     
     if [[ $success_count -eq 0 ]]; then
         _err "没有有效的 Sing-box 协议配置"
@@ -12515,7 +12668,7 @@ generate_singbox_config() {
     done
 
     # 如果 sing-box 二进制带 with_v2ray_api，则生成用户级统计配置
-    if sing-box version 2>/dev/null | grep -q 'with_v2ray_api'; then
+    if "${SINGBOX_CONFIG_BINARY:-sing-box}" version 2>/dev/null | grep -q 'with_v2ray_api'; then
         base_config=$(echo "$base_config" | jq \
             --arg listen "127.0.0.1:${SINGBOX_V2RAY_API_PORT}" \
             --argjson users "$stats_users" \
@@ -12528,19 +12681,114 @@ generate_singbox_config() {
             }')
     fi
 
-    # 合并配置并写入文件
-    echo "$base_config" | jq \
-        --argjson ibs "$inbounds" \
-        '.inbounds = $ibs' > "$CFG/singbox.json"
-    
-    # 验证配置
-    if ! jq empty "$CFG/singbox.json" 2>/dev/null; then
-        _err "Sing-box 配置 JSON 格式错误"
+    # 1.14+ 不再默认接受旧 domain_strategy；只在新核心上输出现代 DNS 格式，
+    # 避免安装 Snell 后共享服务中的原有直连/链式出口因弃用字段无法启动。
+    local core_version
+    core_version=$("${SINGBOX_CONFIG_BINARY:-sing-box}" version 2>/dev/null | awk 'NR == 1 {print $3}')
+    if _singbox_supports_snell_version "$core_version"; then
+        base_config=$(jq '
+            .dns = {servers:[{type:"local",tag:"system-dns"}]} |
+            .route.default_domain_resolver = "system-dns" |
+            .outbounds |= map(
+                if .domain_strategy then
+                    .domain_resolver = {server:"system-dns",strategy:.domain_strategy} |
+                    del(.domain_strategy)
+                else . end
+            )
+        ' <<<"$base_config") || return 1
+    fi
+
+    local tmp
+    tmp=$(mktemp "${output_file}.tmp.XXXXXX") || return 1
+    if ! jq --argjson ibs "$inbounds" '.inbounds = $ibs' <<<"$base_config" >"$tmp" ||
+       ! jq -e '([.inbounds[].listen_port] | length) == ([.inbounds[].listen_port] | unique | length)' "$tmp" >/dev/null ||
+       ! validate_singbox_config "$tmp" || ! chmod 600 "$tmp" || ! mv "$tmp" "$output_file"; then
+        rm -f "$tmp"
+        _err "Sing-box 配置校验失败，保留原配置"
         return 1
     fi
     
     _ok "Sing-box 配置生成成功 ($success_count 个协议)"
     return 0
+}
+
+validate_singbox_config() {
+    # sing-box check 不会验证所有出口引用；缺失出口不能在运行时才被发现。
+    jq -e '
+        ([.outbounds[]?.tag, .endpoints[]?.tag]) as $tags |
+        ($tags | length) == ($tags | unique | length) and
+        all((.route // {} | .. | objects | .outbound? // empty); . as $tag | $tags | index($tag) != null) and
+        all((.route.final // empty); . as $tag | $tags | index($tag) != null) and
+        all((.outbounds[]? | (.outbounds[]?, .default? // empty, .detour? // empty));
+            . as $tag | $tags | index($tag) != null)
+    ' "$1" >/dev/null 2>&1 || return 1
+    local binary="${SINGBOX_CONFIG_BINARY:-sing-box}" version
+    version=$("$binary" version 2>/dev/null | awk 'NR == 1 {print $3}')
+    if _singbox_supports_snell_version "$version"; then
+        "$binary" check -c "$1"
+    else
+        # 未安装 Snell 的旧核心保持原服务的兼容环境，不因新增校验而拒绝旧配置。
+        ENABLE_DEPRECATED_LEGACY_DOMAIN_STRATEGY_OPTIONS=true "$binary" check -c "$1"
+    fi
+}
+
+# 分流更新先生成完整候选配置，重启失败时恢复旧配置和原运行状态。
+_regenerate_singbox_routing_config() {
+    local snapshot was_running=false had_config=false
+    snapshot=$(mktemp -d "$CFG/.singbox-routing.XXXXXX") || return 1
+    if [[ -f "$CFG/singbox.json" ]]; then
+        cp -p "$CFG/singbox.json" "$snapshot/previous.json" || { rmdir "$snapshot"; return 1; }
+        had_config=true
+    fi
+    svc status vless-singbox >/dev/null 2>&1 && was_running=true
+    if ! generate_singbox_config "$snapshot/candidate.json" ||
+       ! mv "$snapshot/candidate.json" "$CFG/singbox.json"; then
+        rm -rf "$snapshot"
+        return 1
+    fi
+    if [[ "$was_running" == true ]]; then
+        if svc restart vless-singbox && _wait_for_singbox_ready; then
+            rm -rf "$snapshot"
+            return 0
+        fi
+        if [[ "$had_config" == true ]]; then
+            cp -p "$snapshot/previous.json" "$CFG/singbox.json" || { _err "Sing-box 恢复失败，快照保留: $snapshot"; return 1; }
+            if ! { svc restart vless-singbox && _wait_for_singbox_ready; }; then
+                _err "Sing-box 恢复失败，快照保留: $snapshot"
+                return 1
+            fi
+        else
+            rm -f "$CFG/singbox.json"
+            svc stop vless-singbox || return 1
+        fi
+        rm -rf "$snapshot"
+        return 1
+    fi
+    rm -rf "$snapshot"
+}
+
+_wait_for_singbox_ready() {
+    local attempt listeners transport port ready
+    listeners=$(jq -r '.inbounds[] |
+        (if .type == "hysteria2" or .type == "tuic" then "udp" else "tcp" end) + "|" + (.listen_port | tostring)
+    ' "$CFG/singbox.json") || return 1
+    [[ -n "$listeners" ]] || return 1
+    for ((attempt=0; attempt<30; attempt++)); do
+        ready=true
+        if svc status vless-singbox >/dev/null 2>&1; then
+            while IFS='|' read -r transport port; do
+                local flag=-lnt
+                [[ "$transport" == udp ]] && flag=-lnu
+                if ! ss -H "$flag" "sport = :$port" 2>/dev/null | grep -q .; then
+                    ready=false
+                    break
+                fi
+            done <<<"$listeners"
+            [[ "$ready" == true ]] && return 0
+        fi
+        sleep 0.3
+    done
+    return 1
 }
 
 # 创建 Sing-box 服务
@@ -12563,7 +12811,7 @@ create_singbox_service() {
     
     if [[ "$DISTRO" == "alpine" ]]; then
         # Alpine: 在 start_pre 中执行端口跳跃脚本
-        cat > /etc/init.d/$service_name << EOF
+        cat > "$OPENRC_DIR/$service_name" << EOF || return 1
 #!/sbin/openrc-run
 name="Sing-box Proxy Server"
 command="/usr/local/bin/sing-box"
@@ -12573,30 +12821,64 @@ command_background="yes"
 pidfile="/run/${service_name}.pid"
 depend() { need net; }
 start_pre() {
-    [[ -x "$CFG/hy2-nat.sh" ]] && "$CFG/hy2-nat.sh" || true
-    [[ -x "$CFG/tuic-nat.sh" ]] && "$CFG/tuic-nat.sh" || true
+    [ ! -x "$CFG/hy2-nat.sh" ] || "$CFG/hy2-nat.sh" || true
+    [ ! -x "$CFG/tuic-nat.sh" ] || "$CFG/tuic-nat.sh" || true
+    /usr/local/bin/sing-box check -c "$CFG/singbox.json"
 }
 EOF
-        chmod +x /etc/init.d/$service_name
+        chmod +x "$OPENRC_DIR/$service_name" || return 1
     else
         # systemd: 添加 ExecStartPre 执行端口跳跃脚本
         local pre_cmd=""
         [[ -f "$CFG/hy2-nat.sh" ]] && pre_cmd="ExecStartPre=-/bin/bash $CFG/hy2-nat.sh"
         [[ -f "$CFG/tuic-nat.sh" ]] && pre_cmd="${pre_cmd}"$'\n'"ExecStartPre=-/bin/bash $CFG/tuic-nat.sh"
         
-        cat > /etc/systemd/system/${service_name}.service << EOF
+        cat > "$SYSTEMD_DIR/${service_name}.service" << EOF || return 1
 [Unit]
-Description=Sing-box Proxy Server (Hy2/TUIC/SS2022)
+Description=Sing-box Proxy Server (Hy2/TUIC/AnyTLS/Snell v6)
 After=network.target
 
 [Service]
 Type=simple
 Environment=ENABLE_DEPRECATED_LEGACY_DOMAIN_STRATEGY_OPTIONS=true
 ${pre_cmd}
+ExecStartPre=/usr/local/bin/sing-box check -c $CFG/singbox.json
 ExecStart=$exec_cmd
 Restart=always
 RestartSec=3
 LimitNOFILE=51200
+
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload
+    fi
+}
+
+# 新装共享核心也需要 watchdog unit，不能依赖其他独立协议顺带创建。
+create_watchdog_service() {
+    if [[ "$DISTRO" == alpine ]]; then
+        cat >"$OPENRC_DIR/vless-watchdog" <<EOF || return 1
+#!/sbin/openrc-run
+name="VLESS Watchdog"
+command="/bin/bash"
+command_args="$CFG/watchdog.sh"
+command_background="yes"
+pidfile="/run/vless-watchdog.pid"
+depend() { need net; }
+EOF
+        chmod +x "$OPENRC_DIR/vless-watchdog"
+    else
+        cat >"$SYSTEMD_DIR/vless-watchdog.service" <<EOF || return 1
+[Unit]
+Description=VLESS Watchdog
+After=network.target vless-singbox.service
+
+[Service]
+Type=simple
+ExecStart=/bin/bash $CFG/watchdog.sh
+Restart=always
+RestartSec=10
 
 [Install]
 WantedBy=multi-user.target
@@ -13642,11 +13924,189 @@ gen_snell_v6_server_config() {
         psk "$psk" port "$port" version "$version" \
         dns "$dns_servers" dns_ip_preference "$dns_pref" mode "$mode" tfo "$tfo")"
     _save_join_info "snell-v6" "SNELL-V6|%s|$port|$psk|$version|$mode" \
-        gen_snell_link "%s" "$port" "$psk" "$version" "" "$mode" \
+        gen_snell_link "%s" "$port" "$psk" "$version" "" "$mode" official \
         --extra "MODE=$mode" "DNS=${dns_servers:-system}" \
         "DNS_IP_PREFERENCE=$dns_pref" "TFO=$tfo"
     cp "$CFG/snell-v6.join" "$CFG/join.txt" 2>/dev/null
     echo "server" > "$CFG/role"
+}
+
+# Sing-box 版的 JOIN 文件按端口重建，绝不覆盖官方 snell-v6.join。
+regenerate_singbox_snell_join_info() {
+    local output="${1:-$CFG/snell-v6-singbox.join}" tmp records record
+    local ipv4 ipv6 label ip host port psk mode tfo code link
+    tmp=$(mktemp "${output}.tmp.XXXXXX") || return 1
+    records=$(db_protocol_configs singbox snell-v6-singbox) || { rm -f "$tmp"; return 1; }
+    IFS='|' read -r ipv4 ipv6 <<<"$(get_connection_addresses)"
+    while IFS= read -r record; do
+        [[ -n "$record" ]] || continue
+        port=$(jq -r '.port' <<<"$record")
+        psk=$(jq -r '.psk' <<<"$record")
+        mode=$(jq -r '.mode // "default"' <<<"$record")
+        tfo=$(jq -r 'if .tfo == null then "true" else .tfo | tostring end' <<<"$record")
+        printf '# Snell v6 (Sing-box) PORT=%s\n' "$port" >>"$tmp"
+        for label in V4 V6; do
+            ip="$ipv4"; [[ "$label" == V6 ]] && ip="$ipv6"
+            [[ -n "$ip" ]] || continue
+            host="$ip"; [[ "$label" == V6 ]] && host="[$ip]"
+            code=$(printf 'SNELL-V6|%s|%s|%s|6|%s' "$host" "$port" "$psk" "$mode" | base64 -w 0) || { rm -f "$tmp"; return 1; }
+            link=$(gen_snell_link "$host" "$port" "$psk" 6 "" "$mode" singbox) || { rm -f "$tmp"; return 1; }
+            printf 'JOIN_%s=%s\nSNELL_V6_SINGBOX_%s=%s\n' "$label" "$code" "$label" "$link" >>"$tmp"
+        done
+        printf 'MODE=%s\nTFO=%s\n' "$mode" "$tfo" >>"$tmp"
+    done <<<"$records"
+    chmod 600 "$tmp" && mv "$tmp" "$output" || { rm -f "$tmp"; return 1; }
+}
+
+# 仅快照共享 Sing-box 所拥有的资源；官方服务和官方配置不在事务范围内。
+_singbox_snell_restore() {
+    local snapshot="$1" runtime_changed="$2" file saved
+    if [[ "$runtime_changed" == true ]]; then
+        svc stop vless-singbox || return 1
+        if [[ ! -f "$snapshot/enabled" &&
+              ( -f "$SYSTEMD_DIR/vless-singbox.service" || -f "$OPENRC_DIR/vless-singbox" ) ]]; then
+            svc disable vless-singbox || return 1
+        fi
+    fi
+    cp -p "$snapshot/db.json" "$DB_FILE" || return 1
+    for saved in config join systemd openrc; do
+        case "$saved" in
+            config) file="$CFG/singbox.json" ;;
+            join) file="$CFG/snell-v6-singbox.join" ;;
+            systemd) file="$SYSTEMD_DIR/vless-singbox.service" ;;
+            openrc) file="$OPENRC_DIR/vless-singbox" ;;
+        esac
+        if [[ -f "$snapshot/$saved" ]]; then
+            cp -p "$snapshot/$saved" "$file" || return 1
+        else
+            rm -f "$file" || return 1
+        fi
+    done
+    if [[ "$runtime_changed" == true ]]; then
+        [[ "$DISTRO" == alpine ]] || systemctl daemon-reload >/dev/null 2>&1 || return 1
+        if [[ -f "$snapshot/enabled" ]]; then
+            svc enable vless-singbox || return 1
+        fi
+        if [[ -f "$snapshot/running" ]]; then
+            svc restart vless-singbox && _wait_for_singbox_ready || return 1
+        fi
+    fi
+}
+
+_apply_singbox_snell_change() {
+    local action="$1" old_port="$2" record="$3" result=0
+    [[ -f "$DB_FILE" ]] || init_db || return 1
+    _db_lock_acquire || return 1
+    _apply_singbox_snell_change_locked "$action" "$old_port" "$record" || result=1
+    _db_lock_release
+    return "$result"
+}
+
+_apply_singbox_snell_change_locked() {
+    local action="$1" old_port="$2" record="$3" snapshot file saved
+    local runtime_changed=false success=false new_port="0"
+    case "$action" in
+        add|replace)
+            _validate_singbox_snell_record "$record" || return 1
+            new_port=$(jq -r '.port' <<<"$record") || return 1
+            ;;
+        remove) ;;
+        *) return 1 ;;
+    esac
+    [[ "$action" == add || "$old_port" =~ ^[0-9]+$ || ( "$action" == remove && "$old_port" == all ) ]] || return 1
+    snapshot=$(mktemp -d "$CFG/.singbox-node.XXXXXX") || return 1
+    cp -p "$DB_FILE" "$snapshot/db.json" || { rmdir "$snapshot"; return 1; }
+    for saved in config join systemd openrc; do
+        case "$saved" in
+            config) file="$CFG/singbox.json" ;;
+            join) file="$CFG/snell-v6-singbox.join" ;;
+            systemd) file="$SYSTEMD_DIR/vless-singbox.service" ;;
+            openrc) file="$OPENRC_DIR/vless-singbox" ;;
+        esac
+        if [[ -f "$file" ]] && ! cp -p "$file" "$snapshot/$saved"; then
+            rm -rf "$snapshot"
+            return 1
+        fi
+    done
+    svc status vless-singbox >/dev/null 2>&1 && touch "$snapshot/running"
+    svc enabled vless-singbox >/dev/null 2>&1 && touch "$snapshot/enabled"
+
+    # 跨核心检查重复端口；覆盖只能豁免精确匹配的本实例。
+    if ! jq --arg action "$action" --arg old "$old_port" --argjson record "$record" --argjson port "$new_port" '
+        def records: if type == "array" then .[] elif type == "object" then . else empty end;
+        (.singbox["snell-v6-singbox"] // [] | [records]) as $current |
+        if $action != "add" and $old != "all" and
+           ([$current[] | select((.port | tostring) == $old)] | length) != 1 then error("target missing")
+        elif $action != "remove" and
+            ([to_entries[] | select(.key == "xray" or .key == "singbox" or .key == "mihomo") |
+              .key as $core | .value | to_entries[] | .key as $proto | .value | records |
+              select(.port == $port) |
+              select(($action == "replace" and $core == "singbox" and $proto == "snell-v6-singbox" and (.port | tostring) == $old) | not)] | length) > 0
+        then error("duplicate port")
+        else
+            (if $action == "add" then $current + [$record]
+             elif $action == "replace" then [$current[] | if (.port | tostring) == $old then $record else . end]
+             elif $old == "all" then []
+             else [$current[] | select((.port | tostring) != $old)] end) as $next |
+            if ($next | length) == 0 then del(.singbox["snell-v6-singbox"])
+            else .singbox["snell-v6-singbox"] = $next end
+        end
+    ' "$DB_FILE" >"$snapshot/next-db.json" ||
+       ! chmod 600 "$snapshot/next-db.json" || ! mv "$snapshot/next-db.json" "$DB_FILE"; then
+        rm -rf "$snapshot"
+        return 1
+    fi
+
+    if [[ -n "$(get_singbox_protocols)" ]]; then
+        if generate_singbox_config "$snapshot/candidate.json" &&
+           regenerate_singbox_snell_join_info "$snapshot/candidate.join" &&
+           mv "$snapshot/candidate.json" "$CFG/singbox.json" &&
+           mv "$snapshot/candidate.join" "$CFG/snell-v6-singbox.join"; then
+            runtime_changed=true
+            if create_singbox_service && svc enable vless-singbox; then
+                local operation=start
+                [[ -f "$snapshot/running" ]] && operation=restart
+                if svc "$operation" vless-singbox && _wait_for_singbox_ready; then
+                    success=true
+                fi
+            fi
+        fi
+    else
+        runtime_changed=true
+        if svc stop vless-singbox && svc disable vless-singbox &&
+           rm -f "$CFG/singbox.json" "$CFG/snell-v6-singbox.join" \
+                 "$SYSTEMD_DIR/vless-singbox.service" "$OPENRC_DIR/vless-singbox"; then
+            if [[ "$DISTRO" == alpine ]] || systemctl daemon-reload; then
+                success=true
+            fi
+        fi
+    fi
+    if [[ "$success" == true ]]; then
+        if ! db_exists singbox snell-v6-singbox; then
+            rm -f "$CFG/snell-v6-singbox.join"
+        fi
+        rm -rf "$snapshot"
+        return 0
+    fi
+    if ! _singbox_snell_restore "$snapshot" "$runtime_changed"; then
+        _err "Sing-box 回滚失败，恢复快照保留在: $snapshot"
+        return 1
+    fi
+    rm -rf "$snapshot"
+    _err "Sing-box 变更失败，已恢复原配置"
+    return 1
+}
+
+gen_singbox_snell_v6_server_config() {
+    local psk="$1" port="$2" mode="${3:-default}" tfo="${4:-true}"
+    local action=add old_port=all record
+    [[ "${INSTALL_MODE:-}" == replace ]] && { action=replace; old_port="${REPLACE_PORT:-}"; }
+    # PSK 即使全部为数字也必须保持字符串，不能被 build_config 自动转为数字。
+    record=$(build_config port "$port" version 6 mode "$mode" tfo "$tfo" |
+        jq --arg psk "$psk" '.psk=$psk') || return 1
+    _apply_singbox_snell_change "$action" "$old_port" "$record" || return 1
+    unset INSTALL_MODE REPLACE_PORT
+    printf '%s\n' server >"$CFG/role"
 }
 
 #═══════════════════════════════════════════════════════════════════════════════
@@ -13748,6 +14208,7 @@ get_all_services() {
                 services+="vless-snell-v5-shadowtls:shadow-tls "
                 services+="vless-snell-v5-shadowtls-backend:snell-server-v5 "
                 ;;
+            snell-v6) services+="vless-snell-v6:snell-server-v6 " ;;
             *) has_xray=true ;;
         esac
     done
@@ -13758,9 +14219,8 @@ get_all_services() {
     local has_singbox=false
     for proto in $singbox_protos; do
         case "$proto" in
-            hy2|tuic) has_singbox=true ;;
+            hy2|tuic|anytls|snell-v6-singbox) has_singbox=true ;;
             snell-v6) services+="vless-snell-v6:snell-server-v6 " ;;
-            anytls) services+="vless-anytls:anytls-server " ;;
             ss2022-shadowtls) services+="vless-ss2022-shadowtls:shadow-tls " ;;
         esac
     done
@@ -13926,6 +14386,11 @@ create_service() {
     local port password sni stls_password ss_backend_port snell_backend_port
 
     [[ -z "$service_name" ]] && { _err "未知协议: $protocol"; return 1; }
+
+    if [[ "$kind" == singbox ]]; then
+        create_singbox_service
+        return $?
+    fi
 
     # 检查配置是否存在
     _need_cfg() {
@@ -14306,12 +14771,13 @@ start_services() {
 ensure_singbox_runtime_consistency() {
     local singbox_protocols=$(get_singbox_protocols)
     [[ -z "$singbox_protocols" ]] && return 0
+    is_paused && return 0
     check_cmd sing-box || return 0
 
     local need_rebuild=false
     [[ ! -f "$CFG/singbox.json" ]] && need_rebuild=true
 
-    if [[ "$need_rebuild" == "false" ]] && ! /usr/local/bin/sing-box check -c "$CFG/singbox.json" >/dev/null 2>&1; then
+    if [[ "$need_rebuild" == "false" ]] && ! validate_singbox_config "$CFG/singbox.json" >/dev/null 2>&1; then
         need_rebuild=true
     fi
 
@@ -14319,9 +14785,10 @@ ensure_singbox_runtime_consistency() {
         _info "检测到 Sing-box 配置缺失或无效，正在自动重建..."
         generate_singbox_config || return 1
         create_server_scripts
-        create_singbox_service
-        svc enable vless-singbox >/dev/null 2>&1 || true
+        create_singbox_service || return 1
+        svc enable vless-singbox >/dev/null 2>&1 || return 1
         svc restart vless-singbox || svc start vless-singbox || return 1
+        _wait_for_singbox_ready || return 1
         _ok "Sing-box 配置已自动修复"
     fi
 }
@@ -16370,6 +16837,22 @@ gen_xray_routing_rules() {
 gen_singbox_routing_rules() {
     local rules=$(db_get_routing_rules singbox)
     [[ -z "$rules" || "$rules" == "[]" ]] && return
+
+    # 预设的域名和 IP 库为 OR 关系；混用 GeoSite/GeoIP/普通域名时分开生成，
+    # 不能把 "geosite:cn,geoip:cn" 当成一个规则集名称。
+    local preset_ips preset
+    preset_ips=$(for preset in "${!ROUTING_PRESETS_IP[@]}"; do
+        jq -nc --arg key "$preset" --arg value "${ROUTING_PRESETS_IP[$preset]}" '{key:$key,value:$value}'
+    done | jq -s 'from_entries') || return 1
+    rules=$(jq --argjson ips "$preset_ips" '[.[] | . as $rule |
+        if .type == "all" then . else
+            (((.domains // "") + "," + ($ips[.type] // "")) | split(",") | map(select(length > 0))) as $tokens |
+            ($tokens | map(select(startswith("geosite:") or startswith("geoip:")))) as $geo |
+            ($tokens | map(select((startswith("geosite:") or startswith("geoip:")) | not)) | join(",")) as $plain |
+            ($geo + (if $plain == "" then [] else [$plain] end))[] |
+            . as $domains | $rule + {domains:$domains}
+        end
+    ]' <<<"$rules") || return 1
     
     local result="[]"
     local all_ipv6="[]"
@@ -16414,6 +16897,8 @@ gen_singbox_routing_rules() {
                 prefer_ipv6) tag="chain-${node_name}-prefer-ipv6" ;;
                 *) tag="chain-${node_name}-prefer-ipv4" ;;
             esac
+        elif [[ "$outbound" == balancer:* ]]; then
+            tag="balancer-${outbound#balancer:}"
         fi
         
         if [[ "$rule_type" == "all" ]]; then
@@ -16506,6 +16991,7 @@ gen_singbox_routing_rules() {
     
     result=$(echo "$result" | jq --argjson v6 "$all_ipv6" --argjson v4 "$all_ipv4" --argjson other "$all_other" '. + $v6 + $v4 + $other')
     [[ "$result" != "[]" ]] && echo "$result"
+    return 0
 }
 
 # Mihomo 出口使用独立名称，避免与内置 DIRECT/REJECT 冲突。
@@ -17539,12 +18025,11 @@ _regenerate_proxy_configs() {
     
     local singbox_protocols=$(get_singbox_protocols)
     if [[ -n "$singbox_protocols" ]]; then
-        generate_singbox_config
-        svc restart vless-singbox 2>/dev/null
+        _regenerate_singbox_routing_config || return 1
     fi
 
     local mihomo_protocols
-    mihomo_protocols=$(get_mihomo_protocols)
+    mihomo_protocols=$(get_mihomo_protocols) || mihomo_protocols=""
     if [[ -n "$mihomo_protocols" ]]; then
         _regenerate_mihomo_routing_config || return 1
     fi
@@ -20635,7 +21120,8 @@ show_all_protocols_info() {
         if [[ -n "$singbox_protocols" ]]; then
             echo -e "  ${Y}Sing-box 协议 (vless-singbox 服务):${NC}"
             for protocol in $singbox_protocols; do
-                local port=$(db_get_field "singbox" "$protocol" "port")
+                local port
+                port=$(db_list_ports singbox "$protocol" | paste -sd ',' -)
                 if [[ -n "$port" ]]; then
                     echo -e "    ${G}$idx${NC}) $(get_protocol_name $protocol) - 端口: ${G}$port${NC}"
                     all_protocols+=("$protocol")
@@ -20808,7 +21294,8 @@ show_all_share_links() {
                     trojan-ws) link=$(gen_trojan_ws_link "$ipv4" "$display_port" "$password" "$sni" "$path" "$country_code") ;;
                     snell) link=$(gen_snell_link "$ipv4" "$display_port" "$psk" "$version" "$country_code") ;;
                     snell-v5) link=$(gen_snell_v5_link "$ipv4" "$display_port" "$psk" "$version" "$country_code") ;;
-                    snell-v6) link=$(gen_snell_link "$ipv4" "$display_port" "$psk" "${version:-6}" "$country_code" "$snell_mode") ;;
+                    snell-v6) link=$(gen_snell_link "$ipv4" "$display_port" "$psk" "${version:-6}" "$country_code" "$snell_mode" official) ;;
+                    snell-v6-singbox) link=$(gen_snell_link "$ipv4" "$display_port" "$psk" "${version:-6}" "$country_code" "$snell_mode" singbox) ;;
                     tuic) link=$(gen_tuic_link "$ipv4" "$display_port" "$uuid" "$password" "$sni" "$country_code") ;;
                     anytls) link=$(gen_anytls_link "$ipv4" "$display_port" "$password" "$sni" "$country_code") ;;
                     naive) link=$(gen_naive_link "$domain" "$display_port" "$username" "$password" "$country_code") ;;
@@ -20855,7 +21342,8 @@ show_all_share_links() {
                     trojan-ws) link=$(gen_trojan_ws_link "$ip6" "$display_port" "$password" "$sni" "$path" "$country_code") ;;
                     snell) link=$(gen_snell_link "$ip6" "$display_port" "$psk" "$version" "$country_code") ;;
                     snell-v5) link=$(gen_snell_v5_link "$ip6" "$display_port" "$psk" "$version" "$country_code") ;;
-                    snell-v6) link=$(gen_snell_link "$ip6" "$display_port" "$psk" "${version:-6}" "$country_code" "$snell_mode") ;;
+                    snell-v6) link=$(gen_snell_link "$ip6" "$display_port" "$psk" "${version:-6}" "$country_code" "$snell_mode" official) ;;
+                    snell-v6-singbox) link=$(gen_snell_link "$ip6" "$display_port" "$psk" "${version:-6}" "$country_code" "$snell_mode" singbox) ;;
                     tuic) link=$(gen_tuic_link "$ip6" "$display_port" "$uuid" "$password" "$sni" "$country_code") ;;
                     anytls) link=$(gen_anytls_link "$ip6" "$display_port" "$password" "$sni" "$country_code") ;;
                     naive) ;; # NaïveProxy 使用域名，不需要 IPv6 链接
@@ -20963,7 +21451,7 @@ show_single_protocol_info() {
     local snell_dns=$(echo "$cfg" | jq -r '.dns // empty')
     local snell_dns_pref=$(echo "$cfg" | jq -r '.dns_ip_preference // empty')
     local snell_mode=$(echo "$cfg" | jq -r '.mode // empty')
-    local snell_tfo=$(echo "$cfg" | jq -r '.tfo // empty')
+    local snell_tfo=$(echo "$cfg" | jq -r 'if .tfo == null then empty else .tfo | tostring end')
     
     # 重新获取连接地址（数据库中的可能是旧的或由无公网旧版本写成空值）
     if [[ -z "$ipv4" && -z "$ipv6" ]]; then
@@ -21236,7 +21724,7 @@ show_single_protocol_info() {
             echo -e "  ${Y}Loon 配置:${NC}"
             echo -e "  ${C}${country_code}-SS2022-ShadowTLS = Shadowsocks, ${config_ip}, ${display_port}, ${method}, \"${password}\", udp=true, shadow-tls-password=${stls_password}, shadow-tls-sni=${sni}, shadow-tls-version=3${NC}"
             ;;
-        snell|snell-v5|snell-v6)
+        snell|snell-v5|snell-v6|snell-v6-singbox)
             echo -e "  PSK: ${G}$psk${NC}"
             echo -e "  版本: ${G}v$version${NC}"
             if [[ "$protocol" == "snell-v6" ]]; then
@@ -21244,6 +21732,10 @@ show_single_protocol_info() {
                 echo -e "  DNS 服务器: ${G}${snell_dns:-系统默认}${NC}"
                 echo -e "  DNS IP 偏好: ${G}${snell_dns_pref:-default}${NC}"
                 echo -e "  TCP Fast Open: ${G}${snell_tfo:-true}${NC}"
+            elif [[ "$protocol" == snell-v6-singbox ]]; then
+                echo -e "  实现: ${G}Sing-box (共享服务与分流)${NC}"
+                echo -e "  混淆模式: ${G}${snell_mode:-default}${NC}"
+                echo -e "  TCP Fast Open (客户端): ${G}${snell_tfo:-true}${NC}"
             fi
             echo ""
             echo -e "  ${Y}Surge 配置 (Snell 为 Surge 专属协议):${NC}"
@@ -21382,8 +21874,10 @@ show_single_protocol_info() {
                 link=$(gen_snell_v5_link "$ip_addr" "$link_port" "$psk" "$version" "$country_code")
                 join_code=$(echo "SNELL-V5|${ip_addr}|${link_port}|${psk}|${version}" | base64 -w 0)
                 ;;
-            snell-v6)
-                link=$(gen_snell_link "$ip_addr" "$link_port" "$psk" "${version:-6}" "$country_code" "${snell_mode:-default}")
+            snell-v6|snell-v6-singbox)
+                local implementation=official
+                [[ "$protocol" == snell-v6-singbox ]] && implementation=singbox
+                link=$(gen_snell_link "$ip_addr" "$link_port" "$psk" "${version:-6}" "$country_code" "${snell_mode:-default}" "$implementation")
                 join_code=$(echo "SNELL-V6|${ip_addr}|${link_port}|${psk}|${version:-6}|${snell_mode:-default}" | base64 -w 0)
                 ;;
             snell-shadowtls|snell-v5-shadowtls)
@@ -21575,6 +22069,7 @@ show_single_protocol_info() {
     
     _line
     [[ "$clear_screen" == "true" ]] && _pause
+    return 0
 }
 
 # 管理协议服务
@@ -21944,6 +22439,19 @@ uninstall_specific_protocol() {
             _err "旧版 Snell 配置更新失败，未执行卸载"
             return 1
         }
+    elif [[ "$selected_protocol" == snell-v6-singbox ]]; then
+        _apply_singbox_snell_change remove "$SELECTED_PORT" '{}' || {
+            _err "Sing-box 配置更新失败，未执行卸载"
+            return 1
+        }
+        # 只更新已存在的订阅，不套用旧版仅面向 TLS 协议的 Nginx 清理规则。
+        # 另一实现及其他协议仍可能通过此订阅发布。
+        if [[ -f "$CFG/sub.info" || -d "$CFG/subscription" ]]; then
+            generate_sub_files || return 1
+        fi
+        _ok "$(get_protocol_name "$selected_protocol") 已卸载"
+        _pause
+        return 0
     elif [[ " $XRAY_PROTOCOLS " == *" $selected_protocol "* ]]; then
         # Xray 协议：需要重新生成配置
         # 根据选择的端口进行卸载
@@ -22121,24 +22629,34 @@ uninstall_specific_protocol() {
         # 删除服务文件
         if [[ "$DISTRO" == "alpine" ]]; then
             rc-update del "$service_name" default 2>/dev/null
-            rm -f "/etc/init.d/$service_name"
+            rm -f "$OPENRC_DIR/$service_name"
             # ShadowTLS 后端服务
             if [[ -n "${BACKEND_NAME[$selected_protocol]:-}" ]]; then
                 rc-update del "${BACKEND_NAME[$selected_protocol]}" default 2>/dev/null
-                rm -f "/etc/init.d/${BACKEND_NAME[$selected_protocol]}"
+                rm -f "$OPENRC_DIR/${BACKEND_NAME[$selected_protocol]}"
             fi
         else
             systemctl disable "$service_name" 2>/dev/null
-            rm -f "/etc/systemd/system/${service_name}.service"
+            rm -f "$SYSTEMD_DIR/${service_name}.service"
             # ShadowTLS 后端服务
             if [[ -n "${BACKEND_NAME[$selected_protocol]:-}" ]]; then
                 systemctl disable "${BACKEND_NAME[$selected_protocol]}" 2>/dev/null
-                rm -f "/etc/systemd/system/${BACKEND_NAME[$selected_protocol]}.service"
+                rm -f "$SYSTEMD_DIR/${BACKEND_NAME[$selected_protocol]}.service"
             fi
             systemctl daemon-reload
         fi
     fi
     
+    # 删除官方版不能顺带清理仍在发布 Sing-box 版的订阅服务。
+    if [[ "$selected_protocol" == snell-v6 ]] && db_exists singbox snell-v6-singbox; then
+        if [[ -f "$CFG/sub.info" || -d "$CFG/subscription" ]]; then
+            generate_sub_files || return 1
+        fi
+        _ok "$(get_protocol_name "$selected_protocol") 已卸载"
+        _pause
+        return 0
+    fi
+
     # 检查是否还有需要订阅服务的协议
     local has_sub_protocol=false
     for proto in vless-ws vless-vision trojan vmess-ws; do
@@ -22467,6 +22985,24 @@ select_protocol() {
     done
 }
 
+# Snell v6 的实现选择先于已有实例检查，两种实现使用不同协议键。
+select_snell_v6_implementation() {
+    local choice
+    printf '\n  选择 Snell v6 服务端实现\n' >&2
+    _item 1 "Sing-box (默认，支持统一分流)"
+    _item 2 "Surge 官方 (独立服务)"
+    _item 0 "返回"
+    while true; do
+        read -rp "  请选择 [0-2] (默认: 1): " choice || return 1
+        case "${choice:-1}" in
+            1) SELECTED_PROTOCOL=snell-v6-singbox; return 0 ;;
+            2) SELECTED_PROTOCOL=snell-v6; return 0 ;;
+            0) return 1 ;;
+            *) _err "无效选择" ;;
+        esac
+    done
+}
+
 # Shadowsocks 版本选择子菜单
 select_ss_version() {
     echo ""
@@ -22501,6 +23037,12 @@ do_install_server() {
     
     # 检查协议是否为空（用户选择返回）
     [[ -z "$protocol" ]] && return 1
+
+    if [[ "$protocol" == snell-v6 ]]; then
+        select_snell_v6_implementation || return 1
+        protocol="$SELECTED_PROTOCOL"
+        unset INSTALL_MODE REPLACE_PORT
+    fi
     
     # 确定核心类型
     local core
@@ -22663,6 +23205,9 @@ do_install_server() {
             ;;
         snell-v6)
             install_snell_v6 || { _err "Snell v6 安装失败"; _pause; return 1; }
+            ;;
+        snell-v6-singbox)
+            ensure_singbox_snell_support || { _err "Sing-box Snell v6 安装失败"; _pause; return 1; }
             ;;
         snell-shadowtls|snell-v5-shadowtls)
             install_mihomo || { _err "Mihomo 安装失败"; _pause; return 1; }
@@ -23529,7 +24074,7 @@ do_install_server() {
                 gen_trojan_server_config "$password" "$port" "$final_sni"
             fi
             ;;
-        snell|snell-v5|snell-shadowtls|snell-v5-shadowtls|snell-v6)
+        snell|snell-v5|snell-shadowtls|snell-v5-shadowtls|snell-v6|snell-v6-singbox)
             # 根据最终协议键确定版本
             local version psk stls_protocol
             if [[ "$protocol" == "snell" || "$protocol" == "snell-shadowtls" ]]; then
@@ -23614,59 +24159,63 @@ do_install_server() {
                         esac
                     done
 
-                    while true; do
-                        echo ""
-                        echo -e "  ${C}配置 DNS 服务器 (Snell v6)${NC}"
-                        _line
-                        echo -e "  ${G}1. 推荐混合 DNS${NC} ${D}(1.1.1.1,8.8.8.8,2001:4860:4860::8888)${NC}"
-                        echo -e "  ${G}2. 系统默认${NC} ${D}(不写入 dns 参数)${NC}"
-                        echo -e "  ${G}3. Cloudflare${NC} ${D}(1.1.1.1,1.0.0.1)${NC}"
-                        echo -e "  ${G}4. Google${NC} ${D}(8.8.8.8,8.8.4.4)${NC}"
-                        echo -e "  ${G}5. AliDNS${NC} ${D}(223.5.5.5,223.6.6.6)${NC}"
-                        echo -e "  ${G}6. 自定义${NC} ${D}(多个 IPv4/IPv6 地址用逗号分隔)${NC}"
-                        _line
-                        read -rp "  请选择 [1-6] (默认: 1.推荐混合 DNS): " snell_v6_dns_choice
-                        snell_v6_dns_choice="${snell_v6_dns_choice:-1}"
-                        case "$snell_v6_dns_choice" in
-                            1) snell_v6_dns="1.1.1.1,8.8.8.8,2001:4860:4860::8888"; break ;;
-                            2) snell_v6_dns=""; break ;;
-                            3) snell_v6_dns="1.1.1.1,1.0.0.1"; break ;;
-                            4) snell_v6_dns="8.8.8.8,8.8.4.4"; break ;;
-                            5) snell_v6_dns="223.5.5.5,223.6.6.6"; break ;;
-                            6)
-                                read -rp "  DNS 地址列表: " snell_v6_dns
-                                snell_v6_dns="${snell_v6_dns//[[:space:]]/}"
-                                if _is_valid_dns_server_list "$snell_v6_dns" && [[ -n "$snell_v6_dns" ]]; then
-                                    break
-                                fi
-                                _err "DNS 格式无效，请输入逗号分隔的 IPv4/IPv6 地址"
-                                ;;
-                            *) _err "无效选择，请输入 1-6" ;;
-                        esac
-                    done
+                    if [[ "$protocol" == snell-v6 ]]; then
+                        while true; do
+                            echo ""
+                            echo -e "  ${C}配置 DNS 服务器 (Snell v6)${NC}"
+                            _line
+                            echo -e "  ${G}1. 推荐混合 DNS${NC} ${D}(1.1.1.1,8.8.8.8,2001:4860:4860::8888)${NC}"
+                            echo -e "  ${G}2. 系统默认${NC} ${D}(不写入 dns 参数)${NC}"
+                            echo -e "  ${G}3. Cloudflare${NC} ${D}(1.1.1.1,1.0.0.1)${NC}"
+                            echo -e "  ${G}4. Google${NC} ${D}(8.8.8.8,8.8.4.4)${NC}"
+                            echo -e "  ${G}5. AliDNS${NC} ${D}(223.5.5.5,223.6.6.6)${NC}"
+                            echo -e "  ${G}6. 自定义${NC} ${D}(多个 IPv4/IPv6 地址用逗号分隔)${NC}"
+                            _line
+                            read -rp "  请选择 [1-6] (默认: 1.推荐混合 DNS): " snell_v6_dns_choice
+                            snell_v6_dns_choice="${snell_v6_dns_choice:-1}"
+                            case "$snell_v6_dns_choice" in
+                                1) snell_v6_dns="1.1.1.1,8.8.8.8,2001:4860:4860::8888"; break ;;
+                                2) snell_v6_dns=""; break ;;
+                                3) snell_v6_dns="1.1.1.1,1.0.0.1"; break ;;
+                                4) snell_v6_dns="8.8.8.8,8.8.4.4"; break ;;
+                                5) snell_v6_dns="223.5.5.5,223.6.6.6"; break ;;
+                                6)
+                                    read -rp "  DNS 地址列表: " snell_v6_dns
+                                    snell_v6_dns="${snell_v6_dns//[[:space:]]/}"
+                                    if _is_valid_dns_server_list "$snell_v6_dns" && [[ -n "$snell_v6_dns" ]]; then
+                                        break
+                                    fi
+                                    _err "DNS 格式无效，请输入逗号分隔的 IPv4/IPv6 地址"
+                                    ;;
+                                *) _err "无效选择，请输入 1-6" ;;
+                            esac
+                        done
 
-                    # Snell v6 服务端网络参数
-                    while true; do
-                        echo ""
-                        echo -e "  ${C}配置 DNS IP 偏好 (Snell v6)${NC}"
-                        _line
-                        echo -e "  ${G}1. default${NC}"
-                        echo -e "  ${G}2. prefer-ipv4${NC}"
-                        echo -e "  ${G}3. prefer-ipv6${NC}"
-                        echo -e "  ${G}4. ipv4-only${NC}"
-                        echo -e "  ${G}5. ipv6-only${NC}"
-                        _line
-                        read -rp "  请选择 [1-5] (默认: 1.default): " dns_pref_choice
-                        dns_pref_choice="${dns_pref_choice:-1}"
-                        case "$dns_pref_choice" in
-                            1) snell_v6_dns_pref="default"; break ;;
-                            2) snell_v6_dns_pref="prefer-ipv4"; break ;;
-                            3) snell_v6_dns_pref="prefer-ipv6"; break ;;
-                            4) snell_v6_dns_pref="ipv4-only"; break ;;
-                            5) snell_v6_dns_pref="ipv6-only"; break ;;
-                            *) _err "无效选择，请输入 1-5" ;;
-                        esac
-                    done
+                        # 官方版独立 DNS 参数不写入 Sing-box 共享设置。
+                        while true; do
+                            echo ""
+                            echo -e "  ${C}配置 DNS IP 偏好 (Snell v6)${NC}"
+                            _line
+                            echo -e "  ${G}1. default${NC}"
+                            echo -e "  ${G}2. prefer-ipv4${NC}"
+                            echo -e "  ${G}3. prefer-ipv6${NC}"
+                            echo -e "  ${G}4. ipv4-only${NC}"
+                            echo -e "  ${G}5. ipv6-only${NC}"
+                            _line
+                            read -rp "  请选择 [1-5] (默认: 1.default): " dns_pref_choice
+                            dns_pref_choice="${dns_pref_choice:-1}"
+                            case "$dns_pref_choice" in
+                                1) snell_v6_dns_pref="default"; break ;;
+                                2) snell_v6_dns_pref="prefer-ipv4"; break ;;
+                                3) snell_v6_dns_pref="prefer-ipv6"; break ;;
+                                4) snell_v6_dns_pref="ipv4-only"; break ;;
+                                5) snell_v6_dns_pref="ipv6-only"; break ;;
+                                *) _err "无效选择，请输入 1-5" ;;
+                            esac
+                        done
+                    else
+                        _info "Sing-box 版使用共享核心 DNS 与分流出口设置，不修改其他协议的设置"
+                    fi
 
                     while true; do
                         echo ""
@@ -23683,8 +24232,8 @@ do_install_server() {
                             *) _err "无效选择，请输入 1-2" ;;
                         esac
                     done
-                    echo -e "  ${D}说明：mode 与 dns 为服务端参数；TFO 开关只控制生成的 Surge 客户端 tfo 参数。${NC}"
-                    echo -e "  ${D}Snell v6 服务端会自动尝试启用 TCP Fast Open。${NC}"
+                    echo -e "  ${D}说明：mode 为服务端参数；TFO 开关只控制生成的 Surge 客户端 tfo 参数。${NC}"
+                    [[ "$protocol" != snell-v6 ]] || echo -e "  ${D}官方 Snell v6 服务端会自动尝试启用 TCP Fast Open。${NC}"
                 fi
 
                 echo ""
@@ -23696,8 +24245,13 @@ do_install_server() {
                 echo -e "  版本: ${G}v$version${NC}"
                 if [[ "$version" == "6" ]]; then
                     echo -e "  混淆模式: ${G}$snell_v6_mode${NC}"
-                    echo -e "  DNS 服务器: ${G}${snell_v6_dns:-系统默认}${NC}"
-                    echo -e "  DNS IP 偏好: ${G}$snell_v6_dns_pref${NC}"
+                    echo -e "  实现: ${G}$(get_protocol_name "$protocol")${NC}"
+                    if [[ "$protocol" == snell-v6 ]]; then
+                        echo -e "  DNS 服务器: ${G}${snell_v6_dns:-系统默认}${NC}"
+                        echo -e "  DNS IP 偏好: ${G}$snell_v6_dns_pref${NC}"
+                    else
+                        echo -e "  分流: ${G}复用 Sing-box 共享规则${NC}"
+                    fi
                     echo -e "  TCP Fast Open: ${G}$snell_v6_tfo${NC}"
                 fi
                 _line
@@ -23710,6 +24264,8 @@ do_install_server() {
                     gen_snell_server_config "$psk" "$port" "$version" || return 1
                 elif [[ "$version" == "5" ]]; then
                     gen_snell_v5_server_config "$psk" "$port" "$version" || return 1
+                elif [[ "$protocol" == snell-v6-singbox ]]; then
+                    gen_singbox_snell_v6_server_config "$psk" "$port" "$snell_v6_mode" "$snell_v6_tfo" || return 1
                 else
                     gen_snell_v6_server_config \
                         "$psk" "$port" "$version" \
@@ -23876,9 +24432,14 @@ do_install_server() {
     # 保存当前安装的协议名（防止被后续函数中的循环变量覆盖）
     local current_protocol="$protocol"
 
-    # Mihomo 节点已在生成器内完成配置校验、服务创建和健康检查，不再重复非事务启动。
-    if [[ "${PROTO_KIND[$current_protocol]:-}" == "mihomo" ]]; then
+    # Mihomo / Sing-box Snell 节点已完成事务启动，不重复重启无关核心。
+    if [[ "${PROTO_KIND[$current_protocol]:-}" == "mihomo" || "$current_protocol" == snell-v6-singbox ]]; then
         create_server_scripts
+        if [[ "$current_protocol" == snell-v6-singbox ]]; then
+            create_watchdog_service || return 1
+            svc enable vless-watchdog || return 1
+            svc start vless-watchdog || return 1
+        fi
     else
         _info "创建服务..."
         create_server_scripts  # 生成服务端辅助脚本（watchdog、hy2-nat、tuic-nat）
@@ -23906,11 +24467,11 @@ do_install_server() {
         _ok "$current_service 已启用并启动"
     fi
     
-    if [[ "${PROTO_KIND[$current_protocol]:-}" == "mihomo" ]] || start_services; then
+    if [[ "${PROTO_KIND[$current_protocol]:-}" == "mihomo" || "$current_protocol" == snell-v6-singbox ]] || start_services; then
         create_shortcut   # 安装成功才创建快捷命令
 
         # 对 Sing-box 协议做一次显式重建与校验，避免交互安装后配置未完全落盘
-        if [[ "${PROTO_KIND[$current_protocol]}" == "singbox" ]]; then
+        if [[ "${PROTO_KIND[$current_protocol]}" == "singbox" && "$current_protocol" != snell-v6-singbox ]]; then
             generate_singbox_config || { _err "Sing-box 配置重建失败"; _pause; return 1; }
             create_server_scripts
             create_singbox_service
@@ -23980,7 +24541,7 @@ do_install_server() {
         
         # 获取当前安装的端口号
         local installed_port=""
-        if [[ "${PROTO_KIND[$current_protocol]:-}" == "mihomo" ]]; then
+        if [[ "${PROTO_KIND[$current_protocol]:-}" == "mihomo" || "$current_protocol" == snell-v6-singbox ]]; then
             installed_port="$port"
         elif [[ "$INSTALL_MODE" == "replace" && -n "$REPLACE_PORT" ]]; then
             # 覆盖模式：使用被覆盖的端口（可能已更新为新端口）
@@ -25847,13 +26408,15 @@ gen_surge_sub() {
             local psk=$(echo "$cfg" | jq -r '.psk // empty')
             local version=$(echo "$cfg" | jq -r '.version // empty')
             local snell_mode=$(echo "$cfg" | jq -r '.mode // "default"')
-            local snell_tfo=$(echo "$cfg" | jq -r '.tfo // "true"')
+            local snell_tfo=$(echo "$cfg" | jq -r 'if .tfo == null then "true" else .tfo | tostring end')
             local stls_password=$(echo "$cfg" | jq -r '.stls_password // empty')
             local name="${country_code}-$(get_protocol_name $protocol)-${ip_suffix}"
             case "$protocol" in
                 snell) name="${country_code}-Snell-${port}" ;;
                 snell-v5) name="${country_code}-Snell-v5-${port}" ;;
                 snell-shadowtls|snell-v5-shadowtls) name="${country_code}-${protocol}-${port}" ;;
+                snell-v6) name="${country_code}-Snell-v6-official-${port}" ;;
+                snell-v6-singbox) name="${country_code}-Snell-v6-singbox-${port}" ;;
             esac
             local proxy=""
             
@@ -25879,7 +26442,7 @@ gen_surge_sub() {
                 snell|snell-v5|snell-shadowtls|snell-v5-shadowtls)
                     [[ -n "$server_ip" ]] && proxy=$(gen_snell_surge_line "$name" "$server_ip" "$port" "$psk" "${version:-4}" "${snell_mode:-default}" "${snell_tfo:-true}" "$stls_password" "$sni")
                     ;;
-                snell-v6)
+                snell-v6|snell-v6-singbox)
                     # Snell v6 服务端与 Surge 客户端的 mode 必须完全一致。
                     [[ -n "$server_ip" ]] && proxy=$(gen_snell_surge_line "$name" "$server_ip" "$port" "$psk" "${version:-6}" "${snell_mode:-default}" "${snell_tfo:-true}")
                     ;;
@@ -27999,7 +28562,7 @@ show_service_logs() {
     # Sing-box 协议组 (hy2/tuic)
     local singbox_protocols=$(get_singbox_protocols)
     if [[ -n "$singbox_protocols" ]]; then
-        echo -e "  ${G}$idx${NC}) Sing-box 服务日志 (hy2/tuic)"
+        echo -e "  ${G}$idx${NC}) Sing-box 服务日志 (HY2/TUIC/AnyTLS/Snell v6)"
         proto_array+=("singbox")
         ((idx++))
     fi
@@ -28120,6 +28683,7 @@ _select_protocol_for_users() {
     local proto_array=()
     while IFS= read -r proto; do
         [[ -z "$proto" ]] && continue
+        [[ "$proto" != snell-v6-singbox ]] || continue
         local core="xray"
         db_exists "singbox" "$proto" && core="singbox"
         local user_count=$(db_count_users "$core" "$proto")
@@ -28132,6 +28696,7 @@ _select_protocol_for_users() {
     _item "0" "返回"
     _line
     
+    [[ ${#proto_array[@]} -gt 0 ]] || { _err "没有支持用户管理的协议 (Snell v6 使用每端口固定 PSK)"; return 1; }
     local max=$((i-1))
     while true; do
         read -rp "  请选择 [0-$max]: " choice
@@ -28548,7 +29113,7 @@ _add_user() {
     local proto_name=$(get_protocol_name "$proto")
     
     # 检查是否为独立协议（不支持多用户）
-    if is_standalone_protocol "$proto"; then
+    if is_standalone_protocol "$proto" || [[ "$proto" == snell-v6-singbox ]]; then
         echo ""
         _err "$proto_name 为独立协议，不支持多用户管理"
         _info "该协议使用配置文件中的固定密钥，无需添加用户"

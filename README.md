@@ -52,8 +52,11 @@ nftm
 ## Snell 与 Mihomo
 
 - Snell v4/v5 由 Mihomo v1.19.28+ 提供；一个进程可同时监听多个端口，且每个端口可独立使用不同的 PSK 和版本。
-- Snell+ShadowTLS 使用 Mihomo 内置的 ShadowTLS v3；Snell v6 仍由官方 `snell-server-v6` 提供。
-- Snell v6 默认使用官方 `v6.0.0` 正式版下载链接（[官方发布说明](https://kb.nssurge.com/surge-knowledge-base/release-notes/snell)），已核对 amd64/aarch64 安装包与 RC2 的 SHA-256 一致；GitHub 镜像未同步时也会使用正式版。
+- Snell+ShadowTLS 使用 Mihomo 内置的 ShadowTLS v3；安装 Snell v6 时可选择 **Sing-box（默认）** 或 **Surge 官方**。已有官方安装不会自动迁移，两种实现可使用不同端口同时运行。
+- Sing-box 版需要核心 **v1.14.0+**，与 HY2/TUIC/AnyTLS 共用 `vless-singbox` 服务和 `/etc/vless-reality/singbox.json`。支持多个端口，各端口独立配置 PSK 和 `default` / `unshaped` / `unsafe-raw` 模式；重复安装可添加或覆盖指定端口，卸载也按端口处理，不会删除另一实现。PSK 沿用脚本的 16–255 位字母数字限制；暂不提供 Snell 多用户、用户限额和用户流量统计。
+- Sing-box 版直接复用“分流管理”的现有共享规则，包括预设 GeoSite/GeoIP、自定义域名/IP、广告及访问限制、IPv4/IPv6 匹配、直连、WARP、链式代理及现有负载均衡，不另写 Snell 专属 DNS。Instagram/INS 规则仍仅作用于 Mihomo。新核心配置使用 `domain_resolver`，无需依赖旧 `domain_strategy` 弃用开关。
+- 官方版继续使用独立的 `vless-snell-v6` 服务和 `/etc/vless-reality/snell-v6.conf`，保留原有 DNS 选择。默认使用官方 `v6.0.0` 正式版下载链接（[官方发布说明](https://kb.nssurge.com/surge-knowledge-base/release-notes/snell)），已核对 amd64/aarch64 安装包与 RC2 的 SHA-256 一致；GitHub 镜像未同步时也会使用正式版。
+- Surge 订阅中的 Snell v6 节点名称包含实现和端口，客户端 `mode` 与服务端一致；TFO 选择只控制客户端参数。Sing-box 节点变更先校验候选配置，重启/监听检查失败则回滚数据库、配置及服务状态；分流更新失败保留原运行配置。存在 Snell v6 入站时，核心更新拒绝降级至 v1.14.0 以下。
 - 旧版 Snell v4/v5 安装会自动迁移到 Mihomo；冷启动时会等待所有 listener 就绪，迁移失败则自动回滚，并自动清理迁移产生的空协议记录。
 - Mihomo 已纳入核心版本管理和运行状态显示。
 - Mihomo 服务端共用“分流管理”中的规则，支持预设 GeoSite/GeoIP、自定义域名/IP、广告及访问限制、IPv4/IPv6 匹配、直连、WARP 和链式代理；修改规则后会校验配置并重启生效。升级后进入脚本会自动同步旧版全部直连的配置，未配置规则时仍默认直连。
@@ -64,12 +67,19 @@ nftm
 安全回归测试（仅临时配置，不安装服务或修改防火墙）：
 
 ```bash
+bash tests/test-mihomo-snell.sh
 bash tests/test-mihomo-routing.sh
 # 可选：使用已有 Mihomo 二进制做配置校验及回环流量测试（需要 Python 3）
 VLESS_TEST_MIHOMO_BIN=/path/to/mihomo bash tests/test-mihomo-routing.sh
 # Instagram 专属选项、规则集和跨内核隔离测试
 bash tests/test-mihomo-instagram.sh
+# Snell v6 双实现、多端口、共享分流、升级保护与失败回滚
+bash tests/test-singbox-snell.sh
+# 可选：已有 Sing-box 1.14+ 的真实配置校验及回环 TCP/UDP 测试（需要 Python 3）
+VLESS_TEST_SINGBOX_BIN=/path/to/sing-box bash tests/test-singbox-snell.sh
 ```
+
+测试使用临时目录和模拟服务；规则集使用本地测试数据，不下载规则库。真实核心流量测试只监听回环地址，不安装服务、不改防火墙。Snell v6 安装本身会写入 `/etc/vless-reality`、`/usr/local/bin` 和 systemd/OpenRC 服务目录，升级共享核心会短暂重启所有 Sing-box 入站，请在维护窗口操作。
 
 REALITY 防偷流量说明：
 
