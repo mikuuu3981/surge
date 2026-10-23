@@ -23,6 +23,7 @@ get_ip_country() { printf '%s\n' TEST; }
 _header() { :; }
 _pause() { :; }
 systemctl() { printf '%s\n' "$*" >>"$TMP/systemctl"; }
+rc-update() { printf '%s\n' "$*" >>"$TMP/rc-update"; }
 create_singbox_service() { printf '%s\n' 'test-service' >"$SYSTEMD_DIR/vless-singbox.service"; }
 sing-box() {
     if [[ -n "$REAL_BIN" ]]; then "$REAL_BIN" "$@"; return $?; fi
@@ -174,7 +175,13 @@ check 'any(.route.rules[]; .outbound=="block" and .domain_suffix==["blocked.exam
        any(.route.rules[]; .ip_cidr==["198.51.100.0/24","2001:db8::/32"])'
 check '.route.final=="direct" and any(.outbounds[]; .tag=="chain-landing-prefer-ipv4" and .domain_resolver.strategy=="prefer_ipv4")'
 if [[ -n "$REAL_BIN" ]]; then
-    python3 "$ROOT/tests/test-singbox-snell-runtime.py" "$REAL_BIN" "$CFG/singbox.json"
+    # Generate real v4/v5 listeners and their scoped sniff actions using a
+    # candidate DB; the active v6 transaction fixture stays intact.
+    jq '.singbox.snell=[{port:41901,version:4,psk:"1234567890123456"}] |
+        .singbox["snell-v5"]=[{port:41902,version:5,psk:"1234567890123456"}]' \
+        "$DB_FILE" >"$TMP/runtime-db.json"
+    generate_singbox_config "$TMP/runtime-server.json" "$TMP/runtime-db.json"
+    python3 "$ROOT/tests/test-singbox-snell-runtime.py" "$REAL_BIN" "$TMP/runtime-server.json"
 fi
 printf '%s\n' 'ok - shared domain/IP routing, reject, chain and modern DNS resolver'
 
@@ -188,6 +195,9 @@ _build_singbox_ruleset() {
     fi
     sing-box rule-set compile "$source_file" -o "$CFG/ruleset/$1.srs"
 }
+# Instagram now participates in Sing-box generation even when there are no
+# eligible v4/v5 listeners. Seed its domain source so this suite stays offline.
+printf '%s\n' '["instagram.com","cdninstagram.com","ig.me"]' >"$CFG/yuu-instagram-domains.json"
 jq '.balancer_groups=[{name:"pool",strategy:"leastPing",nodes:["landing"]}] |
     .routing_rules=[
       {type:"telegram",outbound:"balancer:pool",domains:"geosite:telegram",ip_version:"as_is"},

@@ -12,6 +12,8 @@ wget -O vless-server.sh https://raw.githubusercontent.com/mikuuu3981/surge/main/
 vless
 ```
 
+查看完整配置：进入“协议服务管理 → 查看运行配置文件”，选择 Xray 或 Sing-box。脚本按服务进程的启动参数查找配置，完整输出磁盘文件；服务停止时明确标注默认配置。显示内容包含原始凭据，磁盘文件也可能与进程已经载入的配置不同。
+
 ## 脚本更新渠道
 
 在主菜单选择“检查脚本更新”后，可选择：
@@ -49,37 +51,41 @@ chmod +x nft.sh
 nftm
 ```
 
-## Snell 与 Mihomo
+## Snell 与 Sing-box
 
-- Snell v4/v5 由 Mihomo v1.19.28+ 提供；一个进程可同时监听多个端口，且每个端口可独立使用不同的 PSK 和版本。
-- Snell+ShadowTLS 使用 Mihomo 内置的 ShadowTLS v3；安装 Snell v6 时可选择 **Sing-box（默认）** 或 **Surge 官方**。已有官方安装不会自动迁移，两种实现可使用不同端口同时运行。
-- Sing-box 版需要核心 **v1.14.0+**，与 HY2/TUIC/AnyTLS 共用 `vless-singbox` 服务和 `/etc/vless-reality/singbox.json`。支持多个端口，各端口独立配置 PSK 和 `default` / `unshaped` / `unsafe-raw` 模式；重复安装可添加或覆盖指定端口，卸载也按端口处理，不会删除另一实现。PSK 沿用脚本的 16–255 位字母数字限制；暂不提供 Snell 多用户、用户限额和用户流量统计。
-- Sing-box 版直接复用“分流管理”的现有共享规则，包括预设 GeoSite/GeoIP、自定义域名/IP、广告及访问限制、IPv4/IPv6 匹配、直连、WARP、链式代理及现有负载均衡，不另写 Snell 专属 DNS。Instagram/INS 规则仍仅作用于 Mihomo。新核心配置使用 `domain_resolver`，无需依赖旧 `domain_strategy` 弃用开关。
+- Snell v4/v5/v6 统一由 Sing-box v1.14.0+ 提供，与 HY2/TUIC/AnyTLS 共用 `vless-singbox` 服务。每个端口可独立使用不同的 PSK 和协议版本。
+- Snell v4/v5 的服务端配置统一使用 `version: 5`，分享链接和 Surge 订阅仍保留所选的 `version=4/5`。这是 Sing-box 的协议兼容方式；不支持 Snell v5 的 QUIC 代理模式。
+- Snell+ShadowTLS 使用 Sing-box 内置 ShadowTLS v3 接入 Snell；安装 Snell v6 时仍可选择 **Sing-box（默认）** 或 **Surge 官方**。已有官方安装不会自动迁移，两种实现可使用不同端口同时运行。
+- Sing-box 版使用 `/etc/vless-reality/singbox.json`。支持多个端口，重复安装可添加或覆盖指定端口，卸载也按端口处理。v6 支持 `default` / `unshaped` / `unsafe-raw` 模式，PSK 沿用脚本的 16–255 位字母数字限制；迁移 v4/v5 时保留原凭据。暂不提供 Snell 多用户、用户限额和用户流量统计。
+- Sing-box 版直接复用“分流管理”的现有共享规则，包括预设 GeoSite/GeoIP、自定义域名/IP、广告及访问限制、IPv4/IPv6 匹配、直连、WARP、链式代理及现有负载均衡，不另写 Snell 专属 DNS。新核心配置使用 `domain_resolver`，无需依赖旧 `domain_strategy` 弃用开关。
 - 官方版继续使用独立的 `vless-snell-v6` 服务和 `/etc/vless-reality/snell-v6.conf`，保留原有 DNS 选择。默认使用官方 `v6.0.0` 正式版下载链接（[官方发布说明](https://kb.nssurge.com/surge-knowledge-base/release-notes/snell)），已核对 amd64/aarch64 安装包与 RC2 的 SHA-256 一致；GitHub 镜像未同步时也会使用正式版。
-- Surge 订阅中的 Snell v6 节点名称包含实现和端口，客户端 `mode` 与服务端一致；TFO 选择只控制客户端参数。Sing-box 节点变更先校验候选配置，重启/监听检查失败则回滚数据库、配置及服务状态；分流更新失败保留原运行配置。存在 Snell v6 入站时，核心更新拒绝降级至 v1.14.0 以下。
-- 旧版 Snell v4/v5 安装会自动迁移到 Mihomo；冷启动时会等待所有 listener 就绪，迁移失败则自动回滚，并自动清理迁移产生的空协议记录。
-- Mihomo 已纳入核心版本管理和运行状态显示。
-- Mihomo 服务端共用“分流管理”中的规则，支持预设 GeoSite/GeoIP、自定义域名/IP、广告及访问限制、IPv4/IPv6 匹配、直连、WARP 和链式代理；修改规则后会校验配置并重启生效。升级后进入脚本会自动同步旧版全部直连的配置，未配置规则时仍默认直连。
+- Surge 订阅中的 Snell v6 节点名称包含实现和端口，客户端 `mode` 与服务端一致；TFO 选择只控制客户端参数。Sing-box 节点变更先校验候选配置，重启/监听检查失败则回滚数据库、配置及服务状态；分流更新失败保留原运行配置。存在 Snell 入站时，核心更新拒绝降级至 v1.14.0 以下。
+- 旧版 Mihomo 及更早独立服务中的 Snell v4/v5 节点迁移到 Sing-box，保留端口、PSK 和 ShadowTLS 参数。迁移先校验候选配置，切换失败自动回滚；成功后清理脚本托管的 Mihomo 资源。ShadowTLS 的 Snell 后端仅绑定回环地址。
+- 暂停服务时延后迁移；已安装的 Sing-box 版本不足时，先通过核心管理升级再重试。无法等价迁移的旧分流或负载均衡配置会在停服前报错，保留旧节点和服务。
 - WARP 支持 WGCF 与官方 SOCKS5 模式；官方模式的 UDP 保持直连。GeoSite/GeoIP 首次使用需要从 GitHub 下载规则库，之后每 24 小时更新。
-- Instagram/INS 服务端分流：安装 Mihomo 协议后，在“分流管理 → 配置分流规则 → 添加分流规则”选择 `i) Instagram/INS (仅 Mihomo)`，再选择出口和 IPv4/IPv6 匹配范围。使用 [Yuu-rules 的 Instagram 域名规则集](https://github.com/Yuu518/Yuu-rules/blob/rule-set/mihomo/geosite/instagram.list)（包含 `instagram.com`、`cdninstagram.com`、`ig.me` 等），以 `.mrs` 格式下载并每 24 小时更新，缓存位于 `/etc/vless-reality/rule-providers/yuu-instagram.mrs`。此选项不是默认启用，添加、覆盖或删除只更新 Mihomo；Xray/Sing-box 不应用这条规则，客户端订阅也不因此增加规则。首次下载需能访问 `raw.githubusercontent.com`。
-- Mihomo 负载均衡：`leastPing` 对应最低延迟，`roundRobin`/`random` 对应轮询，`leastLoad` 对应一致性哈希（不等同于 Xray 的最低负载）。不支持的链式协议（如 NaiveProxy）或缺失的出口会报错并保留原配置，不会静默改为直连。
+- Instagram/INS 分流迁至 Sing-box，沿用 [Yuu-rules 域名列表](https://github.com/Yuu518/Yuu-rules/blob/rule-set/mihomo/geosite/instagram.list)，仅匹配 Snell v4/v5（含 ShadowTLS）入站。规则列表缓存 24 小时，更新失败时使用已有缓存；不会扩大到 HY2/TUIC/AnyTLS 或 Snell v6。
+- v4/v5 入站保留 HTTP Host / TLS SNI 嗅探，供域名分流使用，不改写原始目标地址。
 
 安全回归测试（仅临时配置，不安装服务或修改防火墙）：
 
 ```bash
-bash tests/test-mihomo-snell.sh
-bash tests/test-mihomo-routing.sh
-# 可选：使用已有 Mihomo 二进制做配置校验及回环流量测试（需要 Python 3）
-VLESS_TEST_MIHOMO_BIN=/path/to/mihomo bash tests/test-mihomo-routing.sh
-# Instagram 专属选项、规则集和跨内核隔离测试
-bash tests/test-mihomo-instagram.sh
-# Snell v6 双实现、多端口、共享分流、升级保护与失败回滚
+# Snell 多版本、多端口、共享分流、升级保护与失败回滚
 bash tests/test-singbox-snell.sh
+# v4/v5、ShadowTLS 及旧数据库迁移
+bash tests/test-singbox-snell-migration.sh
+# Instagram 域名规则、旧规则兼容与入站隔离
+bash tests/test-singbox-instagram.sh
+# 脚本自身更新、校验与失败恢复
+bash tests/test-script-update.sh
+# 运行配置路径识别、完整输出及停止状态
+bash tests/test-runtime-config.sh
 # 可选：已有 Sing-box 1.14+ 的真实配置校验及回环 TCP/UDP 测试（需要 Python 3）
 VLESS_TEST_SINGBOX_BIN=/path/to/sing-box bash tests/test-singbox-snell.sh
+# 可选：真实迁移配置校验与 ShadowTLS 握手测试（还需 OpenSSL）
+VLESS_TEST_SINGBOX_BIN=/path/to/sing-box bash tests/test-singbox-snell-migration.sh
 ```
 
-测试使用临时目录和模拟服务；规则集使用本地测试数据，不下载规则库。真实核心流量测试只监听回环地址，不安装服务、不改防火墙。Snell v6 安装本身会写入 `/etc/vless-reality`、`/usr/local/bin` 和 systemd/OpenRC 服务目录，升级共享核心会短暂重启所有 Sing-box 入站，请在维护窗口操作。
+测试使用临时目录和模拟服务；规则集使用本地测试数据，不下载规则库。真实核心流量测试只监听回环地址，不安装服务、不改防火墙。Snell 安装和迁移会写入 `/etc/vless-reality`、`/usr/local/bin` 和 systemd/OpenRC 服务目录；节点变更、迁移及核心升级会短暂重启所有 Sing-box 入站，请在维护窗口操作。
 
 REALITY 防偷流量说明：
 
