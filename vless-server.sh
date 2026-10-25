@@ -22,7 +22,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
     exit 1
 fi
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.5.21 [服务端]
+#  多协议代理一键部署脚本 v3.5.22 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -41,7 +41,7 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.5.21"
+readonly VERSION="3.5.22"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/mikuuu3981/surge"
 readonly SCRIPT_REPO="mikuuu3981/surge"
@@ -10677,9 +10677,47 @@ PY
     "${SINGBOX_CONFIG_BINARY:-sing-box}" rule-set compile "$source_path" -o "$output_path" >/dev/null 2>&1
 }
 
+_singbox_sukka_ai_cache_valid() {
+    local path=$(_singbox_ruleset_path "$1")
+    [[ -s "$path" ]] && "${SINGBOX_CONFIG_BINARY:-sing-box}" rule-set decompile "$path" -o /dev/null >/dev/null 2>&1
+}
+
+_build_singbox_sukka_ai_ruleset() {
+    local tag="$1" url source_path output_path tmp_source tmp_output
+    case "$tag" in
+        skk-ai-non-ip) url="https://ruleset.skk.moe/sing-box/non_ip/ai.json" ;;
+        skk-ai-ip) url="https://ruleset.skk.moe/sing-box/ip/ai.json" ;;
+        *) return 1 ;;
+    esac
+    source_path=$(_singbox_ruleset_source_path "$tag")
+    output_path=$(_singbox_ruleset_path "$tag")
+    mkdir -p "$CFG/ruleset" "$CFG/ruleset-src" || return 1
+    tmp_source=$(mktemp "$CFG/ruleset-src/.${tag}.XXXXXX") || return 1
+    tmp_output=$(mktemp "$CFG/ruleset/.${tag}.XXXXXX") || { rm -f "$tmp_source"; return 1; }
+
+    # 保留上游完整 JSON；两份规则集独立编译，禁止扁平化或合并匹配条件。
+    if curl -fsSL --connect-timeout 10 --max-time 60 -o "$tmp_source" "$url" &&
+        jq -e 'type == "object" and (.version | type == "number") and
+            (.rules | type == "array" and length > 0)' "$tmp_source" >/dev/null 2>&1 &&
+        "${SINGBOX_CONFIG_BINARY:-sing-box}" rule-set compile "$tmp_source" -o "$tmp_output" >/dev/null 2>&1 &&
+        [[ -s "$tmp_output" ]]; then
+        chmod 600 "$tmp_source" "$tmp_output"
+        if mv -f "$tmp_source" "$source_path" && mv -f "$tmp_output" "$output_path"; then
+            return 0
+        fi
+    fi
+    rm -f "$tmp_source" "$tmp_output"
+    if _singbox_sukka_ai_cache_valid "$tag"; then
+        _warn "更新 Sukka AI 规则集失败，继续使用有效缓存: $tag" >&2
+        return 0
+    fi
+    return 1
+}
+
 _build_singbox_ruleset() {
     local tag="$1"
     case "$tag" in
+        skk-ai-non-ip|skk-ai-ip) _build_singbox_sukka_ai_ruleset "$tag" ;;
         geosite-*) _build_singbox_geosite_ruleset "$tag" ;;
         geoip-*) _build_singbox_geoip_ruleset "$tag" ;;
         *) return 1 ;;
@@ -10721,6 +10759,25 @@ _ensure_singbox_rulesets_from_routing_rules() {
     local tag
     for tag in $tags; do
         local path=$(_singbox_ruleset_path "$tag")
+        if [[ "$tag" == skk-ai-non-ip || "$tag" == skk-ai-ip ]]; then
+            # 仅在配置重建的准备阶段刷新，不注册后台任务。
+            local source_path=$(_singbox_ruleset_source_path "$tag")
+            if ! _singbox_sukka_ai_cache_valid "$tag" || ! python3 - "$source_path" "$path" <<'PY'
+import os, sys, time
+try:
+    fresh = all(time.time() - os.path.getmtime(path) < 86400 for path in sys.argv[1:])
+except OSError:
+    fresh = False
+sys.exit(0 if fresh else 1)
+PY
+            then
+                _build_singbox_ruleset "$tag" || {
+                    _err "生成 Sing-box 规则集失败: $tag"
+                    return 1
+                }
+            fi
+            continue
+        fi
         if [[ ! -s "$path" ]]; then
             _info "生成规则集: $tag"
             _build_singbox_ruleset "$tag" || {
@@ -15629,6 +15686,7 @@ uninstall_warp() {
 # 预设规则类型定义 (使用 geosite 规则库，更全面且自动更新)
 declare -A ROUTING_PRESETS=(
     [ai-intl]="geosite:category-ai-!cn"
+    [singbox-ai]="rule-set:skk-ai-non-ip,rule-set:skk-ai-ip"
     [openai]="geosite:openai"
     [netflix]="geosite:netflix"
     [disney]="geosite:disney"
@@ -15652,7 +15710,8 @@ declare -A ROUTING_PRESETS_IP=(
 
 # 预设规则显示名称
 declare -A ROUTING_PRESET_NAMES=(
-    [ai-intl]="AI服务(国际)"
+    [ai-intl]="GeoSite-AI-Xray专属"
+    [singbox-ai]="Sukka-AI-Sing-Box专属"
     [openai]="OpenAI/ChatGPT"
     [netflix]="Netflix"
     [disney]="Disney+"
@@ -15765,6 +15824,8 @@ db_get_routing_rules() {
     local core="${1:-all}" db_file="${2:-$DB_FILE}"
     [[ ! -f "$db_file" ]] && printf '%s\n' '[]' && return
     jq --arg core "$core" '. as $db | [.routing_rules[]? |
+        select(.type != "ai-intl" or $core == "all" or $core == "xray") |
+        select(.type != "singbox-ai" or $core == "all" or $core == "singbox") |
         select((.type != "mihomo-instagram" and .type != "singbox-instagram") or $core == "all" or $core == "mihomo" or
             ($core == "singbox" and
              ([$db.singbox, $db.mihomo, $db.xray | . // {} | to_entries[] |
@@ -16437,7 +16498,7 @@ gen_singbox_routing_rules() {
         jq -nc --arg key "$preset" --arg value "${ROUTING_PRESETS_IP[$preset]}" '{key:$key,value:$value}'
     done | jq -s 'from_entries') || return 1
     rules=$(jq --argjson ips "$preset_ips" '[.[] | . as $rule |
-        if .type == "all" then . else
+        if .type == "all" or .type == "singbox-ai" then . else
             (((.domains // "") + "," + ($ips[.type] // "")) | split(",") | map(select(length > 0))) as $tokens |
             ($tokens | map(select(startswith("geosite:") or startswith("geoip:")))) as $geo |
             ($tokens | map(select((startswith("geosite:") or startswith("geoip:")) | not)) | join(",")) as $plain |
@@ -16509,6 +16570,17 @@ gen_singbox_routing_rules() {
                 ipv4_only) all_ipv4=$(echo "$all_ipv4" | jq --argjson r "$rule_json" '. + [$r]') ;;
                 *) all_other=$(echo "$all_other" | jq --argjson r "$rule_json" '. + [$r]') ;;
             esac
+        elif [[ "$rule_type" == "singbox-ai" ]]; then
+            # 相邻路由表达 OR；ip_version 与规则集相交，不能用全网 ip_cidr 扩张匹配。
+            local ai_ip_version=0
+            case "$ip_version" in
+                ipv4_only) ai_ip_version=4 ;;
+                ipv6_only) ai_ip_version=6 ;;
+            esac
+            result=$(jq --arg tag "$tag" --argjson version "$ai_ip_version" '
+                . + (["skk-ai-non-ip", "skk-ai-ip"] | map(
+                    {rule_set:[.], outbound:$tag} +
+                    (if $version == 0 then {} else {ip_version:$version} end)))' <<<"$result") || return 1
         elif [[ -n "$domains" ]]; then
             # 检测是否是 geosite 规则
             if [[ "$domains" == geosite:* ]]; then
@@ -17094,8 +17166,16 @@ configure_routing_rules() {
             3)
                 read -rp "  确认清空所有分流规则? [y/N]: " confirm
                 if [[ "$confirm" =~ ^[Yy]$ ]]; then
+                    local xray_rules singbox_rules
+                    xray_rules=$(db_get_routing_rules xray | jq length)
+                    singbox_rules=$(db_get_routing_rules singbox | jq length)
                     db_clear_routing_rules
-                    _regenerate_proxy_configs
+                    if (( xray_rules > 0 )); then
+                        _reload_ai_routing_core ai-intl || { _pause; return 1; }
+                    fi
+                    if (( singbox_rules > 0 )); then
+                        _reload_ai_routing_core singbox-ai || { _pause; return 1; }
+                    fi
                     _ok "已清空所有分流规则"
                 fi
                 _pause
@@ -17129,7 +17209,10 @@ _add_routing_rule() {
     _item "6" "TikTok"
     _item "7" "Telegram"
     _item "8" "Google"
-    _item "9" "AI服务(国际)"
+    _item "9" "GeoSite-AI-Xray专属"
+    local singbox_protocols
+    singbox_protocols=$(get_singbox_protocols) || :
+    [[ -z "$singbox_protocols" ]] || _item "s" "Sukka-AI-Sing-Box专属"
     _item "d" "MyTVSuper"
     local mihomo_protocols
     mihomo_protocols=$(get_singbox_snell_protocols | grep -v '^snell-v6-singbox$') || :
@@ -17153,6 +17236,11 @@ _add_routing_rule() {
         7) rule_type="telegram" ;;
         8) rule_type="google" ;;
         9) rule_type="ai-intl" ;;
+        s|S)
+            [[ -n "$singbox_protocols" ]] || { _warn "请先安装 Sing-box 协议"; _pause; return 1; }
+            rule_type="singbox-ai"
+            _info "分别使用 Sukka AI non_ip 与 ip 规则集，统一选择出口"
+            ;;
         d|D) rule_type="mytvsuper" ;;
         i|I)
             if [[ -z "$mihomo_protocols" ]]; then
@@ -17248,6 +17336,13 @@ _add_routing_rule() {
         fi
     fi
 
+    # AI 专属规则修改失败时恢复原数据库，与配置回滚保持一致。
+    local ai_snapshot=""
+    if [[ "$rule_type" == singbox-ai || "$rule_type" == ai-intl ]]; then
+        ai_snapshot=$(mktemp "$CFG/.ai-routing.XXXXXX") || return 1
+        cp -p "$DB_FILE" "$ai_snapshot" || { rm -f "$ai_snapshot"; return 1; }
+    fi
+
     # 保存规则
     if [[ "$rule_type" == "custom" ]]; then
         db_add_routing_rule "$rule_type" "$outbound" "$custom_domains" "$ip_version"
@@ -17274,7 +17369,15 @@ _add_routing_rule() {
     
     # Mihomo 专属规则只应用到 Mihomo，不重启其他内核。
     _info "更新代理配置..."
-    if [[ "$rule_type" == "mihomo-instagram" || "$rule_type" == singbox-instagram ]]; then
+    if [[ "$rule_type" == singbox-ai || "$rule_type" == ai-intl ]]; then
+        if ! _reload_ai_routing_core "$rule_type"; then
+            cp -p "$ai_snapshot" "$DB_FILE" || { _err "数据库恢复失败，备份保留: $ai_snapshot"; return 1; }
+            rm -f "$ai_snapshot"
+            _pause
+            return 1
+        fi
+        rm -f "$ai_snapshot"
+    elif [[ "$rule_type" == "mihomo-instagram" || "$rule_type" == singbox-instagram ]]; then
         _regenerate_singbox_routing_config || { _pause; return 1; }
     else
         _regenerate_proxy_configs || { _pause; return 1; }
@@ -17343,8 +17446,21 @@ _del_routing_rule() {
     if [[ "$del_choice" =~ ^[0-9]+$ ]] && [[ "$del_choice" -ge 1 && "$del_choice" -le ${#rule_ids[@]} ]]; then
         local del_id="${rule_ids[$((del_choice-1))]}" del_type
         del_type=$(printf '%s\n' "$rules" | jq -r --arg id "$del_id" '.[] | select(.id == $id) | .type')
+        local ai_snapshot=""
+        if [[ "$del_type" == singbox-ai || "$del_type" == ai-intl ]]; then
+            ai_snapshot=$(mktemp "$CFG/.ai-routing.XXXXXX") || return 1
+            cp -p "$DB_FILE" "$ai_snapshot" || { rm -f "$ai_snapshot"; return 1; }
+        fi
         db_del_routing_rule "$del_id"
-        if [[ "$del_type" == "mihomo-instagram" || "$del_type" == singbox-instagram ]]; then
+        if [[ "$del_type" == singbox-ai || "$del_type" == ai-intl ]]; then
+            if ! _reload_ai_routing_core "$del_type"; then
+                cp -p "$ai_snapshot" "$DB_FILE" || { _err "数据库恢复失败，备份保留: $ai_snapshot"; return 1; }
+                rm -f "$ai_snapshot"
+                _pause
+                return 1
+            fi
+            rm -f "$ai_snapshot"
+        elif [[ "$del_type" == "mihomo-instagram" || "$del_type" == singbox-instagram ]]; then
             local mihomo_protocols
             mihomo_protocols=$(get_singbox_snell_protocols) || :
             if [[ -n "$mihomo_protocols" ]]; then
@@ -17356,6 +17472,21 @@ _del_routing_rule() {
         _ok "已删除规则"
     fi
     _pause
+}
+
+# AI 预设仅重载其所属核心。
+_reload_ai_routing_core() {
+    case "$1" in
+        singbox-ai)
+            [[ -n "$(get_singbox_protocols)" ]] || return 0
+            _regenerate_singbox_routing_config
+            ;;
+        ai-intl)
+            [[ -n "$(get_xray_protocols)" ]] || return 0
+            rebuild_and_reload_xray silent
+            ;;
+        *) return 1 ;;
+    esac
 }
 
 # 重新生成代理配置的辅助函数

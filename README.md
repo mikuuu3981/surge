@@ -72,6 +72,7 @@ Sing-box 版与其他 Sing-box 协议共用 `vless-singbox` 服务及 `/etc/vles
 - 暂停服务时延后迁移；已安装的 Sing-box 版本不足时，先通过核心管理升级再重试。无法等价迁移的旧分流或负载均衡配置会在停服前报错，保留旧节点和服务。
 - WARP 支持 WGCF 与官方 SOCKS5 模式；官方模式的 UDP 保持直连。GeoSite/GeoIP 首次使用需要从 GitHub 下载规则库，之后每 24 小时更新。
 - Instagram/INS 分流迁至 Sing-box，沿用 [Yuu-rules 域名列表](https://github.com/Yuu518/Yuu-rules/blob/rule-set/mihomo/geosite/instagram.list)，仅匹配 Snell v4/v5（含 ShadowTLS）入站。规则列表缓存 24 小时，更新失败时使用已有缓存；不会扩大到 HY2/TUIC/AnyTLS 或 Snell v6。
+- AI 分流分为 `GeoSite-AI-Xray专属`（原 `ai-intl`，仅 Xray）与 `Sukka-AI-Sing-Box专属`（`singbox-ai`，仅 Sing-box，有 Sing-box 协议时显示 `s` 选项）。Sukka 分别使用 [non_ip](https://ruleset.skk.moe/sing-box/non_ip/ai.json) 和 [ip](https://ruleset.skk.moe/sing-box/ip/ai.json) 两份完整规则集，共用所选出口；IPv4/IPv6 限制与规则集匹配条件相交。源文件缓存到 `/etc/vless-reality/ruleset-src/`，独立编译到 `ruleset/`，配置重建时刷新超过 24 小时的缓存；更新失败使用有效旧缓存，无有效缓存则配置生成失败。添加或删除 AI 规则仅重载对应核心。
 - v4/v5 入站保留 HTTP Host / TLS SNI 嗅探，供域名分流使用，不改写原始目标地址。
 
 安全回归测试（仅临时配置，不安装服务或修改防火墙）：
@@ -87,6 +88,10 @@ bash tests/test-singbox-snell.sh
 bash tests/test-singbox-snell-migration.sh
 # Instagram 域名规则、旧规则兼容与入站隔离
 bash tests/test-singbox-instagram.sh
+# AI 核心/出口隔离、完整源编译、缓存刷新回退与菜单/重载隔离
+bash tests/test-singbox-ai.sh
+# 可选：使用本机核心真实编译 AI 规则集并校验配置（不启动服务）
+VLESS_TEST_SINGBOX_BIN=/usr/bin/sing-box bash tests/test-singbox-ai.sh
 # 脚本自身更新、校验与失败恢复
 bash tests/test-script-update.sh
 # 运行配置路径识别、完整输出及停止状态
