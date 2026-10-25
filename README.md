@@ -51,6 +51,14 @@ chmod +x nft.sh
 nftm
 ```
 
+## VLESS+Vision+REALITY 核心选择
+
+安装 VLESS+Vision+REALITY 时可选择 Xray（默认）或 Sing-box。Sing-box 版使用独立协议键 `vless-singbox`，与 Xray 版可在不同端口同时运行；支持多端口、用户管理、分享链接和通用/Clash 订阅。
+
+Sing-box 版与其他 Sing-box 协议共用 `vless-singbox` 服务及 `/etc/vless-reality/singbox.json`，配置或核心变更会影响同一服务的所有入站。REALITY 默认向伪装域名的 443 端口握手；域名匹配脚本托管的真实证书时，使用本地 `127.0.0.1:8443`。Vision 使用 `xtls-rprx-vision`。
+
+**REALITY 防偷流量限速仅适用于 Xray。** Sing-box 版不写入 `reality_fallback_limits` 或 Xray 的 `limitFallbackUpload` / `limitFallbackDownload` 字段。
+
 ## Snell 与 Sing-box
 
 - Snell v4/v5/v6 统一由 Sing-box v1.14.0+ 提供，与 HY2/TUIC/AnyTLS 共用 `vless-singbox` 服务。每个端口可独立使用不同的 PSK 和协议版本。
@@ -69,6 +77,10 @@ nftm
 安全回归测试（仅临时配置，不安装服务或修改防火墙）：
 
 ```bash
+# VLESS 双核心并存、多端口、用户、REALITY 握手及分享/订阅
+bash tests/test-singbox-vless.sh
+# VLESS Sing-box 安装事务成功路径及配置/重启/健康检查失败回滚
+bash tests/test-singbox-vless-install.sh
 # Snell 多版本、多端口、共享分流、升级保护与失败回滚
 bash tests/test-singbox-snell.sh
 # v4/v5、ShadowTLS 及旧数据库迁移
@@ -79,6 +91,8 @@ bash tests/test-singbox-instagram.sh
 bash tests/test-script-update.sh
 # 运行配置路径识别、完整输出及停止状态
 bash tests/test-runtime-config.sh
+# 可选：VLESS 使用已有 Sing-box 1.14+ 执行真实配置校验（不启动监听）
+VLESS_TEST_SINGBOX_BIN=/path/to/sing-box bash tests/test-singbox-vless.sh
 # 可选：已有 Sing-box 1.14+ 的真实配置校验及回环 TCP/UDP 测试（需要 Python 3）
 VLESS_TEST_SINGBOX_BIN=/path/to/sing-box bash tests/test-singbox-snell.sh
 # 可选：真实迁移配置校验与 ShadowTLS 握手测试（还需 OpenSSL）
@@ -89,7 +103,7 @@ VLESS_TEST_SINGBOX_BIN=/path/to/sing-box bash tests/test-singbox-snell-migration
 
 REALITY 防偷流量说明：
 
-REALITY 对鉴权失败的连接会回落到 `target`。如果伪装目标使用 Cloudflare 等公共 CDN，服务器可能被扫描后被当作 CDN 端口转发器，消耗额外出口流量。脚本会按照 XTLS 官方文档为 VLESS+REALITY 和 VLESS+REALITY+XHTTP 写入 `limitFallbackUpload` / `limitFallbackDownload` 令牌桶限速，并为每个实例随机化参数；合法 REALITY 连接不受此限速影响。
+REALITY 对鉴权失败的连接会回落到伪装目标。如果伪装目标使用 Cloudflare 等公共 CDN，服务器可能被扫描后被当作 CDN 端口转发器，消耗额外出口流量。脚本会按照 XTLS 官方文档，仅为 **Xray** 的 VLESS+REALITY 和 VLESS+REALITY+XHTTP 写入 `limitFallbackUpload` / `limitFallbackDownload` 令牌桶限速，并为每个实例随机化参数；合法 REALITY 连接不受此限速影响。Sing-box 版不支持此限速。
 
 这里针对的是 REALITY 的 `target` 使用 CDN 的场景；普通 Cloudflare CDN 不代理原始 TCP REALITY，需使用脚本中的 XHTTP+TLS+CDN 模式。
 

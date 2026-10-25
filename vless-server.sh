@@ -22,7 +22,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
     exit 1
 fi
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.5.20 [服务端]
+#  多协议代理一键部署脚本 v3.5.21 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -41,7 +41,7 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.5.20"
+readonly VERSION="3.5.21"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/mikuuu3981/surge"
 readonly SCRIPT_REPO="mikuuu3981/surge"
@@ -636,6 +636,7 @@ get_protocol_name() {
     local proto="$1"
     case "$proto" in
         vless) echo "VLESS-REALITY" ;;
+        vless-singbox) echo "VLESS-REALITY (Sing-box)" ;;
         vless-vision) echo "VLESS-Vision" ;;
         vless-ws) echo "VLESS-WS-TLS" ;;
         vless-ws-notls) echo "VLESS-WS-CF" ;;
@@ -1290,7 +1291,11 @@ db_set_user_enabled() {
     ' || return 1
     
     # 自动重建配置
-    [[ "$core" == "xray" ]] && rebuild_and_reload_xray "silent"
+    case "$core" in
+        xray) rebuild_and_reload_xray "silent" ;;
+        singbox) rebuild_and_reload_singbox "silent" ;;
+        *) return 0 ;;
+    esac
 }
 
 # 检查用户是否超限 (支持多端口数组格式)
@@ -1665,13 +1670,15 @@ check_and_disable_expired_users() {
     
     while IFS='|' read -r core proto name expire_date days_left; do
         [[ -z "$name" ]] && continue
-        db_set_user_enabled "$core" "$proto" "$name" false
+        if ! db_set_user_enabled "$core" "$proto" "$name" false; then
+            _err "用户 $name ($proto) 禁用或配置重载失败" >&2
+            continue
+        fi
         ((count++))
         [[ "$notify" == "--notify" ]] && send_tg_expired_notice "$name" "$proto" "$expire_date" "$core"
         echo "[$(date '+%Y-%m-%d %H:%M:%S')] 禁用: $name ($proto)" >> "$CFG/expire.log"
     done <<< "$expired_users"
     
-    [[ $count -gt 0 ]] && rebuild_and_reload_xray "silent" 2>/dev/null
     echo "$count"
 }
 
@@ -2505,13 +2512,13 @@ data = json.loads(path.read_text())
 changed = [False]
 singbox = data.get('singbox') or {}
 
-for proto in ('hy2', 'tuic', 'anytls'):
+for proto in ('hy2', 'tuic', 'anytls', 'vless-singbox'):
     cfg = singbox.get(proto)
     if cfg is None:
         continue
 
     def default_secret(obj):
-        if proto == 'tuic':
+        if proto in ('tuic', 'vless-singbox'):
             return obj.get('uuid') or ''
         return obj.get('password') or obj.get('username') or obj.get('uuid') or ''
 
@@ -2766,9 +2773,9 @@ _sync_all_user_traffic_unlocked() {
         done
     done
 
-    # 遍历所有 Sing-box 协议（当前已接入 HY2 / TUIC / AnyTLS 用户级统计）
+    # 遍历支持用户级统计的 Sing-box 协议
     if [[ "$has_singbox" == "true" ]] && singbox_stats_available; then
-        for proto in hy2 tuic anytls; do
+        for proto in hy2 tuic anytls vless-singbox; do
             db_exists "singbox" "$proto" || continue
             local mappings=$(_get_singbox_stat_user_mappings "$proto")
             [[ -z "$mappings" ]] && continue
@@ -2795,7 +2802,10 @@ _sync_all_user_traffic_unlocked() {
                         if [[ "$used" -ge "$quota" ]]; then
                             local exceeded_notified=$(db_get_user_alert_state "singbox" "$proto" "$user" "quota_exceeded_notified")
                             if [[ "$exceeded_notified" != "true" ]]; then
-                                db_set_user_enabled "singbox" "$proto" "$user" "false"
+                                if ! db_set_user_enabled "singbox" "$proto" "$user" "false"; then
+                                    _err "用户 $user ($proto) 配额禁用或配置重载失败" >&2
+                                    continue
+                                fi
                                 db_set_user_alert_state "singbox" "$proto" "$user" "quota_exceeded_notified" "true"
                                 tg_send_over_quota "$user" "$proto" "$used" "$quota" "singbox"
                             fi
@@ -2864,7 +2874,7 @@ sync_all_user_traffic() {
 
 # 获取所有用户流量统计 (用于显示)
 # 输出格式: proto|user|uplink|downlink|total
-# 支持 Xray + Sing-box（当前已接入 HY2 / TUIC / AnyTLS 的用户级统计）
+# 支持 Xray + Sing-box 的用户级统计
 get_all_traffic_stats() {
     [[ ! -f "$DB_FILE" ]] && return 1
     _ensure_singbox_default_users
@@ -2908,9 +2918,9 @@ get_all_traffic_stats() {
         done
     done
 
-    # 遍历 Sing-box 用户（HY2 / TUIC / AnyTLS）
+    # 遍历支持用户级统计的 Sing-box 用户
     if _pgrep sing-box &>/dev/null && singbox_stats_available; then
-        for proto in hy2 tuic anytls; do
+        for proto in hy2 tuic anytls vless-singbox; do
             db_exists "singbox" "$proto" || continue
             local mappings=$(_get_singbox_stat_user_mappings "$proto")
             [[ -z "$mappings" ]] && continue
@@ -3868,7 +3878,7 @@ fi
 SINGBOX_V2RAY_API_PORT="10086"
 XRAY_PROTOCOLS="vless vless-xhttp vless-xhttp-cdn vless-ws vless-ws-notls vmess-ws vless-vision trojan trojan-ws socks ss2022 ss-legacy"
 # Sing-box 管理的协议 (原独立协议，现统一由 Sing-box 处理)
-SINGBOX_PROTOCOLS="hy2 tuic anytls snell-v6-singbox snell snell-v5 snell-shadowtls snell-v5-shadowtls"
+SINGBOX_PROTOCOLS="hy2 tuic anytls vless-singbox snell-v6-singbox snell snell-v5 snell-shadowtls snell-v5-shadowtls"
 readonly SINGBOX_SNELL_MIN_VERSION="1.14.0"
 # 旧版 Snell 协议键保持稳定，供迁移和客户端订阅识别。
 SNELL_LEGACY_PROTOCOLS="snell snell-v5 snell-shadowtls snell-v5-shadowtls"
@@ -3930,10 +3940,11 @@ for _p in $XRAY_PROTOCOLS; do
     PROTO_KIND[$_p]="xray"
 done
 
-# Sing-box 统一服务：HY2/TUIC/AnyTLS/Snell v6 共用 vless-singbox
+# Sing-box 协议共用 vless-singbox 服务
 PROTO_SVC[hy2]="vless-singbox";  PROTO_BIN[hy2]="sing-box"; PROTO_KIND[hy2]="singbox"
 PROTO_SVC[tuic]="vless-singbox"; PROTO_BIN[tuic]="sing-box"; PROTO_KIND[tuic]="singbox"
 PROTO_SVC[anytls]="vless-singbox"; PROTO_BIN[anytls]="sing-box"; PROTO_KIND[anytls]="singbox"
+PROTO_SVC[vless-singbox]="vless-singbox"; PROTO_BIN[vless-singbox]="sing-box"; PROTO_KIND[vless-singbox]="singbox"
 PROTO_SVC[snell-v6-singbox]="vless-singbox"; PROTO_BIN[snell-v6-singbox]="sing-box"; PROTO_KIND[snell-v6-singbox]="singbox"
 
 # 官方 Snell v6 保持独立进程，可与上面的 Sing-box 版同时运行。
@@ -6100,7 +6111,7 @@ recommend_port() {
                 fi
             fi
             ;;
-        vless|vless-xhttp)
+        vless|vless-singbox|vless-xhttp)
             # Reality 协议：伪装特性使其可使用任意端口，默认随机高位端口
             while true; do
                 local p=$(gen_port)
@@ -6181,7 +6192,7 @@ ask_port() {
                 fi
             fi
             ;;
-        vless|vless-xhttp)
+        vless|vless-singbox|vless-xhttp)
             # Reality 协议默认随机端口
             echo -e "  ${D}(Reality 协议伪装能力强，可使用任意端口)${NC}" >&2
             echo -e "  ${C}建议: ${G}$recommend${NC} (随机高位端口)" >&2
@@ -6538,7 +6549,7 @@ EOF
         local nginx_comment="作为Xray的fallback后端"
         local nginx_ssl=""
         
-        if [[ "$protocol" == "vless" || "$protocol" == "vless-xhttp" ]]; then
+        if [[ "$protocol" == "vless" || "$protocol" == "vless-singbox" || "$protocol" == "vless-xhttp" ]]; then
             # Reality协议：Nginx独立运行，提供HTTP订阅服务
             nginx_port="${custom_nginx_port:-8080}"
             nginx_listen="[::]:$nginx_port"
@@ -6794,6 +6805,9 @@ EOF
                 if [[ "$is_real_domain" == "true" ]]; then
                     local reality_port=$(db_get_field "xray" "vless" "port")
                     [[ -z "$reality_port" ]] && reality_port=$(db_get_field "xray" "vless-xhttp" "port")
+                    if [[ "$protocol" == vless-singbox || -z "$reality_port" ]]; then
+                        reality_port=$(db_get_field "singbox" "vless-singbox" "port")
+                    fi
                     if [[ -n "$reality_port" ]]; then
                         _ok "伪装网页: https://$domain:$reality_port"
                     fi
@@ -7825,7 +7839,7 @@ setup_cert_and_nginx() {
                 fi
                 
                 # Reality 协议：询问用户是否使用现有证书
-                if [[ "$protocol" == "vless" || "$protocol" == "vless-xhttp" ]]; then
+                if [[ "$protocol" == "vless" || "$protocol" == "vless-singbox" || "$protocol" == "vless-xhttp" ]]; then
                     echo ""
                     _ok "检测到现有证书: $CERT_DOMAIN"
                     echo ""
@@ -7852,7 +7866,7 @@ setup_cert_and_nginx() {
                     NGINX_PORT="${sub_port:-$default_nginx_port}"
                     
                     # Reality 协议使用真实域名时，必须用 HTTPS 端口，不能用 80
-                    if [[ "$protocol" == "vless" || "$protocol" == "vless-xhttp" ]]; then
+                    if [[ "$protocol" == "vless" || "$protocol" == "vless-singbox" || "$protocol" == "vless-xhttp" ]]; then
                         if [[ "$NGINX_PORT" == "80" ]]; then
                             NGINX_PORT="$default_nginx_port"
                         fi
@@ -7897,7 +7911,7 @@ setup_cert_and_nginx() {
                     fi
                     
                     # Reality 协议不显示 Nginx 端口（外部访问走 Reality 端口）
-                    if [[ "$protocol" != "vless" && "$protocol" != "vless-xhttp" ]]; then
+                    if [[ "$protocol" != "vless" && "$protocol" != "vless-singbox" && "$protocol" != "vless-xhttp" ]]; then
                         _ok "订阅服务端口: $NGINX_PORT"
                     fi
                     
@@ -7917,7 +7931,7 @@ setup_cert_and_nginx() {
                     if ss -tlnp 2>/dev/null | grep -qE ":${NGINX_PORT}\s|:${NGINX_PORT}$"; then
                         _ok "Nginx 服务运行正常"
                         # Reality 协议不显示 Nginx 端口
-                        if [[ "$protocol" != "vless" && "$protocol" != "vless-xhttp" ]]; then
+                        if [[ "$protocol" != "vless" && "$protocol" != "vless-singbox" && "$protocol" != "vless-xhttp" ]]; then
                             _ok "伪装网页: https://$CERT_DOMAIN:$NGINX_PORT"
                         fi
                     else
@@ -8023,7 +8037,7 @@ setup_cert_and_nginx() {
     
     # 使用自签证书（仅对需要真实 TLS 证书的协议）
     # Reality 协议 (vless、vless-xhttp) 不需要证书，使用 TLS 指纹伪装
-    if [[ "$protocol" != "vless" && "$protocol" != "vless-xhttp" ]]; then
+    if [[ "$protocol" != "vless" && "$protocol" != "vless-singbox" && "$protocol" != "vless-xhttp" ]]; then
         gen_self_cert "localhost"
     fi
     return 1
@@ -11667,6 +11681,33 @@ generate_singbox_config() {
         local inbound=""
         
         case "$proto" in
+            vless-singbox)
+                local sni cert_domain="" handshake_server handshake_port=443
+                sni=$(jq -r '.sni // empty' <<<"$cfg") || return 1
+                [[ -n "$sni" ]] || { _err "VLESS REALITY 握手域名缺失"; return 1; }
+                handshake_server="$sni"
+                [[ ! -f "$CFG/cert_domain" ]] || cert_domain=$(cat "$CFG/cert_domain")
+                if [[ -n "$cert_domain" && "$sni" == "$cert_domain" ]] && _is_real_cert; then
+                    handshake_server="127.0.0.1"
+                    handshake_port=8443
+                    _ensure_nginx_https_for_reality "$cert_domain" || return 1
+                fi
+                inbound=$(jq --arg listen "$listen_addr" --arg server "$handshake_server" \
+                    --argjson server_port "$handshake_port" '
+                    (.users // []) as $users |
+                    (if ($users | length) > 0 then $users
+                     else [{name:"default",uuid:.uuid,enabled:true}] end) as $clients |
+                    {
+                        type:"vless", tag:"vless-singbox-in", listen:$listen, listen_port:.port,
+                        users:[$clients[] | select(.enabled != false) |
+                            {name:("vless-singbox-" + .name), uuid:.uuid, flow:"xtls-rprx-vision"}],
+                        tls:{enabled:true, server_name:.sni, reality:{
+                            enabled:true, handshake:{server:$server,server_port:$server_port},
+                            private_key:.private_key, short_id:[.short_id]
+                        }}
+                    }
+                ' <<<"$cfg") || return 1
+                ;;
             snell|snell-v5|snell-shadowtls|snell-v5-shadowtls)
                 inbound=$(jq --arg listen "$listen_addr" --arg proto "$proto" '
                     ("snell-" + $proto + "-" + (.port | tostring)) as $tag |
@@ -11949,9 +11990,9 @@ generate_singbox_config() {
     fi
     
     # 收集可统计的 sing-box 用户标识，用于 V2Ray API 用户级流量统计
-    # HY2 / TUIC / AnyTLS 均使用用户名
+    # 各协议均使用带协议前缀的用户名
     local stats_users="[]"
-    for proto in hy2 tuic anytls; do
+    for proto in hy2 tuic anytls vless-singbox; do
         local mappings=$(_get_singbox_stat_user_mappings "$proto")
         [[ -z "$mappings" ]] && continue
         local proto_stats=$(printf '%s\n' "$mappings" | awk -F'|' 'NF>=2 && $2 != "" {print $2}' | jq -R . 2>/dev/null | jq -s . 2>/dev/null)
@@ -12576,6 +12617,27 @@ gen_server_config() {
     _save_join_info "vless" "REALITY|%s|$port|$uuid|$pubkey|$sid|$sni" \
         gen_vless_link "%s" "$port" "$uuid" "$pubkey" "$sid" "$sni"
     echo "server" > "$CFG/role"
+}
+
+# Sing-box REALITY 使用自身的 X25519 密钥生成器，不依赖 Xray。
+gen_singbox_reality_keys() {
+    local keys private_key public_key
+    keys=$(sing-box generate reality-keypair 2>/dev/null) || return 1
+    private_key=$(printf '%s\n' "$keys" | awk -F': *' '/^PrivateKey:/ {print $2; exit}')
+    public_key=$(printf '%s\n' "$keys" | awk -F': *' '/^PublicKey:/ {print $2; exit}')
+    [[ -n "$private_key" && -n "$public_key" ]] || return 1
+    jq -n --arg private "$private_key" --arg public "$public_key" \
+        '{private_key:$private,public_key:$public}'
+}
+
+gen_vless_singbox_server_config() {
+    local uuid="$1" port="$2" privkey="$3" pubkey="$4" sid="$5" sni="$6"
+    local config
+    mkdir -p "$CFG"
+    config=$(build_config uuid "$uuid" port "$port" private_key "$privkey" \
+        public_key "$pubkey" sni "$sni" security_mode "reality" |
+        jq --arg sid "$sid" '.short_id=$sid') || return 1
+    _apply_singbox_vless_config "$config"
 }
 
 # VLESS+Encryption (纯 TCP，无 Reality) 服务端配置
@@ -13215,6 +13277,141 @@ regenerate_singbox_snell_join_info() {
     chmod 600 "$tmp" && mv "$tmp" "$output" || { rm -f "$tmp"; return 1; }
 }
 
+# 从所有 Sing-box VLESS 端口重建 JOIN；指定 output 时只生成候选文件。
+regenerate_singbox_vless_join_info() {
+    local output="${1:-$CFG/vless-singbox.join}" tmp records record
+    local ipv4 ipv6 label ip host port uuid public_key short_id sni code link join aggregate
+    records=$(db_protocol_configs singbox vless-singbox) || return 1
+    tmp=$(mktemp "${output}.tmp.XXXXXX") || return 1
+    IFS='|' read -r ipv4 ipv6 <<<"$(get_connection_addresses)"
+    while IFS= read -r record; do
+        [[ -n "$record" ]] || continue
+        if ! jq -e '(.port | type == "number") and
+            ([.uuid, .public_key, .short_id, .sni] | all(type == "string"))' <<<"$record" >/dev/null; then
+            rm -f "$tmp"
+            return 1
+        fi
+        port=$(jq -r '.port' <<<"$record")
+        uuid=$(jq -r '.uuid' <<<"$record")
+        public_key=$(jq -r '.public_key' <<<"$record")
+        short_id=$(jq -r '.short_id' <<<"$record")
+        sni=$(jq -r '.sni' <<<"$record")
+        printf '# VLESS REALITY (Sing-box) PORT=%s\n' "$port" >>"$tmp" || { rm -f "$tmp"; return 1; }
+        for label in V4 V6; do
+            ip="$ipv4"; [[ "$label" == V6 ]] && ip="$ipv6"
+            [[ -n "$ip" ]] || continue
+            host="$ip"; [[ "$label" == V6 ]] && host="[$ip]"
+            code=$(printf 'REALITY|%s|%s|%s|%s|%s|%s' "$host" "$port" "$uuid" "$public_key" "$short_id" "$sni" | base64 -w 0) || { rm -f "$tmp"; return 1; }
+            link=$(gen_vless_link "$host" "$port" "$uuid" "$public_key" "$short_id" "$sni") || { rm -f "$tmp"; return 1; }
+            printf 'JOIN_%s=%s\nVLESS_SINGBOX_%s=%s\n' "$label" "$code" "$label" "$link" >>"$tmp" || { rm -f "$tmp"; return 1; }
+        done
+    done <<<"$records"
+    chmod 600 "$tmp" && mv "$tmp" "$output" || { rm -f "$tmp"; return 1; }
+    [[ "$output" == "$CFG/vless-singbox.join" ]] || return 0
+
+    # 删除最后一个端口后也刷新聚合文件，避免残留已失效的凭据。
+    [[ -n "$records" ]] || rm -f "$output" || return 1
+    aggregate=$(mktemp "$CFG/join.txt.tmp.XXXXXX") || return 1
+    for join in "$CFG"/*.join; do
+        [[ -f "$join" ]] || continue
+        cat "$join" >>"$aggregate" || { rm -f "$aggregate"; return 1; }
+    done
+    chmod 600 "$aggregate" && mv "$aggregate" "$CFG/join.txt" || { rm -f "$aggregate"; return 1; }
+}
+
+# VLESS 安装先校验共享配置；启动失败时恢复数据库、凭据和服务状态。
+_apply_singbox_vless_config() {
+    local record="$1" result=0
+    [[ -f "$DB_FILE" ]] || init_db || return 1
+    _db_lock_acquire || return 1
+    _apply_singbox_vless_config_locked "$record" || result=1
+    _db_lock_release
+    return "$result"
+}
+
+_apply_singbox_vless_config_locked() {
+    local record="$1" snapshot file index=0 runtime_changed=false success=false
+    local -a files=("$DB_FILE" "$CFG/singbox.json" "$CFG/vless-singbox.join"
+        "$CFG/join.txt" "$CFG/role" "$SYSTEMD_DIR/vless-singbox.service" "$OPENRC_DIR/vless-singbox")
+    snapshot=$(mktemp -d "$CFG/.singbox-vless.XXXXXX") || return 1
+    for file in "${files[@]}"; do
+        if [[ -f "$file" ]] && ! cp -p "$file" "$snapshot/$index"; then
+            rm -rf "$snapshot"
+            return 1
+        fi
+        index=$((index + 1))
+    done
+    svc status vless-singbox >/dev/null 2>&1 && touch "$snapshot/running"
+    svc enabled vless-singbox >/dev/null 2>&1 && touch "$snapshot/enabled"
+    local operation=start
+    local action="${INSTALL_MODE:-add}" old_port="${REPLACE_PORT:-}"
+    if jq --arg action "$action" --arg old "$old_port" --argjson record "$record" '
+        def records: if type == "array" then .[] elif type == "object" then . else empty end;
+        (.singbox["vless-singbox"] // [] | [records]) as $current |
+        if $action == "replace" and ([$current[] | select((.port | tostring) == $old)] | length) != 1
+        then error("target missing")
+        elif ([to_entries[] | select(.key == "xray" or .key == "singbox" or .key == "mihomo") |
+               .key as $core | .value | to_entries[] | .key as $proto | .value | records |
+               select(.port == $record.port) |
+               select(($action == "replace" and $core == "singbox" and $proto == "vless-singbox" and (.port | tostring) == $old) | not)] | length) > 0
+        then error("duplicate port")
+        else .singbox["vless-singbox"] =
+            (if $action == "replace" then [$current[] | if (.port | tostring) == $old then $record else . end]
+             else $current + [$record] end)
+        end
+    ' "$DB_FILE" >"$snapshot/next-db.json" &&
+       chmod 600 "$snapshot/next-db.json" && mv "$snapshot/next-db.json" "$DB_FILE" &&
+       generate_singbox_config "$snapshot/candidate.json" &&
+       regenerate_singbox_vless_join_info &&
+       mv "$snapshot/candidate.json" "$CFG/singbox.json"; then
+        runtime_changed=true
+        [[ ! -f "$snapshot/running" ]] || operation=restart
+        if create_singbox_service && svc enable vless-singbox &&
+           svc "$operation" vless-singbox && _wait_for_singbox_ready &&
+           printf '%s\n' server >"$CFG/role"; then
+            success=true
+        fi
+    fi
+    if [[ "$success" == true ]]; then
+        unset INSTALL_MODE REPLACE_PORT
+        rm -rf "$snapshot"
+        return 0
+    fi
+    if [[ "$runtime_changed" == true ]]; then
+        svc stop vless-singbox || { _err "Sing-box 停止失败，恢复快照保留: $snapshot"; return 1; }
+        if [[ ! -f "$snapshot/enabled" ]] && ! svc disable vless-singbox; then
+            _err "服务自启状态恢复失败，快照保留: $snapshot"
+            return 1
+        fi
+    fi
+    index=0
+    for file in "${files[@]}"; do
+        if [[ -f "$snapshot/$index" ]]; then
+            cp -p "$snapshot/$index" "$file" || { _err "恢复失败，快照保留: $snapshot"; return 1; }
+        else
+            rm -f "$file" || { _err "恢复失败，快照保留: $snapshot"; return 1; }
+        fi
+        index=$((index + 1))
+    done
+    if [[ "$runtime_changed" == true ]]; then
+        if [[ "$DISTRO" != alpine ]]; then
+            systemctl daemon-reload || { _err "服务恢复失败，快照保留: $snapshot"; return 1; }
+        fi
+        if [[ -f "$snapshot/enabled" ]]; then
+            svc enable vless-singbox || { _err "服务恢复失败，快照保留: $snapshot"; return 1; }
+        fi
+        if [[ -f "$snapshot/running" ]]; then
+            if ! svc start vless-singbox || ! _wait_for_singbox_ready; then
+                _err "服务恢复失败，快照保留: $snapshot"
+                return 1
+            fi
+        fi
+    fi
+    rm -rf "$snapshot"
+    _err "Sing-box VLESS 安装失败，已恢复原配置"
+    return 1
+}
+
 # 仅快照共享 Sing-box 所拥有的资源；官方服务和官方配置不在事务范围内。
 _singbox_snell_restore() {
     local snapshot="$1" runtime_changed="$2" file saved
@@ -13505,7 +13702,7 @@ get_all_services() {
     local has_singbox=false
     for proto in $singbox_protos; do
         case "$proto" in
-            hy2|tuic|anytls|snell-v6-singbox|snell|snell-v5|snell-shadowtls|snell-v5-shadowtls) has_singbox=true ;;
+            hy2|tuic|anytls|vless-singbox|snell-v6-singbox|snell|snell-v5|snell-shadowtls|snell-v5-shadowtls) has_singbox=true ;;
             snell-v6) services+="vless-snell-v6:snell-server-v6 " ;;
             ss2022-shadowtls) services+="vless-ss2022-shadowtls:shadow-tls " ;;
         esac
@@ -16652,7 +16849,7 @@ test_routing() {
     fi
     
     # 检查是否有 sing-box 协议
-    if db_exists "singbox" "hy2" || db_exists "singbox" "tuic"; then
+    if db_exists "singbox" "hy2" || db_exists "singbox" "tuic" || db_exists "singbox" "vless-singbox"; then
         echo ""
         echo -e "  ${Y}调试命令 (Sing-box):${NC}"
         echo -e "  • 检查配置语法: ${C}sing-box check -c /etc/vless-reality/singbox.json${NC}"
@@ -20416,7 +20613,7 @@ show_all_share_links() {
                 local config_ip="$ipv4"
                 
                 case "$protocol" in
-                    vless)
+                    vless|vless-singbox)
                         local security_mode=$(echo "$cfg" | jq -r '.security_mode // "reality"')
                         if [[ "$security_mode" == "encryption" ]]; then
                             local encryption=$(echo "$cfg" | jq -r '.encryption // empty')
@@ -20464,7 +20661,7 @@ show_all_share_links() {
                 local link=""
                 local ip6="[$ipv6]"
                 case "$protocol" in
-                    vless)
+                    vless|vless-singbox)
                         local security_mode=$(echo "$cfg" | jq -r '.security_mode // "reality"')
                         if [[ "$security_mode" == "encryption" ]]; then
                             local encryption=$(echo "$cfg" | jq -r '.encryption // empty')
@@ -20652,7 +20849,7 @@ show_single_protocol_info() {
     fi
     
     case "$protocol" in
-        vless)
+        vless|vless-singbox)
             local security_mode=$(echo "$cfg" | jq -r '.security_mode // "reality"')
             if [[ "$security_mode" == "encryption" ]]; then
                 local encryption=$(echo "$cfg" | jq -r '.encryption // empty')
@@ -20950,7 +21147,7 @@ show_single_protocol_info() {
         
         local link join_code
         case "$protocol" in
-            vless)
+            vless|vless-singbox)
                 local security_mode=$(echo "$cfg" | jq -r '.security_mode // "reality"')
                 if [[ "$security_mode" == "encryption" ]]; then
                     local encryption=$(echo "$cfg" | jq -r '.encryption // empty')
@@ -21147,7 +21344,7 @@ show_single_protocol_info() {
     
     # 检查是否有Reality协议（Reality 不需要 Nginx，不提供订阅服务）
     local has_reality=false
-    if db_exists "xray" "vless" || db_exists "xray" "vless-xhttp"; then
+    if db_exists "xray" "vless" || db_exists "xray" "vless-xhttp" || db_exists "singbox" "vless-singbox"; then
         has_reality=true
         # Reality 协议不启用 Nginx，不设置 nginx_port
     fi
@@ -21165,7 +21362,13 @@ show_single_protocol_info() {
         fi
     fi
     
-    # 判断Web服务是否运行 - 只有证书协议才检查
+    # 独立订阅服务也可供 REALITY 使用，端口以实际保存的配置为准。
+    if [[ "$protocol" == vless-singbox && -f "$CFG/sub.info" ]]; then
+        _load_sub_info "$CFG/sub.info" || { _warn "订阅配置格式无效"; return 1; }
+        nginx_port="$sub_port"
+    fi
+
+    # 判断Web服务是否运行
     if [[ -n "$nginx_port" ]]; then
         if ss -tlnp 2>/dev/null | grep -q ":${nginx_port} "; then
             web_service_running=true
@@ -21173,7 +21376,12 @@ show_single_protocol_info() {
     fi
     
     # 显示订阅链接提示
-    if [[ "$has_cert_protocol" == "true" ]]; then
+    if [[ "$protocol" == vless-singbox && "$web_service_running" == true && -f "$CFG/sub.info" ]]; then
+        local sub_protocol="http" sub_host="${sub_domain:-${ipv4:-[$ipv6]}}"
+        [[ "$sub_https" == true ]] && sub_protocol="https"
+        echo -e "  ${Y}Clash/Clash Verge:${NC}"
+        echo -e "  ${G}${sub_protocol}://${sub_host}:${sub_port}/sub/${sub_uuid}/clash${NC}"
+    elif [[ "$has_cert_protocol" == "true" ]]; then
         # 有证书协议，显示订阅状态
         if [[ "$web_service_running" == "true" && -f "$CFG/sub.info" ]]; then
             _load_sub_info "$CFG/sub.info" || { _warn "订阅配置格式无效"; return 1; }
@@ -21188,7 +21396,7 @@ show_single_protocol_info() {
             echo -e "  ${D}(Web服务未运行，订阅功能不可用)${NC}"
             echo -e "  ${D}提示: 请在主菜单选择「订阅管理」配置订阅服务${NC}"
         fi
-    elif [[ "$has_reality" == "true" && ("$protocol" == "vless" || "$protocol" == "vless-xhttp") ]]; then
+    elif [[ "$has_reality" == "true" && ("$protocol" == "vless" || "$protocol" == "vless-singbox" || "$protocol" == "vless-xhttp") ]]; then
         # Reality 协议：订阅需要手动配置真实域名和启用
         if [[ -n "$domain" && -f "$CFG/sub.info" && "$web_service_running" == "true" ]]; then
             _load_sub_info "$CFG/sub.info" || { _warn "订阅配置格式无效"; return 1; }
@@ -21659,6 +21867,10 @@ uninstall_specific_protocol() {
             fi
         fi
         
+        if [[ "$selected_protocol" == vless-singbox ]]; then
+            regenerate_singbox_vless_join_info || { _err "VLESS JOIN 更新失败"; return 1; }
+        fi
+
         # 检查是否还有其他 Sing-box 协议
         local remaining_singbox=$(get_singbox_protocols)
         if [[ -n "$remaining_singbox" ]]; then
@@ -21772,7 +21984,7 @@ uninstall_specific_protocol() {
 
     # 检查是否还有需要订阅服务的协议
     local has_sub_protocol=false
-    for proto in vless-ws vless-vision trojan vmess-ws; do
+    for proto in vless-ws vless-vision trojan vmess-ws vless-singbox; do
         if is_protocol_installed "$proto"; then
             has_sub_protocol=true
             break
@@ -22033,8 +22245,26 @@ select_vless_mode() {
         read -rp "  请选择 [1]: " vless_mode_choice
         vless_mode_choice="${vless_mode_choice:-1}"
         case "$vless_mode_choice" in
-            1) VLESS_SECURITY_MODE="reality"; SELECTED_PROTOCOL="vless"; return 0 ;;
+            1) VLESS_SECURITY_MODE="reality"; select_vless_reality_implementation; return $? ;;
             2) VLESS_SECURITY_MODE="encryption"; SELECTED_PROTOCOL="vless"; return 0 ;;
+            0) SELECTED_PROTOCOL=""; return 1 ;;
+            *) _err "无效选择" ;;
+        esac
+    done
+}
+
+# 两个 REALITY 实现使用独立协议键，在检查已有端口前完成选择。
+select_vless_reality_implementation() {
+    local choice
+    echo ""
+    _item "1" "Xray (默认)"
+    _item "2" "Sing-box"
+    _item "0" "返回"
+    while true; do
+        read -rp "  选择 VLESS + Vision + REALITY 核心 [1]: " choice || return 1
+        case "${choice:-1}" in
+            1) SELECTED_PROTOCOL="vless"; return 0 ;;
+            2) SELECTED_PROTOCOL="vless-singbox"; return 0 ;;
             0) SELECTED_PROTOCOL=""; return 1 ;;
             *) _err "无效选择" ;;
         esac
@@ -22160,6 +22390,9 @@ do_install_server() {
     # 确定核心类型
     local core
     core=$(protocol_core "$protocol")
+    if [[ "$protocol" == vless-singbox ]]; then
+        unset INSTALL_MODE REPLACE_PORT
+    fi
     
     # 检查该协议是否已安装
     if is_protocol_installed "$protocol" && [[ "$protocol" != "snell" && "$protocol" != "snell-v5" ]]; then
@@ -22310,7 +22543,7 @@ do_install_server() {
         vless|vless-xhttp|vless-ws|vless-ws-notls|vmess-ws|vless-vision|ss2022|ss-legacy|trojan|socks)
             install_xray || { _err "Xray 安装失败"; _pause; return 1; }
             ;;
-        hy2|tuic|anytls)
+        hy2|tuic|anytls|vless-singbox)
             install_singbox || { _err "Sing-box 安装失败"; _pause; return 1; }
             ;;
         snell|snell-v5)
@@ -22441,6 +22674,33 @@ do_install_server() {
                 _info "生成配置..."
                 gen_server_config "$uuid" "$port" "$privkey" "$pubkey" "$sid" "$final_sni"
             fi
+            ;;
+        vless-singbox)
+            local uuid sid keys privkey pubkey final_sni
+            uuid=$(gen_uuid)
+            sid=$(gen_sid)
+            keys=$(gen_singbox_reality_keys) || { _err "Sing-box REALITY 密钥生成失败"; _pause; return 1; }
+            privkey=$(jq -r '.private_key' <<<"$keys")
+            pubkey=$(jq -r '.public_key' <<<"$keys")
+
+            # 复用 VLESS 的证书选择与 Nginx 配置，保证握手目标一致。
+            setup_cert_and_nginx "vless"
+            final_sni=$(ask_sni_config "$(gen_sni)" "$CERT_DOMAIN")
+            [[ -n "$final_sni" ]] || return 1
+            if [[ -z "$CERT_DOMAIN" ]]; then
+                gen_self_cert "$final_sni"
+            fi
+
+            echo ""
+            _line
+            echo -e "  ${C}VLESS + Vision + REALITY (Sing-box) 配置${NC}"
+            _line
+            echo -e "  端口: ${G}$port${NC}  UUID: ${G}${uuid:0:8}...${NC}"
+            echo -e "  SNI: ${G}$final_sni${NC}  ShortID: ${G}$sid${NC}"
+            _line
+            read -rp "  确认安装? [Y/n]: " confirm
+            [[ "$confirm" =~ ^[nN]$ ]] && return
+            gen_vless_singbox_server_config "$uuid" "$port" "$privkey" "$pubkey" "$sid" "$final_sni" || return 1
             ;;
         vless-xhttp)
             # 选择 XHTTP 模式
@@ -23545,14 +23805,12 @@ do_install_server() {
     # 保存当前安装的协议名（防止被后续函数中的循环变量覆盖）
     local current_protocol="$protocol"
 
-    # Mihomo / Sing-box Snell 节点已完成事务启动，不重复重启无关核心。
-    if is_singbox_snell_protocol "$current_protocol"; then
+    # Sing-box Snell / VLESS 节点已完成事务启动，不重复重启无关核心。
+    if [[ "$current_protocol" == vless-singbox ]] || is_singbox_snell_protocol "$current_protocol"; then
         create_server_scripts
-        if is_singbox_snell_protocol "$current_protocol"; then
-            create_watchdog_service || return 1
-            svc enable vless-watchdog || return 1
-            svc start vless-watchdog || return 1
-        fi
+        create_watchdog_service || return 1
+        svc enable vless-watchdog || return 1
+        svc start vless-watchdog || return 1
     else
         _info "创建服务..."
         create_server_scripts  # 生成服务端辅助脚本（watchdog、hy2-nat、tuic-nat）
@@ -23580,11 +23838,11 @@ do_install_server() {
         _ok "$current_service 已启用并启动"
     fi
     
-    if is_singbox_snell_protocol "$current_protocol" || start_services; then
+    if [[ "$current_protocol" == vless-singbox ]] || is_singbox_snell_protocol "$current_protocol" || start_services; then
         create_shortcut   # 安装成功才创建快捷命令
 
         # 对 Sing-box 协议做一次显式重建与校验，避免交互安装后配置未完全落盘
-        if [[ "${PROTO_KIND[$current_protocol]}" == "singbox" ]] && ! is_singbox_snell_protocol "$current_protocol"; then
+        if [[ "${PROTO_KIND[$current_protocol]}" == "singbox" && "$current_protocol" != vless-singbox ]] && ! is_singbox_snell_protocol "$current_protocol"; then
             generate_singbox_config || { _err "Sing-box 配置重建失败"; _pause; return 1; }
             create_server_scripts
             create_singbox_service
@@ -23654,7 +23912,7 @@ do_install_server() {
         
         # 获取当前安装的端口号
         local installed_port=""
-        if is_singbox_snell_protocol "$current_protocol"; then
+        if [[ "$current_protocol" == vless-singbox ]] || is_singbox_snell_protocol "$current_protocol"; then
             installed_port="$port"
         elif [[ "$INSTALL_MODE" == "replace" && -n "$REPLACE_PORT" ]]; then
             # 覆盖模式：使用被覆盖的端口（可能已更新为新端口）
@@ -25166,7 +25424,7 @@ gen_v2ray_sub() {
             
             local link=""
             case "$protocol" in
-                vless)
+                vless|vless-singbox)
                     local security_mode=$(echo "$cfg" | jq -r '.security_mode // "reality"')
                     if [[ "$security_mode" == "encryption" ]]; then
                         local encryption=$(echo "$cfg" | jq -r '.encryption // empty')
@@ -25283,7 +25541,7 @@ gen_clash_sub() {
             local proxy=""
             
             case "$protocol" in
-            vless)
+            vless|vless-singbox)
                 [[ -n "$server_ip" ]] && proxy="  - name: \"$name\"
     type: vless
     server: \"$server_ip\"
@@ -27839,12 +28097,16 @@ _gen_user_share_link() {
     fi
     
     local remark="${country_code}-${user_name}"
+
+    if [[ "$proto" == vless-singbox && -z "$ipv4" && -n "$ipv6" ]]; then
+        ipv4="[$ipv6]"
+    fi
     
     # 生成 IPv4 链接
     if [[ -n "$ipv4" ]]; then
         local link=""
         case "$proto" in
-            vless)
+            vless|vless-singbox)
                 local security_mode=$(echo "$cfg" | jq -r '.security_mode // "reality"')
                 if [[ "$security_mode" == "encryption" ]]; then
                     local encryption=$(echo "$cfg" | jq -r '.encryption // empty')
@@ -28158,7 +28420,7 @@ _add_user() {
     # 生成 UUID/密码
     local uuid
     case "$proto" in
-        vless|vless-xhttp|vless-ws|vless-vision|tuic)
+        vless|vless-singbox|vless-xhttp|vless-ws|vless-vision|tuic)
             uuid=$(gen_uuid)
             ;;
         ss2022)
@@ -28476,11 +28738,6 @@ _toggle_user() {
             
             if db_set_user_enabled "$core" "$proto" "$name" "$new_state"; then
                 _ok "用户 $name 已${action}"
-                
-                # 重新生成配置
-                _info "更新配置..."
-                _regenerate_config "$core" "$proto"
-                
                 _ok "配置已更新"
             else
                 _err "操作失败"
@@ -28563,9 +28820,11 @@ _set_user_expire_date() {
                 if [[ "$enabled" != "true" && -n "$new_expire" ]]; then
                     read -rp "  用户当前已禁用，是否启用? [y/N]: " enable_now
                     if [[ "$enable_now" =~ ^[yY]$ ]]; then
-                        db_set_user_enabled "$core" "$proto" "$name" true
-                        _regenerate_config "$core" "$proto"
-                        _ok "用户已启用"
+                        if db_set_user_enabled "$core" "$proto" "$name" true; then
+                            _ok "用户已启用"
+                        else
+                            _err "用户启用或配置重载失败"
+                        fi
                     fi
                 fi
             else
@@ -28583,6 +28842,24 @@ _regenerate_config() {
     local core="$1" proto="$2"
     local config_file=""
     local service_name=""
+
+    if [[ "$core" == singbox && "$proto" == vless-singbox ]]; then
+        # 使用共享配置生成器更新所有端口的用户与路由。
+        if [[ ! -f "$CFG/singbox.json" ]]; then
+            _info "用户信息已保存到数据库"
+            return 0
+        fi
+        generate_singbox_config || { _err "Sing-box 配置更新失败"; return 1; }
+        if svc status vless-singbox >/dev/null 2>&1; then
+            svc restart vless-singbox && _wait_for_singbox_ready || {
+                _err "Sing-box 服务重启失败"
+                return 1
+            }
+        fi
+        [[ ! -f "$CFG/sub.info" ]] || generate_sub_files || return 1
+        _ok "Sing-box 用户配置已更新"
+        return 0
+    fi
     
     # 确定配置文件路径和服务名称
     if [[ "$core" == "xray" ]]; then
