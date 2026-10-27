@@ -57,6 +57,8 @@ nftm
 
 Sing-box 版与其他 Sing-box 协议共用 `vless-singbox` 服务及 `/etc/vless-reality/singbox.json`，配置或核心变更会影响同一服务的所有入站。REALITY 默认向伪装域名的 443 端口握手；域名匹配脚本托管的真实证书时，使用本地 `127.0.0.1:8443`。Vision 使用 `xtls-rprx-vision`。
 
+卸载 Sing-box 版 VLESS 时，先校验剩余协议的配置，再重启原本正在运行的共享服务；配置生成、重启或监听检查失败会恢复原数据库、配置和服务状态。仍有 Snell 等协议时保留共享服务、原运行及自启状态和现有订阅，只有最后一个 Sing-box 协议删除后才清理共享服务。
+
 **REALITY 防偷流量限速仅适用于 Xray。** Sing-box 版不写入 `reality_fallback_limits` 或 Xray 的 `limitFallbackUpload` / `limitFallbackDownload` 字段。
 
 ## Snell 与 Sing-box
@@ -82,6 +84,8 @@ Sing-box 版与其他 Sing-box 协议共用 `vless-singbox` 服务及 `/etc/vles
 bash tests/test-singbox-vless.sh
 # VLESS Sing-box 安装事务成功路径及配置/重启/健康检查失败回滚
 bash tests/test-singbox-vless-install.sh
+# VLESS 卸载保留共享 Snell 服务、订阅及失败回滚
+bash tests/test-singbox-vless-uninstall.sh
 # Snell 多版本、多端口、共享分流、升级保护与失败回滚
 bash tests/test-singbox-snell.sh
 # v4/v5、ShadowTLS 及旧数据库迁移

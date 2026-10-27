@@ -22,7 +22,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
     exit 1
 fi
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.5.22 [服务端]
+#  多协议代理一键部署脚本 v3.5.23 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -41,7 +41,7 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.5.22"
+readonly VERSION="3.5.23"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/mikuuu3981/surge"
 readonly SCRIPT_REPO="mikuuu3981/surge"
@@ -13376,18 +13376,24 @@ regenerate_singbox_vless_join_info() {
     chmod 600 "$aggregate" && mv "$aggregate" "$CFG/join.txt" || { rm -f "$aggregate"; return 1; }
 }
 
-# VLESS 安装先校验共享配置；启动失败时恢复数据库、凭据和服务状态。
+# VLESS 安装和卸载先校验共享配置；失败时恢复数据库、凭据和服务状态。
 _apply_singbox_vless_config() {
-    local record="$1" result=0
+    local record="$1" action="${2:-${INSTALL_MODE:-add}}" old_port="${3:-${REPLACE_PORT:-}}" result=0
     [[ -f "$DB_FILE" ]] || init_db || return 1
     _db_lock_acquire || return 1
-    _apply_singbox_vless_config_locked "$record" || result=1
+    _apply_singbox_vless_config_locked "$record" "$action" "$old_port" || result=1
     _db_lock_release
     return "$result"
 }
 
 _apply_singbox_vless_config_locked() {
     local record="$1" snapshot file index=0 runtime_changed=false success=false
+    local action="$2" old_port="$3"
+    case "$action" in
+        add|replace|remove) ;;
+        *) return 1 ;;
+    esac
+    [[ "$action" == add || "$old_port" =~ ^[0-9]+$ || ( "$action" == remove && "$old_port" == all ) ]] || return 1
     local -a files=("$DB_FILE" "$CFG/singbox.json" "$CFG/vless-singbox.join"
         "$CFG/join.txt" "$CFG/role" "$SYSTEMD_DIR/vless-singbox.service" "$OPENRC_DIR/vless-singbox")
     snapshot=$(mktemp -d "$CFG/.singbox-vless.XXXXXX") || return 1
@@ -13401,42 +13407,68 @@ _apply_singbox_vless_config_locked() {
     svc status vless-singbox >/dev/null 2>&1 && touch "$snapshot/running"
     svc enabled vless-singbox >/dev/null 2>&1 && touch "$snapshot/enabled"
     local operation=start
-    local action="${INSTALL_MODE:-add}" old_port="${REPLACE_PORT:-}"
     if jq --arg action "$action" --arg old "$old_port" --argjson record "$record" '
         def records: if type == "array" then .[] elif type == "object" then . else empty end;
         (.singbox["vless-singbox"] // [] | [records]) as $current |
-        if $action == "replace" and ([$current[] | select((.port | tostring) == $old)] | length) != 1
+        if ($action != "add" and $old != "all" and
+            ([$current[] | select((.port | tostring) == $old)] | length) != 1) or
+           ($action == "remove" and ($current | length) == 0)
         then error("target missing")
-        elif ([to_entries[] | select(.key == "xray" or .key == "singbox" or .key == "mihomo") |
+        elif $action != "remove" and
+             ([to_entries[] | select(.key == "xray" or .key == "singbox" or .key == "mihomo") |
                .key as $core | .value | to_entries[] | .key as $proto | .value | records |
                select(.port == $record.port) |
                select(($action == "replace" and $core == "singbox" and $proto == "vless-singbox" and (.port | tostring) == $old) | not)] | length) > 0
         then error("duplicate port")
-        else .singbox["vless-singbox"] =
-            (if $action == "replace" then [$current[] | if (.port | tostring) == $old then $record else . end]
-             else $current + [$record] end)
+        else
+            (if $action == "add" then $current + [$record]
+             elif $action == "replace" then [$current[] | if (.port | tostring) == $old then $record else . end]
+             elif $old == "all" then []
+             else [$current[] | select((.port | tostring) != $old)] end) as $next |
+            if ($next | length) == 0 then del(.singbox["vless-singbox"])
+            else .singbox["vless-singbox"] = $next end
         end
     ' "$DB_FILE" >"$snapshot/next-db.json" &&
-       chmod 600 "$snapshot/next-db.json" && mv "$snapshot/next-db.json" "$DB_FILE" &&
-       generate_singbox_config "$snapshot/candidate.json" &&
-       regenerate_singbox_vless_join_info &&
-       mv "$snapshot/candidate.json" "$CFG/singbox.json"; then
-        runtime_changed=true
-        [[ ! -f "$snapshot/running" ]] || operation=restart
-        if create_singbox_service && svc enable vless-singbox &&
-           svc "$operation" vless-singbox && _wait_for_singbox_ready &&
-           printf '%s\n' server >"$CFG/role"; then
-            success=true
+       chmod 600 "$snapshot/next-db.json" && mv "$snapshot/next-db.json" "$DB_FILE"; then
+        if [[ "$action" == remove && -z "$(get_singbox_protocols)" ]]; then
+            if regenerate_singbox_vless_join_info; then
+                runtime_changed=true
+                if svc stop vless-singbox &&
+                   { [[ ! -f "$snapshot/enabled" ]] || svc disable vless-singbox; } &&
+                   rm -f "$CFG/singbox.json" "$SYSTEMD_DIR/vless-singbox.service" "$OPENRC_DIR/vless-singbox" &&
+                   { [[ "$DISTRO" == alpine ]] || systemctl daemon-reload; }; then
+                    success=true
+                fi
+            fi
+        elif generate_singbox_config "$snapshot/candidate.json" &&
+             regenerate_singbox_vless_join_info &&
+             mv "$snapshot/candidate.json" "$CFG/singbox.json"; then
+            runtime_changed=true
+            [[ ! -f "$snapshot/running" ]] || operation=restart
+            if create_singbox_service &&
+               { [[ "$action" == remove ]] || svc enable vless-singbox; } &&
+               { [[ "$action" == remove && ! -f "$snapshot/running" ]] ||
+                 { svc "$operation" vless-singbox && _wait_for_singbox_ready; }; } &&
+               { [[ "$action" == remove ]] || printf '%s\n' server >"$CFG/role"; }; then
+                success=true
+            fi
         fi
     fi
     if [[ "$success" == true ]]; then
-        unset INSTALL_MODE REPLACE_PORT
+        [[ "$action" == remove ]] || unset INSTALL_MODE REPLACE_PORT
         rm -rf "$snapshot"
         return 0
     fi
     if [[ "$runtime_changed" == true ]]; then
-        svc stop vless-singbox || { _err "Sing-box 停止失败，恢复快照保留: $snapshot"; return 1; }
-        if [[ ! -f "$snapshot/enabled" ]] && ! svc disable vless-singbox; then
+        # 最后一个入站卸载失败时，服务定义可能已删除；先判断是否仍需停止。
+        if [[ -f "$SYSTEMD_DIR/vless-singbox.service" || -f "$OPENRC_DIR/vless-singbox" ]] ||
+           svc status vless-singbox >/dev/null 2>&1; then
+            svc stop vless-singbox || { _err "Sing-box 停止失败，恢复快照保留: $snapshot"; return 1; }
+        fi
+        if [[ ! -f "$snapshot/enabled" &&
+              ( -f "$SYSTEMD_DIR/vless-singbox.service" || -f "$OPENRC_DIR/vless-singbox" ) ]] &&
+           svc enabled vless-singbox >/dev/null 2>&1 &&
+           ! svc disable vless-singbox; then
             _err "服务自启状态恢复失败，快照保留: $snapshot"
             return 1
         fi
@@ -13465,7 +13497,7 @@ _apply_singbox_vless_config_locked() {
         fi
     fi
     rm -rf "$snapshot"
-    _err "Sing-box VLESS 安装失败，已恢复原配置"
+    _err "Sing-box VLESS 变更失败，已恢复原配置"
     return 1
 }
 
@@ -21904,6 +21936,11 @@ uninstall_specific_protocol() {
         _ok "$(get_protocol_name "$selected_protocol") 已卸载"
         _pause
         return 0
+    elif [[ "$selected_protocol" == vless-singbox ]]; then
+        _apply_singbox_vless_config '{}' remove "$SELECTED_PORT" || {
+            _err "Sing-box 配置更新失败，未执行卸载"
+            return 1
+        }
     elif [[ " $XRAY_PROTOCOLS " == *" $selected_protocol "* ]]; then
         # Xray 协议：需要重新生成配置
         # 根据选择的端口进行卸载
@@ -21998,10 +22035,6 @@ uninstall_specific_protocol() {
             fi
         fi
         
-        if [[ "$selected_protocol" == vless-singbox ]]; then
-            regenerate_singbox_vless_join_info || { _err "VLESS JOIN 更新失败"; return 1; }
-        fi
-
         # 检查是否还有其他 Sing-box 协议
         local remaining_singbox=$(get_singbox_protocols)
         if [[ -n "$remaining_singbox" ]]; then
@@ -22113,17 +22146,12 @@ uninstall_specific_protocol() {
         return 0
     fi
 
-    # 检查是否还有需要订阅服务的协议
-    local has_sub_protocol=false
-    for proto in vless-ws vless-vision trojan vmess-ws vless-singbox; do
-        if is_protocol_installed "$proto"; then
-            has_sub_protocol=true
-            break
-        fi
-    done
+    # 所有剩余协议（含 Snell）都可能通过现有订阅发布。
+    local remaining_protocols
+    remaining_protocols=$(get_installed_protocols) || { _err "读取剩余协议失败"; return 1; }
     
     # 如果没有需要订阅的协议了，清理订阅相关配置
-    if [[ "$has_sub_protocol" == "false" ]]; then
+    if [[ -z "$remaining_protocols" ]]; then
         _info "清理订阅服务..."
         # 停止并删除 Nginx 订阅配置 (包括 Alpine 的 http.d 目录)
         rm -f /etc/nginx/conf.d/vless-sub.conf /etc/nginx/http.d/vless-sub.conf
