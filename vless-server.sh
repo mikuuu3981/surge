@@ -22,7 +22,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
     exit 1
 fi
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.5.23 [服务端]
+#  多协议代理一键部署脚本 v3.5.24 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -41,7 +41,7 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.5.23"
+readonly VERSION="3.5.24"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/mikuuu3981/surge"
 readonly SCRIPT_REPO="mikuuu3981/surge"
@@ -12089,15 +12089,10 @@ generate_singbox_config() {
         ' <<<"$base_config") || return 1
     fi
 
-    # 旧 v4/v5 核心会读取 HTTP Host/TLS SNI 参与域名分流。只为这些入站恢复
-    # 嗅探行为；现代 sniff action 不改写连接目标，也不影响官方/v6/其他协议。
-    local legacy_sniff_tags
-    legacy_sniff_tags=$(jq '[.[] | select(.type == "snell" and .version == 5) | .tag]' <<<"$inbounds") || return 1
-    if [[ "$legacy_sniff_tags" != '[]' ]]; then
-        base_config=$(jq --argjson tags "$legacy_sniff_tags" '
-            .route.rules = ([{inbound:$tags, action:"sniff", sniffer:["http","tls"]}] + (.route.rules // []))
-        ' <<<"$base_config") || return 1
-    fi
+    # 服务端先嗅探 HTTP Host、TLS SNI 和 QUIC 域名，再执行分流；不改写目标地址。
+    base_config=$(jq '
+        .route.rules = ([{action:"sniff"}] + (.route.rules // []))
+    ' <<<"$base_config") || return 1
 
     local tmp
     tmp=$(mktemp "${output_file}.tmp.XXXXXX") || return 1
@@ -14320,7 +14315,6 @@ _start_core_service() {
     local process_name="$2"
     local protocols="$3"
     local gen_config_func="$4"
-    local failed_services_ref="$5"
     
     local is_running=false
     svc status "$service_name" >/dev/null 2>&1 && is_running=true
@@ -14329,6 +14323,17 @@ _start_core_service() {
     [[ "$is_running" == "true" ]] && action_word="更新"
     
     _info "${action_word} ${process_name} 配置..."
+
+    # 运行中的共享核心复用候选配置和失败回滚，校验完成前不停止代理。
+    if [[ "$service_name" == vless-singbox && "$is_running" == true ]]; then
+        if ! _regenerate_singbox_routing_config; then
+            _err "${process_name} 配置更新或重启失败，请检查上方错误信息"
+            return 1
+        fi
+        svc enable "$service_name" 2>/dev/null
+        _ok "${process_name} 服务已更新 (协议: ${protocols//$'\n'/ })"
+        return 0
+    fi
     
     if ! $gen_config_func; then
         _err "${process_name} 配置生成失败"
@@ -14343,6 +14348,15 @@ _start_core_service() {
     if ! svc $svc_action "$service_name"; then
         _err "${process_name} 服务${action_word}失败"
         return 1
+    fi
+
+    if [[ "$service_name" == vless-singbox ]]; then
+        if ! _wait_for_singbox_ready; then
+            _err "${process_name} 服务未就绪，请检查服务状态和监听端口"
+            return 1
+        fi
+        _ok "${process_name} 服务已${action_word} (协议: ${protocols//$'\n'/ })"
+        return 0
     fi
     
     # 等待服务启动。OpenRC 的 PID 文件/服务状态比精简 Alpine 中可能缺失的
@@ -14365,7 +14379,7 @@ _start_core_service() {
 
 start_services() {
     local failed_services=()
-    rm -f "$CFG/paused"
+    rm -f "$CFG/paused" || { _err "无法清除暂停标记，服务未启动"; return 1; }
     migrate_legacy_snell_to_singbox || { _err "Snell 迁移失败，保留原服务，请先解决预检错误"; return 1; }
     
     # 初始化数据库
@@ -14390,9 +14404,10 @@ start_services() {
         fi
         
         if check_cmd sing-box; then
-            create_singbox_service
-            _start_core_service "vless-singbox" "sing-box" "$singbox_protocols" "generate_singbox_config" || \
+            if ! create_singbox_service ||
+               ! _start_core_service "vless-singbox" "sing-box" "$singbox_protocols" "generate_singbox_config"; then
                 failed_services+=("vless-singbox")
+            fi
         fi
     fi
     
@@ -21587,6 +21602,7 @@ show_single_protocol_info() {
 
 # 管理协议服务
 manage_protocol_services() {
+    local choice
     local installed=$(get_installed_protocols)
     [[ -z "$installed" ]] && { _warn "未安装任何协议"; return; }
     
@@ -21604,11 +21620,12 @@ manage_protocol_services() {
         _item "0" "返回"
         _line
 
-        read -rp "  请选择: " choice
+        read -rp "  请选择: " choice || return
         case $choice in
             1)
                 _info "重启所有服务..."
-                stop_services; sleep 2; start_services && _ok "所有服务已重启"
+                # start_services 会先生成/校验配置，再重启已运行的核心。
+                start_services && _ok "所有服务已重启"
                 _pause
                 ;;
             2)

@@ -75,7 +75,8 @@ Sing-box 版与其他 Sing-box 协议共用 `vless-singbox` 服务及 `/etc/vles
 - WARP 支持 WGCF 与官方 SOCKS5 模式；官方模式的 UDP 保持直连。GeoSite/GeoIP 首次使用需要从 GitHub 下载规则库，之后每 24 小时更新。
 - Instagram/INS 分流迁至 Sing-box，沿用 [Yuu-rules 域名列表](https://github.com/Yuu518/Yuu-rules/blob/rule-set/mihomo/geosite/instagram.list)，仅匹配 Snell v4/v5（含 ShadowTLS）入站。规则列表缓存 24 小时，更新失败时使用已有缓存；不会扩大到 HY2/TUIC/AnyTLS 或 Snell v6。
 - AI 分流分为 `GeoSite-AI-Xray专属`（原 `ai-intl`，仅 Xray）与 `Sukka-AI-Sing-Box专属`（`singbox-ai`，仅 Sing-box，有 Sing-box 协议时显示 `s` 选项）。Sukka 分别使用 [non_ip](https://ruleset.skk.moe/sing-box/non_ip/ai.json) 和 [ip](https://ruleset.skk.moe/sing-box/ip/ai.json) 两份完整规则集，共用所选出口；IPv4/IPv6 限制与规则集匹配条件相交。源文件缓存到 `/etc/vless-reality/ruleset-src/`，独立编译到 `ruleset/`，配置重建时刷新超过 24 小时的缓存；更新失败使用有效旧缓存，无有效缓存则配置生成失败。添加或删除 AI 规则仅重载对应核心。
-- v4/v5 入站保留 HTTP Host / TLS SNI 嗅探，供域名分流使用，不改写原始目标地址。
+- Sing-box 服务端在 `route.rules` 首位统一添加 `{"action":"sniff"}`，从 HTTP Host、TLS SNI 或 QUIC 嗅探域名后执行分流，覆盖所有共享入站；客户端无需修改，不改写原始目标地址。
+- “重启所有服务”先生成并校验配置，再由服务管理器逐个重启；不再预先停止全部代理。Sing-box 重启或监听检查失败时恢复旧配置及运行状态，错误会显示在终端；只有主动停止服务才设置“已暂停”标记。
 
 安全回归测试（仅临时配置，不安装服务或修改防火墙）：
 
@@ -100,6 +101,8 @@ VLESS_TEST_SINGBOX_BIN=/usr/bin/sing-box bash tests/test-singbox-ai.sh
 bash tests/test-script-update.sh
 # 运行配置路径识别、完整输出及停止状态
 bash tests/test-runtime-config.sh
+# 服务重启顺序、配置失败保护、Sing-box 回滚、暂停恢复及菜单输入中断
+bash tests/test-service-restart.sh
 # 可选：VLESS 使用已有 Sing-box 1.14+ 执行真实配置校验（不启动监听）
 VLESS_TEST_SINGBOX_BIN=/path/to/sing-box bash tests/test-singbox-vless.sh
 # 可选：已有 Sing-box 1.14+ 的真实配置校验及回环 TCP/UDP 测试（需要 Python 3）

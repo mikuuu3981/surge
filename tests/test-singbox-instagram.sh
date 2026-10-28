@@ -87,13 +87,10 @@ fixture() {
         routing_rules:[]}' >"$DB_FILE"
 }
 check() { jq -e "$1" "$CFG/singbox.json" >/dev/null; }
-assert_sniff_scope() {
-    jq -e --argjson expected "$expected" '
-        [.route.rules[] | select(.action=="sniff")] as $sniff |
-        ($sniff | length)>0 and
-        ([$sniff[].inbound[]] | unique | sort)==$expected and
-        all($sniff[]; (.inbound | length)>0 and (.sniffer | sort)==["http","tls"] and
-            .override_destination!=true)
+assert_sniff_first() {
+    jq -e '
+        .route.rules[0]=={action:"sniff"} and
+        ([.route.rules[] | select(.action=="sniff")] | length)==1
     ' "$1" >/dev/null
 }
 set_rules() {
@@ -134,7 +131,7 @@ for rule_type in mihomo-instagram singbox-instagram; do
             jq -e --arg cidr "$cidr" 'all(.[] | select((.domain_suffix // []) | index("instagram.com")); .ip_cidr==[$cidr])' "$TMP/rules" >/dev/null
         fi
         generate_singbox_config
-        assert_sniff_scope "$CFG/singbox.json"
+        assert_sniff_first "$CFG/singbox.json"
         jq '.route.rules' "$CFG/singbox.json" >"$TMP/generated-rules"
         assert_scope "$TMP/generated-rules"
         # Match tags from generated inbounds, including detour targets, and
@@ -163,7 +160,7 @@ for rule_type in mihomo-instagram singbox-instagram; do
     mv "$TMP/active-db" "$DB_FILE"
     cp "$DB_FILE" "$TMP/active-before"
     generate_singbox_config "$TMP/candidate-config" "$TMP/candidate-db"
-    assert_sniff_scope "$TMP/candidate-config"
+    assert_sniff_first "$TMP/candidate-config"
     cmp "$DB_FILE" "$TMP/active-before"
     jq '.route.rules' "$TMP/candidate-config" >"$TMP/candidate-rules"
     assert_scope "$TMP/candidate-rules"
@@ -173,7 +170,7 @@ for rule_type in mihomo-instagram singbox-instagram; do
     jq '.chain_proxy.nodes=[]' "$DB_FILE" >"$TMP/db"
     mv "$TMP/db" "$DB_FILE"
     generate_singbox_config
-    check 'all(.route.rules[]; .action!="sniff")'
+    assert_sniff_first "$CFG/singbox.json"
     check 'all(.route.rules[]; ((.domain_suffix // []) | index("instagram.com"))==null) and
         all(.outbounds[]; ((.tag // "") | startswith("chain-")) | not)'
     [[ "$(db_get_routing_rules | jq length)" == 2 ]]

@@ -201,12 +201,12 @@ with TCPServer(("127.0.0.1", 0), Landing) as landing, \
                 extra.update(tag="runtime-unshaped", mode="unshaped", listen_port=free_port())
                 cfg["inbounds"].append(extra)
                 listeners.append(extra)
-                # v4/v5 inbounds and sniff rules come from the actual installer.
+                # Inbounds and the global sniff rule come from the actual installer.
                 legacy_tags = {ib["tag"] for ib in listeners if ib["version"] == 5}
                 assert len(legacy_tags) >= 2, "pass generated v4 and v5 listeners"
                 sniff = [rule for rule in cfg["route"]["rules"] if rule.get("action") == "sniff"]
-                assert {tag for rule in sniff for tag in rule["inbound"]} == legacy_tags, sniff
-                assert all(sorted(rule["sniffer"]) == ["http", "tls"] for rule in sniff), sniff
+                assert sniff == [{"action": "sniff"}], sniff
+                assert cfg["route"]["rules"][0] == sniff[0]
                 path = Path(tmp) / "server.json"
                 path.write_text(json.dumps(cfg))
                 processes.append(start(binary, path, log, [ib["listen_port"] for ib in listeners]))
@@ -230,7 +230,7 @@ with TCPServer(("127.0.0.1", 0), Landing) as landing, \
                 path.write_text(json.dumps(client))
                 ports = [ib["listen_port"] for ib in client["inbounds"]]
                 processes.append(start(binary, path, log, ports))
-                for port, inbound in zip(ports, listeners):
+                for port in ports:
                     assert socks_connect(port, "landing.example", 80) == b"landing-ok"
                     assert socks_connect(port, "127.0.0.1", direct.server_address[1]) == b"direct-ok"
                     try:
@@ -240,14 +240,13 @@ with TCPServer(("127.0.0.1", 0), Landing) as landing, \
                     socks_udp(port, udp.server_address[1])
                     # Sniff HTTP Host for the routing decision while preserving
                     # the requested IP and port delivered to the SOCKS landing.
-                    expected = HTTP_LANDING if inbound["version"] == 5 else HTTP_DIRECT
                     assert socks_connect(port, "127.0.0.1", direct.server_address[1],
-                                         HTTP_REQUEST, len(expected)) == expected
+                                         HTTP_REQUEST, len(HTTP_LANDING)) == HTTP_LANDING
                 assert seen == ["landing.example"] * len(ports), seen
-                assert http_seen == [("127.0.0.1", direct.server_address[1], HTTP_REQUEST)] * len(legacy_tags), http_seen
+                assert http_seen == [("127.0.0.1", direct.server_address[1], HTTP_REQUEST)] * len(ports), http_seen
                 assert not errors, errors
                 print("ok - live Snell v4/v5 via version-5 servers and v6 modes: TCP/UDP, direct, reject, chain")
-                print("ok - v4/v5 HTTP Host sniff routes IP targets through chain without destination override; v6 remains direct")
+                print("ok - v4/v5/v6 HTTP Host sniff routes IP targets through chain without destination override")
             except BaseException:
                 log.flush()
                 log.seek(0)

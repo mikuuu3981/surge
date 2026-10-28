@@ -175,7 +175,7 @@ check 'any(.route.rules[]; .outbound=="block" and .domain_suffix==["blocked.exam
        any(.route.rules[]; .ip_cidr==["198.51.100.0/24","2001:db8::/32"])'
 check '.route.final=="direct" and any(.outbounds[]; .tag=="chain-landing-prefer-ipv4" and .domain_resolver.strategy=="prefer_ipv4")'
 if [[ -n "$REAL_BIN" ]]; then
-    # Generate real v4/v5 listeners and their scoped sniff actions using a
+    # Generate real v4/v5 listeners and the global sniff action using a
     # candidate DB; the active v6 transaction fixture stays intact.
     jq '.singbox.snell=[{port:41901,version:4,psk:"1234567890123456"}] |
         .singbox["snell-v5"]=[{port:41902,version:5,psk:"1234567890123456"}]' \
@@ -209,8 +209,9 @@ jq '.balancer_groups=[{name:"pool",strategy:"leastPing",nodes:["landing"]}] |
     ]' "$DB_FILE" >"$TMP/db"; mv "$TMP/db" "$DB_FILE"
 generate_singbox_config
 check '[.route.rule_set[].tag] == ["geoip-cn","geoip-telegram","geosite-category-ads-all","geosite-cn","geosite-telegram"]'
-check '.route.rules[0].rule_set==["geosite-telegram"] and .route.rules[1].rule_set==["geoip-telegram"] and
-    .route.rules[0].outbound=="balancer-pool" and any(.outbounds[]; .tag=="balancer-pool" and .type=="urltest")'
+check '.route.rules[0]=={action:"sniff"} and
+    .route.rules[1].rule_set==["geosite-telegram"] and .route.rules[2].rule_set==["geoip-telegram"] and
+    .route.rules[1].outbound=="balancer-pool" and any(.outbounds[]; .tag=="balancer-pool" and .type=="urltest")'
 check 'any(.route.rules[]; .domain_suffix==["v4.example"] and .ip_cidr==["0.0.0.0/0"]) and
     any(.route.rules[]; .domain_suffix==["v6.example"] and .ip_cidr==["::/0"])'
 printf '%s\n' 'ok - presets, GeoIP companions, mixed rules, family filters, ads and Instagram isolation'
@@ -218,7 +219,8 @@ printf '%s\n' 'ok - presets, GeoIP companions, mixed rules, family filters, ads 
 jq '.routing={warp_mode:"official"} | .routing_rules=[{type:"all",outbound:"warp",ip_version:"as_is"}]' "$DB_FILE" >"$TMP/db"; mv "$TMP/db" "$DB_FILE"
 check_cmd() { [[ "$1" == warp-cli ]] || command -v "$1" >/dev/null 2>&1; }
 generate_singbox_config
-check '.route.rules[0]=={network:"udp",outbound:"direct"} and any(.outbounds[]; .type=="socks" and .server=="127.0.0.1")'
+check '.route.rules[0]=={action:"sniff"} and .route.rules[1]=={network:"udp",outbound:"direct"} and
+    any(.outbounds[]; .type=="socks" and .server=="127.0.0.1")'
 jq '.routing.warp_mode="wgcf"' "$DB_FILE" >"$TMP/db"; mv "$TMP/db" "$DB_FILE"
 jq -n '{endpoint:"[2606:4700:d0::1]:2408",address_v4:"172.16.0.2/32",address_v6:"2606:4700:110::2/128",
     private_key:"eCtXsJZ27+4PbhDkHnB923tkUn2Gj59wZw5wFA75MnU=",public_key:"Cr8hWlKvtDt7nrvf+f0brNQQzabAqrjfBvas9pmowjo="}' >"$WARP_CONF_FILE"
