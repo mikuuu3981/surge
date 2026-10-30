@@ -67,7 +67,7 @@ Sing-box 版与其他 Sing-box 协议共用 `vless-singbox` 服务及 `/etc/vles
 
 - Mieru 使用独立的 `vless-mihomo` 服务、`/usr/local/bin/vless-mihomo` 和 `/etc/vless-reality/mihomo.yaml`，数据库键为 `.mihomo.mieru`。配置采用 JSON 语法（合法 YAML），凭据始终保存为字符串。
 - 支持多个端口、按端口覆盖或卸载，每个端口独立设置账号密码和传输。首版每端口使用一个账号，暂不接入用户管理、配额和用户流量统计。
-- “查看配置”和“所有分享链接”显示可直接加入 `proxies` 的 Mihomo 节点；Clash/Mihomo 订阅也包含全部 Mieru 端口。通用 Base64、Surge 订阅不包含 Mieru，请使用支持 Mieru 的 Mihomo 客户端。
+- “查看配置”按字段显示地址、端口、传输协议、用户名和密码，并提供可直接加入 `proxies` 的多行 Clash/Mihomo YAML 节点及已启用的订阅地址；“所有分享链接”按端口列出 IPv4/IPv6 YAML 节点。Clash/Mihomo 订阅也以多行 YAML 包含全部 Mieru 端口，保留数字账号和密码的字符串类型。通用 Base64、Surge 订阅不包含 Mieru，请使用支持 Mieru 的 Mihomo 客户端。
 - 在 **分流管理 → 添加分流规则 → m（Sukka-AI-Mieru专属）** 中选择 AI 出口。使用 Sukka 的 [AI 域名规则](https://ruleset.skk.moe/Clash/non_ip/ai.txt) 和 [AI IP 规则](https://ruleset.skk.moe/Clash/ip/ai.txt)，包含 AI 语音服务的地址段；两份规则共用出口，其余流量直连。服务端开启 HTTP/TLS/QUIC 域名嗅探，保持原始目标地址。
 - 仅应用 `mihomo-ai` 规则；Xray、Sing-box 的 AI 规则及其他全局规则不会进入 Mieru。支持 ALL、仅 IPv4、仅 IPv6，IP 版本条件与 AI 规则相交。添加或删除此规则只更新 Mihomo。
 - AI 出口支持直连、拦截、WARP（WGCF/官方 SOCKS5）以及已有的 SOCKS5、HTTP、Shadowsocks、Trojan、Hysteria2、VLESS TCP/WS/REALITY 节点。官方 WARP SOCKS5 的 UDP 保持直连。不支持的出口参数、`via_warp` 和负载均衡组会明确报错并保留原配置。

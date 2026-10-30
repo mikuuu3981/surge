@@ -64,6 +64,90 @@ fixture() {
         chain_proxy:{nodes:[{name:"landing",type:"socks",server:"127.0.0.1",port:1080,username:"fixture",password:"quote\"pass"}]}}' >"$DB_FILE"
     RUNNING=false ENABLED=false FAIL_CONFIG=false FAIL_RESTART=false FAIL_HEALTH=false
 }
+
+# Exercise the actual details/share views without invoking services or networking.
+(
+    fixture
+    G= C= NC= Y= D= W=
+    _pause() { printf 'pause\n' >>"$TMP/display-pauses"; }
+    gen_qr() { printf 'unexpected QR generation\n' >&2; exit 90; }
+    db_add mihomo mieru "$(jq -nc --arg password 'quote"back\slash # :!' '[
+        {port:43001,username:"00123",password:"00123456789",transport:"TCP"},
+        {port:43003,username:"user2",password:$password,transport:"UDP"}]')"
+    cp "$DB_FILE" "$TMP/display-before-db"
+    show_single_protocol_info mieru <<<2 >"$TMP/display-selected"
+    show_single_protocol_info mieru false 43001 >"$TMP/display-tcp"
+    [[ "$(wc -l <"$TMP/display-pauses")" == 1 ]]
+    show_all_share_links >"$TMP/display-dual"
+    gen_clash_sub >"$TMP/display-subscription-nodes"
+    get_connection_addresses() { printf '|2001:db8::1\n'; }
+    show_single_protocol_info mieru false 43003 >"$TMP/display-ipv6"
+    show_all_share_links >"$TMP/display-ipv6-all"
+    get_connection_addresses() { printf '|\n'; }
+    show_single_protocol_info mieru false 43001 >"$TMP/display-no-address" 2>&1
+    get_connection_addresses() { printf '192.0.2.1|2001:db8::1\n'; }
+    _write_sub_info 11111111-1111-4111-8111-111111111111 8443 proxy.example true
+    ss() { printf 'LISTEN 0 128 0.0.0.0:8443 0.0.0.0:*\n'; }
+    show_single_protocol_info mieru false 43001 >"$TMP/display-subscription"
+    rm "$CFG/sub.info"
+    cmp "$DB_FILE" "$TMP/display-before-db"
+    python3 - "$TMP" <<'DISPLAYTEST'
+import json, pathlib, re, sys
+root = pathlib.Path(sys.argv[1])
+def read(name):
+    return re.sub(r'\x1b\[[0-9;]*m', '', (root / name).read_text())
+def nodes(name):
+    text = read(name).split('\nproxy-groups:', 1)[0]
+    assert '"type":"mieru"' not in text, text
+    blocks = re.findall(r'^  - name: .*\n(?:    [^\n]+\n)*', text, re.M)
+    result = []
+    for block in blocks:
+        node = {}
+        for line in block.splitlines():
+            key, value = line.strip().lstrip('- ').split(': ', 1)
+            if key in {'name', 'server', 'username', 'password'}:
+                node[key] = json.loads(value)
+            elif key == 'port':
+                node[key] = int(value)
+            elif key == 'udp':
+                node[key] = value == 'true'
+            else:
+                node[key] = value
+        assert node['type'] == 'mieru' and node['udp'] is True
+        assert node['multiplexing'] == 'MULTIPLEXING_LOW'
+        result.append(node)
+    assert result, text
+    (root / (name + '.yaml')).write_text('proxies:\n' + ''.join(blocks) + 'rules:\n  - MATCH,DIRECT\n')
+    return result
+tcp, = nodes('display-tcp')
+assert (tcp['port'], tcp['username'], tcp['password'], tcp['transport']) == (43001, '00123', '00123456789', 'TCP')
+udp, = nodes('display-selected')
+assert (udp['port'], udp['password'], udp['transport']) == (43003, 'quote"back\\slash # :!', 'UDP')
+details = read('display-selected')
+assert '传输协议: UDP' in details and '用户名: user2' in details
+assert '密码: quote"back\\slash # :!' in details and '订阅链接:' in details
+assert '二维码:' not in details and 'JOIN码:' not in details
+dual = nodes('display-dual')
+assert {(n['port'], n['server']) for n in dual} == {(p, ip) for p in (43001, 43003) for ip in ('192.0.2.1', '2001:db8::1')}
+assert len({n['name'] for n in dual}) == 4
+subscription = nodes('display-subscription-nodes')
+assert {(n['port'], n['username'], n['password'], n['transport']) for n in subscription} == {
+    (43001, '00123', '00123456789', 'TCP'), (43003, 'user2', 'quote"back\\slash # :!', 'UDP')}
+ipv6, = nodes('display-ipv6')
+assert ipv6['server'] == '2001:db8::1'
+assert all(n['server'] == '2001:db8::1' for n in nodes('display-ipv6-all'))
+missing, = nodes('display-no-address')
+assert missing['server'] == '请填写服务器地址' and '未检测到可用的连接地址' in read('display-no-address')
+assert 'https://proxy.example:8443/sub/11111111-1111-4111-8111-111111111111/clash' in read('display-subscription')
+DISPLAYTEST
+    if [[ -x "$REAL_BIN" ]]; then
+        for yaml in "$TMP"/display-*.yaml; do
+            "$REAL_BIN" -t -d "$TMP" -f "$yaml" >"$TMP/display-check.log" 2>&1
+        done
+    fi
+)
+printf 'ok - readable Mieru details/YAML, port selection, pause, credentials, dual-stack sharing and subscription display\n'
+
 fixture
 record='{"port":43001,"username":"00123","password":"00123456789","transport":"TCP"}'
 touch "$CFG/paused"
@@ -123,17 +207,20 @@ _reload_ai_routing_core mihomo-ai
 printf 'ok - AI core isolation, domain/IP matching, cache reuse/fallback and reload isolation\n'
 
 gen_clash_sub >"$TMP/sub.yaml"
-rg -q '"type":"mieru".*"username":"00123","password":"00123456789","udp":true,"transport":"TCP"' "$TMP/sub.yaml"
+rg -q '^    type: mieru$' "$TMP/sub.yaml"
+rg -q '^    username: "00123"$' "$TMP/sub.yaml"
+rg -q '^    password: "00123456789"$' "$TMP/sub.yaml"
+rg -q '^    transport: TCP$' "$TMP/sub.yaml"
 rg -q 'TEST-Mieru-43003' "$TMP/sub.yaml"
 if [[ -x "$REAL_BIN" ]]; then
     # Extract the Mieru nodes into a local-only validation config; the full client
     # template contains unrelated GEOIP rules that would download a database.
-    python3 - "$TMP/sub.yaml" "$TMP/sub-nodes.json" <<'PYTEST'
-import json,sys
-nodes=[json.loads(line.strip()[2:]) for line in open(sys.argv[1]) if line.strip().startswith('- {')]
-json.dump({'proxies':nodes,'rules':['MATCH,DIRECT']},open(sys.argv[2],'w'))
+    python3 - "$TMP/sub.yaml" "$TMP/sub-nodes.yaml" <<'PYTEST'
+import pathlib,sys
+nodes=pathlib.Path(sys.argv[1]).read_text().split('\nproxies:\n',1)[1].split('\nproxy-groups:',1)[0]
+pathlib.Path(sys.argv[2]).write_text('proxies:\n'+nodes+'\nrules:\n  - MATCH,DIRECT\n')
 PYTEST
-    "$REAL_BIN" -t -d "$TMP" -f "$TMP/sub-nodes.json" >"$TMP/sub-check.log" 2>&1
+    "$REAL_BIN" -t -d "$TMP" -f "$TMP/sub-nodes.yaml" >"$TMP/sub-check.log" 2>&1
 fi
 # Current Sing-box Snell must survive every Mieru port removal below.
 jq '.singbox.snell={port:43004,psk:"preserve-snell-key",version:4}' "$DB_FILE" >"$TMP/mixed-db"

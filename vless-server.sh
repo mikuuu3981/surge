@@ -22,7 +22,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
     exit 1
 fi
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.5.25 [服务端]
+#  多协议代理一键部署脚本 v3.5.26 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -41,7 +41,7 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.5.25"
+readonly VERSION="3.5.26"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/mikuuu3981/surge"
 readonly SCRIPT_REPO="mikuuu3981/surge"
@@ -11153,6 +11153,23 @@ gen_mieru_client_proxy() {
          transport:.transport,multiplexing:"MULTIPLEXING_LOW"}' <<<"$record"
 }
 
+# 客户端展示使用多行 YAML；字符串沿用 JSON 引号转义，保留数字账号及特殊字符。
+gen_mieru_client_yaml() {
+    local proxy
+    proxy=$(gen_mieru_client_proxy "$@") || return 1
+    jq -r '
+        "  - name: \(.name | tojson)\n" +
+        "    type: mieru\n" +
+        "    server: \(.server | tojson)\n" +
+        "    port: \(.port)\n" +
+        "    username: \(.username | tojson)\n" +
+        "    password: \(.password | tojson)\n" +
+        "    udp: true\n" +
+        "    transport: \(.transport)\n" +
+        "    multiplexing: \(.multiplexing)"
+    ' <<<"$proxy"
+}
+
 _install_mieru_interactive() {
     local port username password transport choice action=add old_port=all record
     install_deps && install_mihomo || return 1
@@ -20681,11 +20698,19 @@ show_all_share_links() {
         
         echo -e "  ${Y}$(get_protocol_name $protocol)${NC}"
         if [[ "$protocol" == mieru ]]; then
+            local mieru_port mieru_address mieru_family mieru_yaml
             while IFS= read -r cfg; do
-                printf '  - '
-                gen_mieru_client_proxy "${ipv4:-$ipv6}" "$cfg" "${country_code}-Mieru-$(jq -r .port <<<"$cfg")"
+                mieru_port=$(jq -r .port <<<"$cfg")
+                for mieru_family in IPv4 IPv6; do
+                    mieru_address="$ipv4"
+                    [[ "$mieru_family" != IPv6 ]] || mieru_address="$ipv6"
+                    [[ -n "$mieru_address" ]] || continue
+                    mieru_yaml=$(gen_mieru_client_yaml "$mieru_address" "$cfg" "${country_code}-Mieru-${mieru_port}-${mieru_family}") || return 1
+                    printf '  %bClash/Mihomo 配置（%s，端口 %s）：%b\n' "$Y" "$mieru_family" "$mieru_port" "$NC"
+                    printf '%b%s%b\n\n' "$C" "$mieru_yaml" "$NC"
+                    has_links=true
+                done
             done <<<"$cfg_stream"
-            has_links=true
             continue
         fi
 
@@ -20852,7 +20877,7 @@ show_single_protocol_info() {
         [[ -n "$cfg" ]] || { _err "未找到端口 $specified_port 的配置"; return; }
     elif [[ $port_count -gt 1 ]]; then
         echo ""
-        echo -e "${CYAN}协议 ${YELLOW}$protocol${CYAN} 有 ${port_count} 个端口实例：${NC}"
+        echo -e "${C}协议 ${Y}$(get_protocol_name "$protocol")${C} 有 ${port_count} 个端口实例：${NC}"
         echo ""
         local i=1 p
         for record in "${configs[@]}"; do
@@ -20864,7 +20889,7 @@ show_single_protocol_info() {
         echo ""
 
         local choice
-        read -p "$(echo -e "  ${GREEN}请选择要查看的端口 [0-$port_count]:${NC} ")" choice
+        read -rp "$(printf '  %b请选择要查看的端口 [0-%s]:%b ' "$G" "$port_count" "$NC")" choice || return 1
         if [[ "$choice" == "0" ]]; then
             return
         elif [[ "$choice" =~ ^[0-9]+$ ]] && [ "$choice" -ge 1 ] && [ "$choice" -le "$port_count" ]; then
@@ -20957,15 +20982,18 @@ show_single_protocol_info() {
         _warn "未检测到可用的连接地址，客户端配置中的服务器地址需要手动填写"
     fi
     
-    if [[ "$protocol" == mieru ]]; then
-        printf '  传输: %s\n  用户名: %s\n  密码: %s\n' "$(jq -r .transport <<<"$cfg")" "$username" "$password"
-        printf '\n  Mihomo 客户端节点（添加到 proxies）：\n  - '
-        gen_mieru_client_proxy "$config_ip" "$cfg" "${country_code}-Mieru-${port}"
-        _line
-        return 0
-    fi
-
     case "$protocol" in
+        mieru)
+            local transport mieru_yaml
+            transport=$(jq -r .transport <<<"$cfg")
+            printf '  传输协议: %b%s%b\n' "$G" "$transport" "$NC"
+            printf '  用户名: %b%s%b\n' "$G" "$username" "$NC"
+            printf '  密码: %b%s%b\n' "$G" "$password" "$NC"
+            printf '\n  %bClash/Mihomo 配置:%b\n' "$Y" "$NC"
+            mieru_yaml=$(gen_mieru_client_yaml "$config_ip" "$cfg" "${country_code}-Mieru-${port}") || return 1
+            printf '%b%s%b\n' "$C" "$mieru_yaml" "$NC"
+            printf '\n  %b将以上节点添加到客户端配置的 proxies 中。%b\n' "$D" "$NC"
+            ;;
         vless|vless-singbox)
             local security_mode=$(echo "$cfg" | jq -r '.security_mode // "reality"')
             if [[ "$security_mode" == "encryption" ]]; then
@@ -21259,7 +21287,7 @@ show_single_protocol_info() {
     fi
     
     # 显示分享链接和二维码
-    if [[ -n "$ip_addr" ]]; then
+    if [[ -n "$ip_addr" && "$protocol" != mieru ]]; then
         local link_port="$display_port"
         
         local link join_code
@@ -21479,8 +21507,8 @@ show_single_protocol_info() {
         fi
     fi
     
-    # 独立订阅服务也可供 REALITY 使用，端口以实际保存的配置为准。
-    if [[ "$protocol" == vless-singbox && -f "$CFG/sub.info" ]]; then
+    # 独立订阅服务也可供 REALITY 和 Mieru 使用，端口以实际保存的配置为准。
+    if [[ ( "$protocol" == vless-singbox || "$protocol" == mieru ) && -f "$CFG/sub.info" ]]; then
         _load_sub_info "$CFG/sub.info" || { _warn "订阅配置格式无效"; return 1; }
         nginx_port="$sub_port"
     fi
@@ -21493,11 +21521,13 @@ show_single_protocol_info() {
     fi
     
     # 显示订阅链接提示
-    if [[ "$protocol" == vless-singbox && "$web_service_running" == true && -f "$CFG/sub.info" ]]; then
+    if [[ ( "$protocol" == vless-singbox || "$protocol" == mieru ) && "$web_service_running" == true && -f "$CFG/sub.info" ]]; then
         local sub_protocol="http" sub_host="${sub_domain:-${ipv4:-[$ipv6]}}"
         [[ "$sub_https" == true ]] && sub_protocol="https"
         echo -e "  ${Y}Clash/Clash Verge:${NC}"
         echo -e "  ${G}${sub_protocol}://${sub_host}:${sub_port}/sub/${sub_uuid}/clash${NC}"
+    elif [[ "$protocol" == mieru ]]; then
+        printf '  %b可使用上面的 YAML 节点，或在「订阅管理」中启用 Clash/Mihomo 订阅。%b\n' "$D" "$NC"
     elif [[ "$has_cert_protocol" == "true" ]]; then
         # 有证书协议，显示订阅状态
         if [[ "$web_service_running" == "true" && -f "$CFG/sub.info" ]]; then
@@ -21555,7 +21585,7 @@ manage_protocol_services() {
         _item "2" "停止所有服务"
         _item "3" "启动所有服务"
         _item "4" "查看服务状态"
-        _item "5" "查看运行配置文件（Xray / Sing-box）"
+        _item "5" "查看运行配置文件（Xray / Sing-box / Mihomo）"
         _item "0" "返回"
         _line
 
@@ -25627,7 +25657,7 @@ gen_clash_sub() {
             case "$protocol" in
             mieru)
                 name="${country_code}-Mieru-${port}-${ip_suffix}"
-                [[ -z "$server_ip" ]] || proxy="  - $(gen_mieru_client_proxy "$server_ip" "$cfg" "$name")"
+                [[ -z "$server_ip" ]] || proxy=$(gen_mieru_client_yaml "$server_ip" "$cfg" "$name")
                 ;;
             vless|vless-singbox)
                 [[ -n "$server_ip" ]] && proxy="  - name: \"$name\"
