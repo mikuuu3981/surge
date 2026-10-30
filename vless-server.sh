@@ -22,7 +22,7 @@ if (( BASH_VERSINFO[0] < 4 || (BASH_VERSINFO[0] == 4 && BASH_VERSINFO[1] < 1) ))
     exit 1
 fi
 #═══════════════════════════════════════════════════════════════════════════════
-#  多协议代理一键部署脚本 v3.5.24 [服务端]
+#  多协议代理一键部署脚本 v3.5.25 [服务端]
 #  
 #  架构升级:
 #    • Xray 核心: 处理 TCP/TLS 协议 (VLESS/VMess/Trojan/SOCKS/SS2022)
@@ -31,7 +31,7 @@ fi
 #  
 #  支持协议: VLESS+Reality / VLESS+Reality+XHTTP / VLESS+WS / VMess+WS / 
 #           VLESS-XTLS-Vision / SOCKS5 / SS2022 / HY2 / Trojan / 
-#           Snell v4 / Snell v5 / Snell v6 / AnyTLS / TUIC / NaïveProxy (多协议)
+#           Snell v4 / Snell v5 / Snell v6 / AnyTLS / TUIC / Mieru / NaïveProxy (多协议)
 #  插件支持: SS2022 保持可选外部 ShadowTLS；Snell v4/v5 使用 Sing-box 内置 ShadowTLS v3
 #  适配: Alpine/Debian/Ubuntu/CentOS
 #  
@@ -41,7 +41,7 @@ fi
 #  作者地址:https://docs.vaiox.de/
 #═══════════════════════════════════════════════════════════════════════════════
 
-readonly VERSION="3.5.24"
+readonly VERSION="3.5.25"
 readonly AUTHOR="Zyx0rx"
 readonly REPO_URL="https://github.com/mikuuu3981/surge"
 readonly SCRIPT_REPO="mikuuu3981/surge"
@@ -70,13 +70,10 @@ readonly CFG MIHOMO_BIN SYSTEMD_DIR OPENRC_DIR
 readonly MIHOMO_CONFIG="$CFG/mihomo.yaml"
 if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
     MIHOMO_LOG_FILE="${VLESS_TEST_MIHOMO_LOG_FILE:-/var/log/vless/mihomo.log}"
-    SYSTEM_MESSAGES_LOG="${VLESS_TEST_MESSAGES_LOG:-/var/log/messages}"
 else
     MIHOMO_LOG_FILE="/var/log/vless/mihomo.log"
-    SYSTEM_MESSAGES_LOG="/var/log/messages"
 fi
-readonly MIHOMO_LOG_FILE SYSTEM_MESSAGES_LOG
-readonly MIHOMO_MIGRATION_MARKER="$CFG/.mihomo-snell-migrated-v1"
+readonly MIHOMO_LOG_FILE
 readonly ACME_DEFAULT_EMAIL="acme@vaio.com"
 
 # curl 超时常量
@@ -468,9 +465,12 @@ db_list_protocols() {
 db_get_all_protocols() {
     [[ ! -f "$DB_FILE" ]] && return 1
     {
-        jq -r '(.xray // {}) | keys[]' "$DB_FILE" 2>/dev/null
-        jq -r '(.singbox // {}) | keys[]' "$DB_FILE" 2>/dev/null
-        jq -r '(.mihomo // {}) | keys[]' "$DB_FILE" 2>/dev/null
+        jq -r --arg protocols "$XRAY_PROTOCOLS $STANDALONE_PROTOCOLS" \
+            '(.xray // {}) | keys[] as $p | select($protocols | split(" ") | index($p)) | $p' "$DB_FILE" 2>/dev/null
+        jq -r --arg protocols "$SINGBOX_PROTOCOLS" \
+            '(.singbox // {}) | keys[] as $p | select($protocols | split(" ") | index($p)) | $p' "$DB_FILE" 2>/dev/null
+        jq -r --arg protocols "$MIHOMO_PROTOCOLS" \
+            '(.mihomo // {}) | keys[] as $p | select($protocols | split(" ") | index($p)) | $p' "$DB_FILE" 2>/dev/null
     } | sort -u
 }
 
@@ -657,6 +657,7 @@ get_protocol_name() {
         trojan) echo "Trojan" ;;
         trojan-ws) echo "Trojan-WS" ;;
         anytls) echo "AnyTLS" ;;
+        mieru) echo "Mieru (Mihomo)" ;;
         *) echo "$proto" ;;
     esac
 }
@@ -899,7 +900,7 @@ db_add_user() {
     fi
     
     # 检查是否为独立协议（不支持多用户）
-    if is_standalone_protocol "$proto" || is_singbox_snell_protocol "$proto"; then
+    if is_standalone_protocol "$proto" || is_singbox_snell_protocol "$proto" || [[ "$proto" == mieru ]]; then
         _err "协议 $proto 使用固定 PSK，不支持添加用户"
         return 1
     fi
@@ -3453,7 +3454,7 @@ _snell_append_join_record() {
 
 # 从 .singbox 数据重建 v4/v5 JOIN 文件，并以所有现存协议 JOIN 文件重建聚合。
 # 调用方已有事务快照；任一写入失败会由调用方回滚，绝不报告半成功节点变更。
-regenerate_legacy_snell_join_info() {
+regenerate_singbox_snell_v45_join_info() {
     local db_file="${1:-$DB_FILE}" tmpdir protocol record join base aggregate
     local protocols=(snell snell-v5 snell-shadowtls snell-v5-shadowtls)
     [[ -f "$db_file" ]] || return 1
@@ -3880,14 +3881,17 @@ XRAY_PROTOCOLS="vless vless-xhttp vless-xhttp-cdn vless-ws vless-ws-notls vmess-
 # Sing-box 管理的协议 (原独立协议，现统一由 Sing-box 处理)
 SINGBOX_PROTOCOLS="hy2 tuic anytls vless-singbox snell-v6-singbox snell snell-v5 snell-shadowtls snell-v5-shadowtls"
 readonly SINGBOX_SNELL_MIN_VERSION="1.14.0"
-# 旧版 Snell 协议键保持稳定，供迁移和客户端订阅识别。
-SNELL_LEGACY_PROTOCOLS="snell snell-v5 snell-shadowtls snell-v5-shadowtls"
+# Sing-box Snell v4/v5 协议键保持稳定，供管理和客户端订阅识别。
+SINGBOX_SNELL_V45_PROTOCOLS="snell snell-v5 snell-shadowtls snell-v5-shadowtls"
 # 仍需独立进程的协议
 STANDALONE_PROTOCOLS="snell-v6 ss2022-shadowtls naive"
+MIHOMO_PROTOCOLS="mieru"
 
 protocol_core() {
     local protocol="$1"
-    if [[ " $SINGBOX_PROTOCOLS " == *" $protocol "* ]]; then
+    if [[ " $MIHOMO_PROTOCOLS " == *" $protocol "* ]]; then
+        echo mihomo
+    elif [[ " $SINGBOX_PROTOCOLS " == *" $protocol "* ]]; then
         echo singbox
     elif [[ " $STANDALONE_PROTOCOLS " == *" $protocol "* ]]; then
         echo standalone
@@ -3897,7 +3901,7 @@ protocol_core() {
 }
 
 # 获取协议记录实际所在的数据库命名空间。
-# 新 Snell 记录统一写入 singbox；遗留数据只由迁移入口处理。
+# 独立进程协议仍保存在 xray 命名空间；其他协议按所属核心存储。
 protocol_db_core() {
     local protocol="$1" core
     core=$(protocol_core "$protocol")
@@ -3909,18 +3913,8 @@ protocol_db_core() {
     fi
 }
 
-# 当前活动数据所有者：singbox 优先，其次读取遗留 mihomo/xray。
-# 保持与 protocol_db_core 的兼容写入语义分离，确保展示、选择和卸载一致。
-protocol_active_db_core() {
-    local protocol="$1"
-    if [[ " $SNELL_LEGACY_PROTOCOLS " == *" $protocol "* ]] && ! db_exists singbox "$protocol" && db_exists "mihomo" "$protocol"; then
-        printf '%s\n' mihomo
-    elif [[ " $SNELL_LEGACY_PROTOCOLS " == *" $protocol "* ]] && ! db_exists singbox "$protocol" && db_exists xray "$protocol"; then
-        printf '%s\n' xray
-    else
-        protocol_db_core "$protocol"
-    fi
-}
+# 当前协议记录统一按所属核心读取。
+protocol_active_db_core() { protocol_db_core "$1"; }
 
 protocol_subscription_db_core() { protocol_active_db_core "$1"; }
 protocol_uninstall_db_core() { protocol_active_db_core "$1"; }
@@ -3945,6 +3939,7 @@ PROTO_SVC[hy2]="vless-singbox";  PROTO_BIN[hy2]="sing-box"; PROTO_KIND[hy2]="sin
 PROTO_SVC[tuic]="vless-singbox"; PROTO_BIN[tuic]="sing-box"; PROTO_KIND[tuic]="singbox"
 PROTO_SVC[anytls]="vless-singbox"; PROTO_BIN[anytls]="sing-box"; PROTO_KIND[anytls]="singbox"
 PROTO_SVC[vless-singbox]="vless-singbox"; PROTO_BIN[vless-singbox]="sing-box"; PROTO_KIND[vless-singbox]="singbox"
+PROTO_SVC[mieru]="vless-mihomo"; PROTO_BIN[mieru]="vless-mihomo"; PROTO_KIND[mieru]="mihomo"
 PROTO_SVC[snell-v6-singbox]="vless-singbox"; PROTO_BIN[snell-v6-singbox]="sing-box"; PROTO_KIND[snell-v6-singbox]="singbox"
 
 # 官方 Snell v6 保持独立进程，可与上面的 Sing-box 版同时运行。
@@ -3959,7 +3954,7 @@ PROTO_KIND[ss2022-shadowtls]="shadowtls"
 PROTO_BIN[ss2022-shadowtls]="shadow-tls"
 
 # Snell v4/v5（含内置 ShadowTLS）共享 Sing-box 进程。
-for _p in $SNELL_LEGACY_PROTOCOLS; do
+for _p in $SINGBOX_SNELL_V45_PROTOCOLS; do
     PROTO_SVC[$_p]="vless-singbox"
     PROTO_BIN[$_p]="sing-box"
     PROTO_KIND[$_p]="singbox"
@@ -3987,7 +3982,7 @@ register_protocol() {
     local protocol="$1"
     local config_json="$2"
     
-    # 使用记录实际所在的命名空间，避免更新旧 Snell 时重复写入 mihomo。
+    # 使用协议所属核心的数据库命名空间。
     local core
     core=$(protocol_db_core "$protocol")
     
@@ -4046,7 +4041,8 @@ filter_installed() { # filter_installed "proto1 proto2 ..."
 }
 
 get_xray_protocols()       { filter_installed "$XRAY_PROTOCOLS"; }
-# 运行时仅枚举已归属 Sing-box 的数据，迁移前的旧数据不启动新核心。
+get_mihomo_protocols()     { filter_installed "$MIHOMO_PROTOCOLS"; }
+# 仅枚举 Sing-box 命名空间内已安装的协议。
 get_singbox_protocols() {
     local protocol
     for protocol in $SINGBOX_PROTOCOLS; do
@@ -4055,34 +4051,6 @@ get_singbox_protocols() {
     return 0
 }
 
-# 只读展示迁移待完成的数据；不提供旧核心的运行入口。
-get_pending_mihomo_protocols() {
-    local protocol
-    for protocol in $SNELL_LEGACY_PROTOCOLS; do
-        if ! db_exists singbox "$protocol" && db_exists mihomo "$protocol"; then
-            printf '%s\n' "$protocol"
-        fi
-    done
-    return 0
-}
-
-# 迁移前的 Snell v4/v5 记录仍归旧服务所有；绝不能将 .mihomo 新节点带入该回退路径。
-get_legacy_snell_protocols() {
-    local installed protocol
-    installed=$(db_list_protocols "xray") || return 0
-    for protocol in $SNELL_LEGACY_PROTOCOLS; do
-        grep -qx "$protocol" <<<"$installed" && printf '%s\n' "$protocol"
-    done
-}
-
-# 展示不重复列出已完成迁移的旧副本；运行时旧服务发现仍使用上面的完整列表。
-get_legacy_snell_display_protocols() {
-    local protocol
-    while IFS= read -r protocol; do
-        [[ -z "$protocol" ]] && continue
-        ! db_exists "mihomo" "$protocol" && ! db_exists singbox "$protocol" && printf '%s\n' "$protocol"
-    done <<<"$(get_legacy_snell_protocols)"
-}
 get_standalone_protocols() { filter_installed "$STANDALONE_PROTOCOLS"; }
 
 # 生成用户级路由规则
@@ -5776,10 +5744,10 @@ ensure_dual_stack_listen() {
 # 核心功能：强力清理 & 时间同步
 #═══════════════════════════════════════════════════════════════════════════════
 _cleanup_managed_mihomo_resources() {
-    # 仅删除本脚本命名并管理的 Mihomo 文件；外部 ShadowTLS 的归属另行判断。
+    # 仅删除本脚本命名并管理的 Mihomo 文件。
     local backup_dir
     svc disable vless-mihomo 2>/dev/null
-    rm -f "$MIHOMO_CONFIG" "$MIHOMO_MIGRATION_MARKER" "$MIHOMO_BIN"
+    rm -f "$MIHOMO_CONFIG" "$MIHOMO_BIN"
     _remove_mihomo_service_definition 2>/dev/null || true
     rm -f "$VERSION_CACHE_DIR"/MetaCubeX_mihomo*
     if backup_dir=$(_get_core_backup_dir 2>/dev/null); then
@@ -5789,9 +5757,8 @@ _cleanup_managed_mihomo_resources() {
 
 force_cleanup() {
     # 停止所有 vless 相关服务
-    local services="watchdog reality hy2 tuic snell snell-v5 snell-v6 anytls singbox mihomo"
-    services+=" snell-shadowtls snell-v5-shadowtls ss2022-shadowtls"
-    services+=" snell-shadowtls-backend snell-v5-shadowtls-backend ss2022-shadowtls-backend"
+    local services="watchdog reality hy2 tuic snell-v6 anytls singbox mihomo"
+    services+=" ss2022-shadowtls ss2022-shadowtls-backend"
     for s in $services; do svc stop "vless-$s" 2>/dev/null; done
     
     # 清理 iptables NAT 规则
@@ -6121,7 +6088,7 @@ recommend_port() {
                 fi
             done
             ;;
-        vless-vision|trojan|anytls|snell-shadowtls|snell-v5-shadowtls|ss2022-shadowtls)
+        vless-vision|trojan|anytls|ss2022-shadowtls)
             # 这些协议需要对外暴露，优先使用 HTTPS 端口
             if ! ss -tuln 2>/dev/null | grep -q ":443 " && ! is_internal_port_occupied "443" >/dev/null; then
                 echo "443"
@@ -10483,9 +10450,10 @@ _update_core_with_channel_select() {
 update_core_menu() {
     while true; do
         _header
-        echo -e "  ${W}核心版本管理 (Xray/Sing-box/Snell v6)${NC}"
+        echo -e "  ${W}核心版本管理 (Xray/Sing-box/Mihomo/Snell v6)${NC}"
         _line
         _show_core_versions
+        if [[ -x "$MIHOMO_BIN" ]]; then "$MIHOMO_BIN" -v | head -n 1; fi
         _line
         
         local xray_label="更新 Xray"
@@ -10499,6 +10467,7 @@ update_core_menu() {
         _item "2" "$singbox_label"
         _item "3" "$snellv6_label"
         _item "4" "重新获取版本"
+        _item "5" "安装/更新 Mihomo (Mieru)"
         _item "0" "返回"
         _line
         
@@ -10508,6 +10477,7 @@ update_core_menu() {
             2) _update_core_with_channel_select "Sing-box" "SagerNet/sing-box" "sing-box" "vless-singbox" "install_singbox" ;;
             3) _update_core_with_channel_select "Snell v6" "$SNELL_V6_REPO" "snell-server-v6" "vless-snell-v6" "install_snell_v6" ;;
             4) _refresh_core_versions_now ;;
+            5) update_mihomo_core ;;
             0) break ;;
             *) _err "无效选择" ;;
         esac
@@ -10804,12 +10774,405 @@ _build_singbox_ruleset_defs() {
     echo "$defs"
 }
 
-_mihomo_service_definition_exists() {
-    if [[ "$DISTRO" == "alpine" ]]; then
-        [[ -f "$OPENRC_DIR/vless-mihomo" ]]
-    else
-        [[ -f "$SYSTEMD_DIR/vless-mihomo.service" ]]
+# Mieru 由 Mihomo 提供；JSON 是合法 YAML，使用 jq 避免凭据插值和 YAML 类型歧义。
+validate_mihomo_config() {
+    "${MIHOMO_CONFIG_BINARY:-$MIHOMO_BIN}" -t -d "$CFG" -f "$1"
+}
+
+install_mihomo() {
+    local channel="${1:-stable}" force="${2:-false}" version="${3:-}"
+    local arch asset url tmp
+    [[ "$force" == true || ! -x "$MIHOMO_BIN" ]] || return 0
+    [[ -n "$version" ]] || version=$(_get_latest_version MetaCubeX/mihomo true)
+    version="${version#v}"
+    [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ && "$channel" == stable ]] || {
+        _err "Mieru 使用 Mihomo 正式版，请指定有效的稳定版本"; return 1;
+    }
+    case "$(uname -m)" in
+        x86_64|amd64) arch=amd64-v1 ;;
+        aarch64|arm64) arch=arm64 ;;
+        armv7l) arch=armv7 ;;
+        *) _err "Mihomo 不支持此架构"; return 1 ;;
+    esac
+    asset="mihomo-linux-${arch}-v${version}.gz"
+    url="https://github.com/MetaCubeX/mihomo/releases/download/v${version}/${asset}"
+    tmp=$(mktemp -d) || return 1
+    if ! curl -fsSL --connect-timeout 10 --max-time 180 --retry 2 -o "$tmp/pkg.gz" "$url" ||
+       ! _verify_github_release_asset MetaCubeX/mihomo "$version" "$url" "$tmp/pkg.gz" ||
+       ! gzip -dc "$tmp/pkg.gz" >"$tmp/mihomo" || ! chmod 755 "$tmp/mihomo" ||
+       ! "$tmp/mihomo" -v >/dev/null 2>&1; then
+        rm -rf "$tmp"; _err "Mihomo 下载或 SHA-256 校验失败"; return 1
     fi
+    # 候选核心必须认识 Mieru listener；拒绝只实现 Mieru 出站的旧版本。
+    jq -n '{listeners:[{name:"mieru-check",type:"mieru",listen:"127.0.0.1",port:18081,
+        transport:"TCP",users:{check:"check-password"}}],rules:["MATCH,DIRECT"]}' >"$tmp/check.json"
+    if ! "$tmp/mihomo" -t -d "$tmp" -f "$tmp/check.json" >/dev/null 2>&1; then
+        rm -rf "$tmp"; _err "此 Mihomo 版本不支持 Mieru 服务端"; return 1
+    fi
+    if [[ -f "$MIHOMO_CONFIG" ]] && ! MIHOMO_CONFIG_BINARY="$tmp/mihomo" validate_mihomo_config "$MIHOMO_CONFIG"; then
+        rm -rf "$tmp"; _err "候选 Mihomo 无法读取现有配置，保留原核心"; return 1
+    fi
+    # 同目录原子替换，兼容正在运行的核心及 Linux ETXTBSY。
+    local staged
+    staged=$(mktemp "${MIHOMO_BIN}.new.XXXXXX") || { rm -rf "$tmp"; return 1; }
+    if ! install -m 755 "$tmp/mihomo" "$staged" || ! mv "$staged" "$MIHOMO_BIN"; then
+        rm -f "$staged"; rm -rf "$tmp"; return 1
+    fi
+    rm -rf "$tmp"
+}
+
+update_mihomo_core() {
+    local version snapshot was_running=false staged
+    read -rp "  Mihomo 稳定版本号 [回车使用最新正式版]: " version || return 1
+    version="${version#v}"
+    [[ -z "$version" || "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || return 1
+    snapshot=$(mktemp -d "$CFG/.mihomo-core.XXXXXX") || return 1
+    if [[ -f "$MIHOMO_BIN" ]]; then
+        cp -p "$MIHOMO_BIN" "$snapshot/previous" || { rm -rf "$snapshot"; return 1; }
+    fi
+    svc status vless-mihomo >/dev/null 2>&1 && was_running=true
+    if install_mihomo stable true "$version"; then
+        if [[ "$was_running" != true ]] || { svc restart vless-mihomo && _wait_for_mihomo_ready; }; then
+            rm -rf "$snapshot"
+            _ok "Mihomo 核心已更新"
+            return 0
+        fi
+    fi
+    if [[ -f "$snapshot/previous" ]]; then
+        staged=$(mktemp "${MIHOMO_BIN}.restore.XXXXXX") || return 1
+        cp -p "$snapshot/previous" "$staged" && mv "$staged" "$MIHOMO_BIN" || return 1
+    else
+        rm -f "$MIHOMO_BIN" || return 1
+    fi
+    if [[ "$was_running" == true ]]; then
+        svc restart vless-mihomo && _wait_for_mihomo_ready || {
+            _err "Mihomo 核心恢复失败，快照保留: $snapshot"; return 1;
+        }
+    fi
+    rm -rf "$snapshot"
+    _err "Mihomo 更新失败，已恢复原核心"
+    return 1
+}
+
+_mihomo_ai_cache_valid() {
+    local file="$1"
+    [[ -s "$file" && $(wc -c <"$file") -le $SUBSCRIPTION_MAX_BYTES ]] || return 1
+    awk '
+        /^[[:space:]]*(#|$)/ {next}
+        /^(DOMAIN|DOMAIN-SUFFIX|DOMAIN-KEYWORD|DOMAIN-WILDCARD|DOMAIN-REGEX|IP-CIDR|IP-CIDR6|IP-ASN),[^,]+(,no-resolve)?$/ {
+            split($0, fields, ",")
+            if (fields[1] == "IP-ASN" && (fields[2] !~ /^[0-9]+$/ || fields[2]+0 < 1 || fields[2]+0 > 4294967295)) bad=1
+            if (fields[1] == "IP-CIDR" || fields[1] == "IP-CIDR6") {
+                if (split(fields[2], cidr, "/") != 2 || cidr[2] !~ /^[0-9]+$/) bad=1
+                if (fields[1] == "IP-CIDR") {
+                    if (cidr[2]+0 > 32 || split(cidr[1], octets, ".") != 4) bad=1
+                    for (i=1; i<=4; i++) if (octets[i] !~ /^[0-9]+$/ || octets[i]+0 > 255) bad=1
+                } else if (cidr[2]+0 > 128 || cidr[1] !~ /^[0-9a-fA-F:]+$/ || index(cidr[1], ":") == 0) bad=1
+            }
+            n++; next
+        }
+        {bad=1}
+        END {exit (bad || !n)}
+    ' "$file"
+}
+
+_prepare_mihomo_ai_ruleset() {
+    local category="$1" tag="$2" file tmp check now mtime=0
+    file="$CFG/ruleset/mihomo-${tag}.txt"
+    mkdir -p "$CFG/ruleset" || return 1
+    now=$(date +%s)
+    [[ ! -f "$file" ]] || mtime=$(stat -c %Y "$file" 2>/dev/null || printf 0)
+    if _mihomo_ai_cache_valid "$file" && ((now - mtime < 86400)); then return 0; fi
+    tmp=$(mktemp "$CFG/ruleset/.mihomo-${tag}.XXXXXX") || return 1
+    check=$(mktemp "$CFG/.mihomo-provider.XXXXXX") || { rm -f "$tmp"; return 1; }
+    if curl -fsSL --connect-timeout 10 --max-time 60 --max-filesize "$SUBSCRIPTION_MAX_BYTES" \
+        "https://ruleset.skk.moe/Clash/${category}/ai.txt" -o "$tmp" &&
+       _mihomo_ai_cache_valid "$tmp" &&
+       jq -Rn '{rules:([inputs | select(test("^[[:space:]]*(#|$)") | not) | split(",") |
+           if length==2 then .+["DIRECT"] else [.[0],.[1],"DIRECT",.[2]] end | join(",")] + ["MATCH,DIRECT"])}' <"$tmp" >"$check" &&
+       validate_mihomo_config "$check" >/dev/null 2>&1 && chmod 600 "$tmp" && mv "$tmp" "$file"; then
+        rm -f "$check"
+        return 0
+    fi
+    rm -f "$tmp" "$check"
+    if _mihomo_ai_cache_valid "$file"; then
+        _warn "Sukka AI ${category} 更新失败，使用旧缓存"
+        return 0
+    fi
+    _err "Sukka AI ${category} 无有效缓存，保留原运行配置"
+    return 1
+}
+
+_prepare_mihomo_asn_database() {
+    local asn check
+    asn=$(awk -F, '/^IP-ASN,/ {print $2; exit}' "$CFG/ruleset/mihomo-skk-ai-ip.txt") || return 1
+    [[ -n "$asn" ]] || return 0
+    check=$(mktemp "$CFG/.mihomo-asn.XXXXXX") || return 1
+    # -t 不会初始化 provider 的内容。把 ASN 规则放在顶层，让核心在切换前
+    # 下载并校验 ASN.mmdb，避免服务启动后才发现数据库缺失而漏掉 AI 分流。
+    if jq -n --arg rule "IP-ASN,${asn},DIRECT" '{rules:[$rule,"MATCH,DIRECT"]}' >"$check" &&
+       validate_mihomo_config "$check"; then
+        rm -f "$check"
+        return 0
+    fi
+    rm -f "$check"
+    _err "Mihomo ASN 数据库准备失败，保留原运行配置"
+    return 1
+}
+
+_gen_mihomo_ai_proxy() {
+    local outbound="$1" db_file="$2" node
+    case "$outbound" in
+        direct|block) printf '[]\n'; return ;;
+        warp)
+            if [[ "$(jq -r '.routing.warp_mode // "wgcf"' "$db_file")" == official ]]; then
+                check_cmd warp-cli || return 1
+                jq -n --argjson port "$WARP_OFFICIAL_PORT" '[{name:"AI-OUT",type:"socks5",server:"127.0.0.1",port:$port,udp:false}]'
+            else
+                [[ -f "$WARP_CONF_FILE" ]] || return 1
+                jq -e '[{name:"AI-OUT",type:"wireguard",server:(.endpoint | sub("^\\[";"") | sub("\\]?:[0-9]+$";"")),
+                    port:(.endpoint | capture(":(?<port>[0-9]+)$").port | tonumber),
+                    ip:(.address_v4 | split("/")[0]),ipv6:(.address_v6 | split("/")[0]),
+                    "private-key":.private_key,"public-key":.public_key,udp:true,mtu:1280}]' "$WARP_CONF_FILE"
+            fi
+            return ;;
+        chain:*) node=$(jq -c --arg name "${outbound#chain:}" '.chain_proxy.nodes[]? | select(.name==$name)' "$db_file") ;;
+        *) _err "Mieru AI 暂不支持此出口: $outbound"; return 1 ;;
+    esac
+    [[ -n "$node" ]] || { _err "AI 出口节点不存在: $outbound"; return 1; }
+    # 首版仅翻译能完整保留参数的出口，其他类型明确报错。
+    jq -e '
+        if (.via_warp // false) or ((.network // "tcp") != "tcp" and (.type != "vless" or .network != "ws")) then error("unsupported transport or via_warp") else . end |
+        {name:"AI-OUT",server:.server,port:.port,udp:true} +
+        (if .type=="socks" then {type:"socks5",username:(.username // ""),password:(.password // "")}
+         elif .type=="http" then {type:"http",username:(.username // ""),password:(.password // "")}
+         elif .type=="shadowsocks" then {type:"ss",cipher:.method,password:.password}
+         elif .type=="trojan" or .type=="hysteria2" then
+             {type:.type,password:.password,sni:(.sni // .server),"skip-cert-verify":(.insecure=="1" or .insecure==true)}
+         elif .type=="vless" and (.encryption // "none")=="none" then
+             {type:"vless",uuid:.uuid,network:(.network // "tcp"),tls:(.security=="tls" or .security=="reality"),
+              servername:(.sni // .server),flow:(.flow // ""),"client-fingerprint":(.fingerprint // "chrome")} +
+             (if .security=="reality" then {"reality-opts":{"public-key":.publicKey,"short-id":.shortId}} else {} end) +
+             (if .network=="ws" then {"ws-opts":{path:(.wsPath // "/"),headers:{Host:(.wsHost // .sni // .server)}}} else {} end)
+         else error("unsupported AI outbound") end) | [.]
+    ' <<<"$node" || { _err "AI 出口参数无法完整转换: $outbound"; return 1; }
+}
+
+generate_mihomo_config() {
+    local output="${1:-$MIHOMO_CONFIG}" db_file="${2:-$DB_FILE}" records config rule outbound proxies target ip_version tag match tmp
+    records=$(jq -c '.mihomo.mieru // [] | if type=="array" then . else [.] end' "$db_file") || return 1
+    jq -e 'length>0 and all(.[]; (.port|type)=="number" and .port>=1 and .port<=65535 and
+        (.port|floor)==.port and (.username|type)=="string" and (.username|length)>0 and
+        (.password|type)=="string" and (.password|length)>0 and (.transport=="TCP" or .transport=="UDP")) and
+        ([.[].port]|length)==([.[].port]|unique|length)' <<<"$records" >/dev/null || return 1
+    config=$(jq -n --argjson records "$records" --arg listen "$(_listen_addr)" '{
+        mode:"rule",ipv6:true,"log-level":"info","find-process-mode":"off",
+        listeners:[$records[]|{name:("mieru-"+(.port|tostring)),type:"mieru",listen:$listen,port:.port,
+            transport:.transport,users:{(.username):.password}}],
+        sniffer:{enable:true,"parse-pure-ip":true,"force-dns-mapping":true,"override-destination":false,
+            sniff:{HTTP:{ports:[80,"8080-8880"]},TLS:{ports:[443,8443]},QUIC:{ports:[443,8443]}}},
+        proxies:[],"rule-providers":{},rules:[]
+    }') || return 1
+    # 与现有核心的全局/用户级规则隔离，Mieru 只读取明确归属它的 AI 规则。
+    rule=$(jq -c '[.routing_rules[]? | select(.type=="mihomo-ai")] |
+        if length>1 then error("duplicate Mihomo AI rules") else .[0] // empty end' "$db_file") || return 1
+    if [[ -n "$rule" ]]; then
+        outbound=$(jq -r '.outbound' <<<"$rule")
+        ip_version=$(jq -r '.ip_version // "as_is"' <<<"$rule")
+        proxies=$(_gen_mihomo_ai_proxy "$outbound" "$db_file") || return 1
+        case "$outbound" in direct) target=DIRECT ;; block) target=REJECT ;; *) target=AI-OUT ;; esac
+        config=$(jq --argjson proxies "$proxies" '.proxies=$proxies' <<<"$config") || return 1
+        _prepare_mihomo_ai_ruleset non_ip skk-ai-non-ip && _prepare_mihomo_ai_ruleset ip skk-ai-ip || return 1
+        _prepare_mihomo_asn_database || return 1
+        for tag in skk-ai-non-ip skk-ai-ip; do
+            match="RULE-SET,$tag,$target"
+            case "$ip_version" in
+                ipv4_only) match="AND,((RULE-SET,$tag),(IP-CIDR,0.0.0.0/0)),$target" ;;
+                ipv6_only) match="AND,((RULE-SET,$tag),(IP-CIDR6,::/0)),$target" ;;
+                as_is|asis) ;;
+                *) _err "Mieru AI 不支持此 IP 匹配方式: $ip_version"; return 1 ;;
+            esac
+            config=$(jq --arg tag "$tag" --arg path "$CFG/ruleset/mihomo-${tag}.txt" --arg rule "$match" '
+                .["rule-providers"][$tag]={type:"file",behavior:"classical",format:"text",path:$path} |
+                .rules+=[$rule]' <<<"$config") || return 1
+        done
+        # 官方 WARP SOCKS5 无 UDP 转发能力，与其他核心的既有行为一致。
+        if [[ "$outbound" == warp && "$(jq -r '.routing.warp_mode // ""' "$db_file")" == official ]]; then
+            config=$(jq '.rules=(["NETWORK,udp,DIRECT"]+.rules)' <<<"$config") || return 1
+        fi
+    fi
+    tmp=$(mktemp "${output}.tmp.XXXXXX") || return 1
+    if ! jq '.rules += ["MATCH,DIRECT"]' <<<"$config" >"$tmp" ||
+       ! validate_mihomo_config "$tmp" || ! chmod 600 "$tmp" || ! mv "$tmp" "$output"; then
+        rm -f "$tmp"; _err "Mihomo 配置校验失败，保留原配置"; return 1
+    fi
+}
+
+create_mihomo_service() {
+    if [[ "$DISTRO" == alpine ]]; then
+        cat >"$OPENRC_DIR/vless-mihomo" <<EOF || return 1
+#!/sbin/openrc-run
+name="Mihomo Mieru Server"
+command="$MIHOMO_BIN"
+command_args="-d $CFG -f $MIHOMO_CONFIG"
+command_background="yes"
+pidfile="/run/vless-mihomo.pid"
+output_log="$MIHOMO_LOG_FILE"
+error_log="$MIHOMO_LOG_FILE"
+depend() { need net; after firewall; }
+start_pre() {
+    checkpath -d -m 0700 "$(dirname "$MIHOMO_LOG_FILE")"
+    "$MIHOMO_BIN" -t -d "$CFG" -f "$MIHOMO_CONFIG"
+}
+EOF
+        chmod 755 "$OPENRC_DIR/vless-mihomo"
+    else
+        cat >"$SYSTEMD_DIR/vless-mihomo.service" <<EOF || return 1
+[Unit]
+Description=Mihomo Mieru Server
+After=network-online.target
+Wants=network-online.target
+[Service]
+Type=simple
+UMask=0077
+ExecStartPre=$MIHOMO_BIN -t -d $CFG -f $MIHOMO_CONFIG
+ExecStart=$MIHOMO_BIN -d $CFG -f $MIHOMO_CONFIG
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=51200
+[Install]
+WantedBy=multi-user.target
+EOF
+        systemctl daemon-reload
+    fi
+}
+
+_wait_for_mihomo_ready() {
+    local attempt transport port flag ready
+    for ((attempt=0; attempt<30; attempt++)); do
+        ready=true
+        if svc status vless-mihomo >/dev/null 2>&1; then
+            while IFS='|' read -r transport port; do
+                flag=-lnt
+                [[ "$transport" != UDP ]] || flag=-lnu
+                ss -H "$flag" "sport = :$port" 2>/dev/null | grep -q . || { ready=false; break; }
+            done < <(jq -r '.listeners[] | .transport+"|"+(.port|tostring)' "$MIHOMO_CONFIG")
+            [[ "$ready" != true ]] || return 0
+        fi
+        sleep 0.3
+    done
+    return 1
+}
+
+# 节点、分流和重启共用快照；失败恢复磁盘文件、运行状态及自启状态。
+_apply_mieru_change() {
+    local action="$1" old_port="${2:-all}" record="${3:-}" result=0
+    [[ -n "$record" ]] || record='{}'
+    _db_lock_acquire || return 1
+    _apply_mieru_change_locked "$action" "$old_port" "$record" || result=1
+    _db_lock_release
+    return "$result"
+}
+
+_apply_mieru_change_locked() {
+    local action="$1" old_port="$2" record="$3" snapshot file index=0 changed=false operation=start success=false
+    local -a files=("$DB_FILE" "$MIHOMO_CONFIG" "$SYSTEMD_DIR/vless-mihomo.service" "$OPENRC_DIR/vless-mihomo" "$CFG/role" "$CFG/paused")
+    snapshot=$(mktemp -d "$CFG/.mieru-change.XXXXXX") || return 1
+    for file in "${files[@]}"; do
+        [[ ! -f "$file" ]] || cp -p "$file" "$snapshot/$index" || { rm -rf "$snapshot"; return 1; }
+        index=$((index+1))
+    done
+    svc status vless-mihomo >/dev/null 2>&1 && touch "$snapshot/running"
+    svc enabled vless-mihomo >/dev/null 2>&1 && touch "$snapshot/enabled"
+    case "$action" in add|replace|remove|reload|start) ;; *) rm -rf "$snapshot"; return 1 ;; esac
+    if jq --arg action "$action" --arg old "$old_port" --argjson record "$record" '
+        def records: if type=="array" then .[] elif type=="object" then . else empty end;
+        [.mihomo.mieru | records] as $current |
+        if ($action=="replace" or $action=="remove") and
+            (($old!="all" and ([$current[]|select((.port|tostring)==$old)]|length)!=1) or ($current|length)==0)
+        then error("target missing")
+        elif ($action=="add" or $action=="replace") and
+            ([to_entries[]|select(.key=="xray" or .key=="singbox" or .key=="mihomo")|.key as $core|
+              .value|to_entries[]|.key as $proto|.value|records|select(.port==$record.port)|
+              select(($action=="replace" and $core=="mihomo" and $proto=="mieru" and (.port|tostring)==$old)|not)]|length)>0
+        then error("duplicate port")
+        else (if $action=="add" then $current+[$record]
+              elif $action=="replace" then [$current[]|if (.port|tostring)==$old then $record else . end]
+              elif $action=="remove" then [$current[]|select($old!="all" and (.port|tostring)!=$old)]
+              else $current end) as $next |
+            if ($next|length)==0 then del(.mihomo.mieru) else .mihomo.mieru=$next end
+        end' "$DB_FILE" >"$snapshot/next.json" && chmod 600 "$snapshot/next.json" && mv "$snapshot/next.json" "$DB_FILE"; then
+        if [[ "$action" == remove && -z "$(get_mihomo_protocols)" ]]; then
+            changed=true
+            if svc stop vless-mihomo && svc disable vless-mihomo && _remove_mihomo_service_definition && rm -f "$MIHOMO_CONFIG"; then success=true; fi
+        elif generate_mihomo_config "$snapshot/candidate.json" && mv "$snapshot/candidate.json" "$MIHOMO_CONFIG"; then
+            if [[ "$action" == reload && ! -f "$snapshot/running" ]]; then
+                success=true
+            else
+                changed=true
+                [[ ! -f "$snapshot/running" ]] || operation=restart
+                if create_mihomo_service &&
+                   { [[ "$action" == remove || "$action" == reload ]] || svc enable vless-mihomo; } &&
+                   { [[ "$action" == remove && ! -f "$snapshot/running" ]] || { svc "$operation" vless-mihomo && _wait_for_mihomo_ready; }; } &&
+                   printf 'server\n' >"$CFG/role"; then success=true; fi
+            fi
+        fi
+    fi
+    if [[ "$success" == true ]]; then
+        if [[ "$action" != add && "$action" != replace && "$action" != start ]] || rm -f "$CFG/paused"; then
+            rm -rf "$snapshot"
+            return 0
+        fi
+    fi
+    if [[ "$changed" == true ]]; then
+        svc stop vless-mihomo || { _err "Mihomo 停止失败，恢复快照保留: $snapshot"; return 1; }
+        [[ -f "$snapshot/enabled" ]] || svc disable vless-mihomo || { _err "自启状态恢复失败: $snapshot"; return 1; }
+    fi
+    index=0
+    for file in "${files[@]}"; do
+        if [[ -f "$snapshot/$index" ]]; then cp -p "$snapshot/$index" "$file" || return 1
+        else rm -f "$file" || return 1; fi
+        index=$((index+1))
+    done
+    if [[ "$changed" == true ]]; then
+        [[ "$DISTRO" == alpine ]] || systemctl daemon-reload || return 1
+        [[ ! -f "$snapshot/enabled" ]] || svc enable vless-mihomo || return 1
+        if [[ -f "$snapshot/running" ]]; then
+            svc start vless-mihomo && _wait_for_mihomo_ready || { _err "服务恢复失败，快照保留: $snapshot"; return 1; }
+        fi
+    fi
+    rm -rf "$snapshot"
+    _err "Mieru 变更失败，已恢复原配置"
+    return 1
+}
+
+gen_mieru_client_proxy() {
+    local server="$1" record="$2" name="${3:-Mieru}"
+    jq -c --arg server "${server#[}" --arg name "$name" '
+        {name:$name,type:"mieru",server:($server|rtrimstr("]")),port:.port,username:.username,password:.password,udp:true,
+         transport:.transport,multiplexing:"MULTIPLEXING_LOW"}' <<<"$record"
+}
+
+_install_mieru_interactive() {
+    local port username password transport choice action=add old_port=all record
+    install_deps && install_mihomo || return 1
+    port=$(ask_port mieru) || return 1
+    read -rp "  Mieru 用户名 [默认: mieru]: " username || return 1
+    username="${username:-mieru}"
+    [[ "$username" =~ ^[A-Za-z0-9_-]{1,64}$ ]] || { _err "用户名须为 1–64 位字母、数字、下划线或短横线"; return 1; }
+    password=$(ask_password 24 "Mieru 密码") || return 1
+    read -rp "  传输协议 [1=TCP / 2=UDP，默认 1]: " choice || return 1
+    case "${choice:-1}" in 1) transport=TCP ;; 2) transport=UDP ;; *) _err "无效传输协议"; return 1 ;; esac
+    record=$(jq -n --argjson port "$port" --arg username "$username" --arg password "$password" --arg transport "$transport" \
+        '{port:$port,username:$username,password:$password,transport:$transport}') || return 1
+    [[ "${INSTALL_MODE:-}" != replace ]] || { action=replace; old_port="$REPLACE_PORT"; }
+    _apply_mieru_change "$action" "$old_port" "$record" || return 1
+    unset INSTALL_MODE REPLACE_PORT
+    create_server_scripts
+    create_watchdog_service && svc enable vless-watchdog && svc start vless-watchdog || return 1
+    [[ ! -f "$CFG/sub.info" ]] || generate_sub_files || return 1
+    _ok "Mieru 已安装；请在服务器及云防火墙放行 ${port}/${transport}"
+    show_single_protocol_info mieru false "$port"
 }
 
 _remove_mihomo_service_definition() {
@@ -10821,472 +11184,10 @@ _remove_mihomo_service_definition() {
     fi
 }
 
-# 将旧版 .xray/.mihomo Snell 配置合并到 Sing-box 候选数据库，不修改源文件。
-_build_singbox_snell_migration_db() {
-    local source_db="$1" candidate_db="$2" tmp
-    [[ -f "$source_db" ]] || return 1
-    jq empty "$source_db" >/dev/null 2>&1 || return 1
-    tmp=$(mktemp "${candidate_db}.tmp.XXXXXX") || return 1
-    if ! jq '
-        def records:
-            if . == null then [] elif type == "array" then . else [.] end;
-        def normalized: del(.snell_backend_port);
-        ["snell", "snell-v5", "snell-shadowtls", "snell-v5-shadowtls"] as $protocols |
-        .singbox = (.singbox // {}) |
-        reduce $protocols[] as $protocol (
-            .;
-            (.singbox[$protocol] | records | map(normalized)) as $existing |
-            (.mihomo[$protocol] | records | map(normalized)) as $mihomo |
-            (.xray[$protocol] | records | map(normalized)) as $legacy |
-            ($existing + $mihomo + $legacy | map(.version = (if $protocol | startswith("snell-v5") then 5 else 4 end))) as $combined |
-            if ([ $combined | group_by(.port)[] |
-                  select(length > 1) |
-                  .[0] as $first | select(any(.[]; . != $first)) ] | length) > 0 then
-                error("conflicting Snell protocol and port")
-            else
-                ($combined | unique_by(.port)) as $deduplicated |
-                if ($deduplicated | length) == 0 then del(.singbox[$protocol])
-                else .singbox[$protocol] = $deduplicated end
-            end
-        ) |
-        .xray |= del(.snell, .["snell-v5"], .["snell-shadowtls"], .["snell-v5-shadowtls"]) |
-        .mihomo |= del(.snell, .["snell-v5"], .["snell-shadowtls"], .["snell-v5-shadowtls"]) |
-        if (.mihomo | length) != 0 then error("unknown legacy Mihomo nodes") else del(.mihomo) end |
-        ([.xray, .singbox | .[]? | records | .[]] | group_by(.port) |
-         any(length > 1)) as $duplicate_ports |
-        if $duplicate_ports then error("duplicate public port") else . end
-    ' "$source_db" >"$tmp" 2>/dev/null; then
-        rm -f "$tmp"
-        return 1
-    fi
-    if ! chmod 600 "$tmp" || ! mv "$tmp" "$candidate_db"; then
-        rm -f "$tmp"
-        return 1
-    fi
-}
-
-_check_legacy_snell_routing_compatibility() {
-    local rules outbound group node name strategy
-    rules=$(db_get_routing_rules mihomo) || return 1
-    while IFS= read -r outbound; do
-        case "$outbound" in
-            direct|block|warp) continue ;;
-            chain:*) name="${outbound#chain:}" ;;
-            balancer:*)
-                group=$(db_get_balancer_group "${outbound#balancer:}") || return 1
-                strategy=$(jq -r '.strategy // empty' <<<"$group") || return 1
-                if [[ "$strategy" != leastPing ]]; then
-                    _err "Snell 迁移无法等价保留均衡策略 $outbound ($strategy)，请先调整为 leastPing"
-                    return 1
-                fi
-                name=$(jq -r '.nodes[]?' <<<"$group") || return 1
-                ;;
-            *) _err "Snell 迁移不支持出口: $outbound"; return 1 ;;
-        esac
-        while IFS= read -r name; do
-            [[ -n "$name" ]] || { _err "Snell 迁移发现空链路"; return 1; }
-            node=$(db_get_chain_node "$name") || return 1
-            if ! jq -e '
-                type == "object" and (.via_warp // false | not) and
-                ((.type == "socks" or .type == "http" or .type == "shadowsocks" or .type == "trojan" or .type == "hysteria2") or
-                 (.type == "vmess" and (.network // "tcp") == "tcp" and (.sni // .server) == .server) or
-                 (.type == "vless" and ((.network // "tcp") == "tcp" or .network == "ws") and (.encryption // "none") == "none"))
-            ' <<<"$node" >/dev/null; then
-                _err "Snell 迁移无法等价保留链路 $name（传输、加密或 via_warp 参数），旧服务保持原状"
-                return 1
-            fi
-        done <<<"$name"
-    done < <(jq -r '[.[].outbound] | unique[]' <<<"$rules")
-}
-
-_legacy_snell_service_names() {
-    local protocol
-    for protocol in $(get_legacy_snell_protocols); do
-        case "$protocol" in
-            snell) printf '%s\n' vless-snell ;;
-            snell-v5) printf '%s\n' vless-snell-v5 ;;
-            snell-shadowtls) printf '%s\n' vless-snell-shadowtls vless-snell-shadowtls-backend ;;
-            snell-v5-shadowtls) printf '%s\n' vless-snell-v5-shadowtls vless-snell-v5-shadowtls-backend ;;
-        esac
-    done
-}
-
-# SS2022 或任意其他服务仍使用外部 ShadowTLS 时，不得删除其二进制。
-_external_shadowtls_is_needed() {
-    jq -e '.xray["ss2022-shadowtls"] != null' "$DB_FILE" >/dev/null 2>&1 && return 0
-    grep -R -F -q '/usr/local/bin/shadow-tls' "$SYSTEMD_DIR" "$OPENRC_DIR" 2>/dev/null
-}
-
-_cleanup_legacy_snell_resources() {
-    local legacy_services="${1:-}" service_name
-    [[ -n "$legacy_services" ]] || legacy_services=$(_legacy_snell_service_names)
-    for service_name in $legacy_services; do
-        svc disable "$service_name" >/dev/null 2>&1 || return 1
-        rm -f "$SYSTEMD_DIR/${service_name}.service" "$OPENRC_DIR/$service_name" || return 1
-    done
-    if [[ "$DISTRO" != "alpine" ]]; then
-        systemctl daemon-reload >/dev/null 2>&1 || return 1
-    fi
-    rm -f "$CFG/snell.conf" "$CFG/snell-v5.conf" \
-        "$CFG/snell-shadowtls.conf" "$CFG/snell-v5-shadowtls.conf" \
-        /usr/local/bin/snell-server /usr/local/bin/snell-server-v5 || return 1
-    if ! _external_shadowtls_is_needed && [[ -f "$CFG/.shadowtls-managed" ]]; then
-        rm -f /usr/local/bin/shadow-tls "$CFG/.shadowtls-managed" || return 1
-    fi
-}
-
-_mihomo_migration_snapshot_path() {
-    local snapshot="$1" name="$2" path="$3"
-    printf '%s\n' "$path" >"$snapshot/${name}.path" || return 1
-    if [[ -f "$path" ]]; then
-        cp -p "$path" "$snapshot/$name" || return 1
-    else
-        touch "$snapshot/${name}.absent" || return 1
-    fi
-}
-
-_mihomo_migration_snapshot_create() {
-    local services="$1" snapshot service_name index=0 path
-    snapshot=$(mktemp -d "$CFG/.mihomo-migration.XXXXXX") || return 1
-    chmod 700 "$snapshot" || { rm -rf "$snapshot"; return 1; }
-    for service_name in $services; do
-        printf '%s\n' "$service_name" || return 1
-    done >"$snapshot/services" || { rm -rf "$snapshot"; return 1; }
-    for service_name in $services vless-mihomo; do
-        if svc status "$service_name" >/dev/null 2>&1; then touch "$snapshot/${service_name}.running"; else touch "$snapshot/${service_name}.stopped"; fi
-        if svc enabled "$service_name" >/dev/null 2>&1; then touch "$snapshot/${service_name}.enabled"; else touch "$snapshot/${service_name}.disabled"; fi
-    done
-    for path in "$DB_FILE" "$MIHOMO_CONFIG" "$CFG/singbox.json" /usr/local/bin/sing-box \
-        "$CFG/snell.join" "$CFG/snell-v5.join" "$CFG/snell-shadowtls.join" "$CFG/snell-v5-shadowtls.join" \
-        "$CFG/snell-v6-singbox.join" "$CFG/join.txt" \
-        "$CFG/snell.conf" "$CFG/snell-v5.conf" "$CFG/snell-shadowtls.conf" "$CFG/snell-v5-shadowtls.conf" \
-        "$CFG/.shadowtls-managed" "$MIHOMO_MIGRATION_MARKER" "$MIHOMO_BIN" \
-        /usr/local/bin/snell-server /usr/local/bin/snell-server-v5 /usr/local/bin/shadow-tls; do
-        _mihomo_migration_snapshot_path "$snapshot" "resource-$index" "$path" || { rm -rf "$snapshot"; return 1; }
-        index=$((index + 1))
-    done
-    for service_name in $services vless-mihomo; do
-        for path in "$SYSTEMD_DIR/${service_name}.service" "$OPENRC_DIR/$service_name"; do
-            _mihomo_migration_snapshot_path "$snapshot" "resource-$index" "$path" || { rm -rf "$snapshot"; return 1; }
-            index=$((index + 1))
-        done
-    done
-    printf '%s\n' "$snapshot"
-}
-
-_mihomo_migration_restore_binary() {
-    local snapshot="$1" path_file path
-    [[ -d "$snapshot" ]] || return 1
-    for path_file in "$snapshot"/*.path; do
-        [[ -e "$path_file" ]] || continue
-        path=$(<"$path_file")
-        [[ "$path" == "$MIHOMO_BIN" ]] || continue
-        if [[ -f "${path_file%.path}.absent" ]]; then
-            rm -f "$MIHOMO_BIN"
-        else
-            mkdir -p "$(dirname "$MIHOMO_BIN")" || return 1
-            cp -p "${path_file%.path}" "$MIHOMO_BIN"
-        fi
-        return
-    done
-    return 1
-}
-
-# 仅 source 的测试可在观察点替换夹具条目；直接执行时这是无副作用的 no-op。
-_mihomo_migration_proc_observe() {
-    if [[ "${BASH_SOURCE[0]}" != "$0" && -n "${VLESS_TEST_PROC_ROOT:-}" ]] && \
-        declare -F _mihomo_migration_test_proc_observe >/dev/null; then
-        _mihomo_migration_test_proc_observe "$@"
-    fi
-}
-
-_mihomo_migration_proc_path_identity() {
-    stat -c '%d:%i' -- "$1" 2>/dev/null
-}
-
-# 只接受 /proc comm 的精确进程名，不能使用 Alpine _pgrep 的 -f 回退结果。
-# 返回 0=active、1=inactive、2=无法完整检查；后者绝不能作为已停止处理。
-_mihomo_migration_managed_process_running() {
-    # 仅被 source 时接受测试夹具路径；直接执行时始终检查真实 /proc。
-    local process="vless-mihomo" expected_comm proc_root="/proc"
-    local proc_dir pid comm_path comm pid_identity comm_identity read_rc
-    expected_comm="${process}"$'\n'
-    if [[ "${BASH_SOURCE[0]}" != "$0" ]]; then
-        proc_root="${VLESS_TEST_PROC_ROOT:-/proc}"
-    fi
-    [[ ! -L "$proc_root" && -d "$proc_root" && -r "$proc_root" && -x "$proc_root" ]] || return 2
-    for proc_dir in "$proc_root"/[0-9]*; do
-        pid=${proc_dir##*/}
-        # /proc 也会有非 PID 条目；只有纯 ASCII 数字目录属于此次扫描。
-        [[ "$pid" =~ ^[0123456789]+$ ]] || continue
-        [[ ! -L "$proc_dir" && -d "$proc_dir" ]] || return 2
-        pid_identity=$(_mihomo_migration_proc_path_identity "$proc_dir") || return 2
-        _mihomo_migration_proc_observe pid-validated "$proc_dir" || return 2
-        [[ ! -L "$proc_dir" && -d "$proc_dir" && \
-            "$(_mihomo_migration_proc_path_identity "$proc_dir")" == "$pid_identity" ]] || return 2
-
-        comm_path="$proc_dir/comm"
-        [[ ! -L "$comm_path" && -f "$comm_path" && -r "$comm_path" ]] || return 2
-        comm_identity=$(_mihomo_migration_proc_path_identity "$comm_path") || return 2
-        _mihomo_migration_proc_observe comm-validated "$proc_dir" "$comm_path" || return 2
-        [[ ! -L "$proc_dir" && -d "$proc_dir" && \
-            "$(_mihomo_migration_proc_path_identity "$proc_dir")" == "$pid_identity" && \
-            ! -L "$comm_path" && -f "$comm_path" && -r "$comm_path" && \
-            "$(_mihomo_migration_proc_path_identity "$comm_path")" == "$comm_identity" ]] || return 2
-
-        # 在子 shell 中使用固定 FD，避免影响调用者；cat 的状态可区分 EOF 与读失败。
-        _mihomo_migration_proc_observe comm-read-opening "$proc_dir" "$comm_path" || return 2
-        if ! comm=$( (
-            exec 9<"$comm_path" || exit 2
-            cat <&9
-            read_rc=$?
-            exec 9<&- || exit 2
-            [[ "$read_rc" -eq 0 ]] || exit 2
-            # 命令替换会剥离尾随换行，使用哨兵保留 comm 的完整字节序列。
-            printf '\001'
-        ) 2>/dev/null ); then
-            return 2
-        fi
-        comm=${comm%$'\001'}
-        _mihomo_migration_proc_observe comm-read "$proc_dir" "$comm_path" || return 2
-        [[ ! -L "$proc_dir" && -d "$proc_dir" && \
-            "$(_mihomo_migration_proc_path_identity "$proc_dir")" == "$pid_identity" && \
-            ! -L "$comm_path" && -f "$comm_path" && -r "$comm_path" && \
-            "$(_mihomo_migration_proc_path_identity "$comm_path")" == "$comm_identity" ]] || return 2
-        [[ "$comm" == "$expected_comm" ]] && return 0
-    done
-    return 1
-}
-
-_mihomo_migration_managed_process_state() {
-    local rc
-    _mihomo_migration_managed_process_running
-    rc=$?
-    case "$rc" in
-        0) printf '%s\n' active ;;
-        1) printf '%s\n' inactive ;;
-        *) printf '%s\n' error ;;
-    esac
-}
-
-# 事务专用三态查询。普通 svc status 保持其既有二态兼容语义。
-_mihomo_service_state() {
-    local output state rc
-    if ! _mihomo_service_definition_exists; then
-        _mihomo_migration_managed_process_state
-        return
-    fi
-
-    if [[ "$DISTRO" == "alpine" ]]; then
-        # OpenRC/LSB: 0=running，3=stopped；127 仅表示 rc-service/status 不可用。
-        rc-service vless-mihomo status >/dev/null 2>&1
-        rc=$?
-        case "$rc" in
-            0) printf '%s\n' active ;;
-            3) printf '%s\n' inactive ;;
-            127) _mihomo_migration_managed_process_state ;;
-            *) printf '%s\n' error ;;
-        esac
-    else
-        output=$(systemctl show --property=ActiveState --value vless-mihomo 2>&1)
-        rc=$?
-        case "$rc" in
-            0) ;;
-            127) _mihomo_migration_managed_process_state; return ;;
-            *) printf '%s\n' error; return ;;
-        esac
-        state=$(printf '%s' "$output" | tr '[:upper:]' '[:lower:]')
-        case "$state" in
-            active|activating|reloading) printf '%s\n' active ;;
-            inactive|failed|deactivating) printf '%s\n' inactive ;;
-            *) printf '%s\n' error ;;
-        esac
-    fi
-}
-
-# 保留迁移内部接口；更新事务复用同一个权威状态分类器。
-_mihomo_migration_service_state() {
-    _mihomo_service_state
-}
-
-_mihomo_migration_snapshot_restore() {
-    local snapshot="$1" path_file path service_state
-    [[ -d "$snapshot" ]] || return 1
-    # 缺少服务定义且无进程可安全跳过；管理器查询异常必须保留快照并中止回滚。
-    service_state=$(_mihomo_migration_service_state)
-    case "$service_state" in
-        active) svc stop vless-mihomo >/dev/null 2>&1 || return 1 ;;
-        inactive) ;;
-        *) return 1 ;;
-    esac
-    for path_file in "$snapshot"/*.path; do
-        [[ -e "$path_file" ]] || continue
-        path=$(<"$path_file")
-        if [[ -f "${path_file%.path}.absent" ]]; then
-            rm -f "$path" || return 1
-        else
-            mkdir -p "$(dirname "$path")" || return 1
-            if [[ "$path" == /usr/local/bin/sing-box ]]; then
-                _replace_singbox_binary "${path_file%.path}" "$path" || return 1
-            else
-                cp -p "${path_file%.path}" "$path" || return 1
-            fi
-        fi
-    done
-    if [[ "$DISTRO" != "alpine" ]]; then
-        systemctl daemon-reload >/dev/null 2>&1 || return 1
-    fi
-}
-
-_mihomo_migration_restore_service_states() {
-    local snapshot="$1" service_name failed=false
-    while IFS= read -r service_name; do
-        [[ -n "$service_name" ]] || continue
-        if [[ ! -f "$SYSTEMD_DIR/${service_name}.service" && ! -f "$OPENRC_DIR/$service_name" &&
-              ! -f "$snapshot/${service_name}.enabled" ]]; then
-            continue
-        fi
-        if [[ -f "$snapshot/${service_name}.enabled" ]]; then
-            svc enable "$service_name" >/dev/null 2>&1 || failed=true
-        else
-            svc disable "$service_name" >/dev/null 2>&1 || failed=true
-        fi
-    done < <(printf '%s\n' vless-mihomo; cat "$snapshot/services")
-    while IFS= read -r service_name; do
-        [[ -n "$service_name" ]] || continue
-        if [[ -f "$snapshot/${service_name}.running" ]]; then
-            svc start "$service_name" >/dev/null 2>&1 || failed=true
-        elif [[ "$service_name" == "vless-mihomo" ]]; then
-            case "$(_mihomo_migration_service_state)" in
-                active) svc stop "$service_name" >/dev/null 2>&1 || failed=true ;;
-                inactive) ;;
-                *) failed=true ;;
-            esac
-        elif svc status "$service_name" >/dev/null 2>&1; then
-            svc stop "$service_name" >/dev/null 2>&1 || failed=true
-        fi
-    done < <(printf '%s\n' vless-mihomo; cat "$snapshot/services")
-    [[ "$failed" == false ]]
-}
-
-_mihomo_migration_rollback() {
-    local snapshot="$1"
-    if [[ -f "$SYSTEMD_DIR/vless-singbox.service" || -f "$OPENRC_DIR/vless-singbox" ]] || svc status vless-singbox >/dev/null 2>&1; then
-        svc stop vless-singbox >/dev/null 2>&1 || { _err "无法停止候选 Sing-box；恢复快照: $snapshot"; return 1; }
-    fi
-    if ! _mihomo_migration_snapshot_restore "$snapshot" || ! _mihomo_migration_restore_service_states "$snapshot"; then
-        printf 'Snell 自动迁移回滚失败，恢复快照保留在: %s\n' "$snapshot" >&2
-        return 1
-    fi
-    rm -rf "$snapshot"
-}
-
-# 仅在交互式启动阶段调用：预检完成前不会停止任何旧 Snell 服务。
-migrate_legacy_snell_to_singbox() {
-    local result=0
-    [[ -f "$DB_FILE" ]] || return 0
-    if [[ -f "$CFG/paused" ]]; then
-        _info "服务已暂停，Snell 迁移将在恢复服务后执行"
-        return 0
-    fi
-    jq -e '((.mihomo // {}) | length > 0) or
-        (.xray | keys | any(. == "snell" or . == "snell-v5" or . == "snell-shadowtls" or . == "snell-v5-shadowtls"))' "$DB_FILE" >/dev/null || return 0
-    _db_lock_acquire || return 1
-    _migrate_legacy_snell_to_singbox_locked || result=1
-    _db_lock_release
-    return "$result"
-}
-
-_migrate_legacy_snell_to_singbox_locked() {
-    local legacy_services snapshot candidate_db candidate_config service_name record protocol
-    legacy_services=$(_legacy_snell_service_names)
-    snapshot=$(_mihomo_migration_snapshot_create "$legacy_services vless-singbox") || return 1
-    candidate_db="$snapshot/candidate-db.json"
-    candidate_config="$snapshot/candidate.json"
-    # 不支持的出口必须在停服之前明确拒绝，不能悄悄改成首节点或直连。
-    if ! _check_legacy_snell_routing_compatibility ||
-       ! _build_singbox_snell_migration_db "$DB_FILE" "$candidate_db"; then
-        _err "Snell 迁移预检失败，旧服务及数据保持原状"
-        rm -rf "$snapshot"
-        return 1
-    fi
-    if ! _prepare_singbox_snell_migration_core || ! generate_singbox_config "$candidate_config" "$candidate_db"; then
-        # 预检尚未停服，只恢复可能安装或更新过的二进制。
-        local binary_snapshot
-        for binary_snapshot in "$snapshot"/*.path; do
-            [[ "$(cat "$binary_snapshot")" == /usr/local/bin/sing-box ]] || continue
-            if [[ -f "${binary_snapshot%.path}.absent" ]]; then
-                rm -f /usr/local/bin/sing-box || return 1
-            else
-                _replace_singbox_binary "${binary_snapshot%.path}" /usr/local/bin/sing-box || return 1
-            fi
-        done
-        _err "Snell 候选配置校验失败，旧服务及数据保持原状"
-        rm -rf "$snapshot"
-        return 1
-    fi
-    for service_name in $legacy_services vless-mihomo; do
-        if [[ -f "$snapshot/${service_name}.running" ]] && ! svc stop "$service_name"; then
-            _mihomo_migration_rollback "$snapshot"
-            return 1
-        fi
-    done
-    if mv "$candidate_db" "$DB_FILE" && mv "$candidate_config" "$CFG/singbox.json" &&
-       create_singbox_service && _activate_migrated_singbox "$snapshot" &&
-       regenerate_singbox_snell_join_info && regenerate_legacy_snell_join_info &&
-       _cleanup_legacy_snell_resources "$legacy_services" &&
-       _disable_legacy_mihomo_service && _remove_mihomo_service_definition &&
-       rm -f "$MIHOMO_BIN" "$MIHOMO_CONFIG" "$MIHOMO_MIGRATION_MARKER"; then
-        rm -rf "$snapshot"
-        return 0
-    fi
-    _mihomo_migration_rollback "$snapshot"
-    return 1
-}
-
-_prepare_singbox_snell_migration_core() {
-    local version
-    if check_cmd sing-box; then
-        version=$(sing-box version 2>/dev/null | awk 'NR == 1 {print $3}') || return 1
-        _singbox_supports_snell_version "$version" || {
-            _err "迁移需要 Sing-box ${SINGBOX_SNELL_MIN_VERSION}+；请先从核心管理升级，旧服务保持原状"
-            return 1
-        }
-    else
-        ensure_singbox_snell_support || return 1
-    fi
-}
-
-_activate_migrated_singbox() {
-    local snapshot="$1" state service_name run=false enable=false
-    local services="vless-singbox vless-mihomo $(cat "$snapshot/services")" path_file
-    for path_file in "$snapshot"/*.path; do
-        case "$(cat "$path_file")" in
-            "$SYSTEMD_DIR/vless-singbox.service"|"$OPENRC_DIR/vless-singbox")
-                [[ -f "${path_file%.path}.absent" ]] || services=vless-singbox ;;
-        esac
-    done
-    for service_name in $services; do
-        [[ -f "$snapshot/${service_name}.running" ]] && run=true
-        [[ -f "$snapshot/${service_name}.enabled" ]] && enable=true
-    done
-    if [[ "$enable" == true ]]; then svc enable vless-singbox || return 1; fi
-    if [[ "$run" == true ]]; then
-        svc restart vless-singbox && _wait_for_singbox_ready || return 1
-    fi
-    return 0
-}
-
-_disable_legacy_mihomo_service() {
-    _mihomo_service_definition_exists || return 0
-    svc disable vless-mihomo
-}
-
-# 校验单 PSK Snell v6 入站；不隐式启用需要 userkey 的多用户模式。
 _validate_singbox_snell_record() {
     local protocol="${2:-snell-v6-singbox}"
     if [[ "$protocol" != snell-v6-singbox ]]; then
-        _validate_legacy_snell_record "$protocol" "$1"
+        _validate_singbox_snell_v45_record "$protocol" "$1"
         return
     fi
     jq -e '
@@ -11301,7 +11202,7 @@ _validate_singbox_snell_record() {
 }
 
 # v4/v5 沿用旧 PSK 字符集；users 为历史元数据，不得转换成多用户认证。
-_validate_legacy_snell_record() {
+_validate_singbox_snell_v45_record() {
     local protocol="$1" record="$2" version=4 sni
     [[ "$protocol" == snell-v5* ]] && version=5
     jq -e --argjson version "$version" '
@@ -11321,14 +11222,14 @@ _validate_legacy_snell_record() {
 
 get_singbox_snell_protocols() {
     local protocol
-    for protocol in $SNELL_LEGACY_PROTOCOLS snell-v6-singbox; do
+    for protocol in $SINGBOX_SNELL_V45_PROTOCOLS snell-v6-singbox; do
         db_exists singbox "$protocol" && printf '%s\n' "$protocol"
     done
     return 0
 }
 
 is_singbox_snell_protocol() {
-    [[ " $SNELL_LEGACY_PROTOCOLS snell-v6-singbox " == *" $1 "* ]]
+    [[ " $SINGBOX_SNELL_V45_PROTOCOLS snell-v6-singbox " == *" $1 "* ]]
 }
 
 # 生成 Sing-box 统一配置；可写入候选文件，校验成功前不覆盖运行配置。
@@ -11728,7 +11629,7 @@ generate_singbox_config() {
     ' "$db_file") || return 1
     while IFS='|' read -r proto cfg; do
         [[ -z "$cfg" ]] && continue
-        if [[ " $SNELL_LEGACY_PROTOCOLS snell-v6-singbox " == *" $proto "* ]]; then
+        if [[ " $SINGBOX_SNELL_V45_PROTOCOLS snell-v6-singbox " == *" $proto "* ]]; then
             _validate_singbox_snell_record "$cfg" "$proto" || return 1
         fi
         
@@ -11953,7 +11854,7 @@ generate_singbox_config() {
         
         if [[ -n "$inbound" ]]; then
             # 兼容其他协议已有的多端口记录；单端口保留原 tag。
-            if [[ " $SNELL_LEGACY_PROTOCOLS snell-v6-singbox " != *" $proto "* && "$(jq --arg p "$proto" '.singbox[$p] | if type == "array" then length else 1 end' "$db_file")" -gt 1 ]]; then
+            if [[ " $SINGBOX_SNELL_V45_PROTOCOLS snell-v6-singbox " != *" $proto "* && "$(jq --arg p "$proto" '.singbox[$p] | if type == "array" then length else 1 end' "$db_file")" -gt 1 ]]; then
                 inbound=$(jq --arg port "$port" '.tag += ("-" + $port)' <<<"$inbound") || return 1
             fi
             inbounds=$(echo "$inbounds" | jq --argjson ib "$inbound" '. += [$ib]')
@@ -11972,7 +11873,7 @@ generate_singbox_config() {
     local chain_outbounds_added=""  # 跟踪已添加的链式代理 outbound
     
     for proto in $singbox_protocols; do
-        [[ " $SNELL_LEGACY_PROTOCOLS snell-v6-singbox " != *" $proto "* ]] || continue
+        [[ " $SINGBOX_SNELL_V45_PROTOCOLS snell-v6-singbox " != *" $proto "* ]] || continue
         local db_users=$(jq -r --arg p "$proto" '
             .singbox[$p] as $cfg |
             if $cfg == null then empty
@@ -13550,7 +13451,7 @@ _apply_singbox_snell_change() {
 _apply_singbox_snell_change_locked() {
     local action="$1" old_port="$2" record="$3" snapshot file saved
     local protocol="${4:-snell-v6-singbox}"
-    [[ " $SNELL_LEGACY_PROTOCOLS snell-v6-singbox " == *" $protocol "* ]] || return 1
+    [[ " $SINGBOX_SNELL_V45_PROTOCOLS snell-v6-singbox " == *" $protocol "* ]] || return 1
     local runtime_changed=false success=false new_port="0"
     case "$action" in
         add|replace)
@@ -13615,7 +13516,7 @@ _apply_singbox_snell_change_locked() {
            regenerate_singbox_snell_join_info "$snapshot/candidate.join" &&
            mv "$snapshot/candidate.json" "$CFG/singbox.json" &&
             mv "$snapshot/candidate.join" "$CFG/snell-v6-singbox.join" &&
-            regenerate_legacy_snell_join_info; then
+            regenerate_singbox_snell_v45_join_info; then
             runtime_changed=true
             if create_singbox_service && svc enable vless-singbox; then
                 local operation=start
@@ -13630,7 +13531,7 @@ _apply_singbox_snell_change_locked() {
         if svc stop vless-singbox && svc disable vless-singbox &&
            rm -f "$CFG/singbox.json" "$CFG/snell-v6-singbox.join" \
                  "$SYSTEMD_DIR/vless-singbox.service" "$OPENRC_DIR/vless-singbox"; then
-            if regenerate_legacy_snell_join_info && { [[ "$DISTRO" == alpine ]] || systemctl daemon-reload; }; then
+            if regenerate_singbox_snell_v45_join_info && { [[ "$DISTRO" == alpine ]] || systemctl daemon-reload; }; then
                 success=true
             fi
         fi
@@ -13760,23 +13661,19 @@ get_all_services() {
     
     [[ ! -f "$DB_FILE" ]] && { echo ""; return; }
     
-    # 检查 Xray 协议；迁移前的 Snell 记录仍归其旧服务所有，不能错误归属给 Xray。
+    # 只识别当前支持的协议，独立进程不归入 Xray 服务。
     local xray_protos=$(jq -r '(.xray // {}) | keys[]' "$DB_FILE" 2>/dev/null)
     local has_xray=false
     for proto in $xray_protos; do
         case "$proto" in
-            snell) services+="vless-snell:snell-server " ;;
-            snell-v5) services+="vless-snell-v5:snell-server-v5 " ;;
-            snell-shadowtls)
-                services+="vless-snell-shadowtls:shadow-tls "
-                services+="vless-snell-shadowtls-backend:snell-server "
-                ;;
-            snell-v5-shadowtls)
-                services+="vless-snell-v5-shadowtls:shadow-tls "
-                services+="vless-snell-v5-shadowtls-backend:snell-server-v5 "
-                ;;
             snell-v6) services+="vless-snell-v6:snell-server-v6 " ;;
-            *) has_xray=true ;;
+            naive) services+="vless-naive:caddy " ;;
+            ss2022-shadowtls)
+                services+="vless-ss2022-shadowtls:shadow-tls "
+                services+="vless-ss2022-shadowtls-backend:xray "
+                ;;
+            vless|vless-xhttp|vless-xhttp-cdn|vless-ws|vless-ws-notls|vmess-ws|vless-vision|trojan|trojan-ws|socks|ss2022|ss-legacy)
+                has_xray=true ;;
         esac
     done
     [[ "$has_xray" == "true" ]] && services+="vless-reality:xray "
@@ -13793,6 +13690,9 @@ get_all_services() {
     done
     [[ "$has_singbox" == "true" ]] && services+="vless-singbox:sing-box "
 
+    if jq -e '.mihomo.mieru != null' "$DB_FILE" >/dev/null 2>&1; then
+        services+="vless-mihomo:vless-mihomo "
+    fi
     echo "$services"
 }
 
@@ -13946,10 +13846,14 @@ create_service() {
     local service_name="${PROTO_SVC[$protocol]:-}"
     local exec_cmd="${PROTO_EXEC[$protocol]:-}"
     local exec_name="${PROTO_BIN[$protocol]:-}"
-    local port password sni stls_password ss_backend_port snell_backend_port
+    local port password sni stls_password ss_backend_port
 
     [[ -z "$service_name" ]] && { _err "未知协议: $protocol"; return 1; }
 
+    if [[ "$kind" == mihomo ]]; then
+        create_mihomo_service
+        return $?
+    fi
     if [[ "$kind" == singbox ]]; then
         create_singbox_service
         return $?
@@ -13987,13 +13891,9 @@ create_service() {
             port=$(db_get_field "$cfg_core" "$protocol" "port")
             sni=$(db_get_field "$cfg_core" "$protocol" "sni")
             stls_password=$(db_get_field "$cfg_core" "$protocol" "stls_password")
-            if [[ "$protocol" == "ss2022-shadowtls" ]]; then
-                ss_backend_port=$(db_get_field "$cfg_core" "$protocol" "ss_backend_port")
-            else
-                snell_backend_port=$(db_get_field "$cfg_core" "$protocol" "snell_backend_port")
-            fi
+            ss_backend_port=$(db_get_field "$cfg_core" "$protocol" "ss_backend_port")
             local lh=$(_listen_addr)
-            exec_cmd="/usr/local/bin/shadow-tls --v3 server --listen $(_fmt_hostport "$lh" "$port") --server 127.0.0.1:${ss_backend_port:-$snell_backend_port} --tls ${sni}:443 --password ${stls_password}"
+            exec_cmd="/usr/local/bin/shadow-tls --v3 server --listen $(_fmt_hostport "$lh" "$port") --server 127.0.0.1:${ss_backend_port} --tls ${sni}:443 --password ${stls_password}"
             exec_name="shadow-tls"
             ;;
     esac
@@ -14206,6 +14106,7 @@ show_runtime_config() {
     case "$core" in
         xray) name=vless-reality; binary=/usr/local/bin/xray; default_file="$CFG/config.json" ;;
         singbox) name=vless-singbox; binary=/usr/local/bin/sing-box; default_file="$CFG/singbox.json" ;;
+        mihomo) name=vless-mihomo; binary="$MIHOMO_BIN"; default_file="$MIHOMO_CONFIG" ;;
         *) printf '未知核心：%s\n' "$core"; return 1 ;;
     esac
     printf '磁盘文件可能与进程已载入内存的配置不同。\n'
@@ -14236,7 +14137,7 @@ show_runtime_config() {
     for ((i=1; i<${#argv[@]}; i++)); do
         arg="${argv[i]}"
         case "$arg" in
-            -c|-config|--config|-C|--config-directory|-confdir)
+            -c|-config|--config|-f|-C|--config-directory|-confdir)
                 kind=file
                 case "$arg" in -C|--config-directory|-confdir) kind=directory ;; esac
                 if ((i+1 >= ${#argv[@]})) || [[ -z "${argv[i+1]}" ]]; then
@@ -14244,7 +14145,7 @@ show_runtime_config() {
                 fi
                 i=$((i+1)); value="${argv[i]}"
                 ;;
-            -c=*|-config=*|--config=*|-C=*|--config-directory=*|-confdir=*)
+            -c=*|-config=*|--config=*|-f=*|-C=*|--config-directory=*|-confdir=*)
                 value="${arg#*=}"; kind=file
                 case "${arg%%=*}" in -C|--config-directory|-confdir) kind=directory ;; esac
                 [[ -n "$value" ]] || { printf '配置参数缺少路径：%s\n' "$arg"; return 1; }
@@ -14297,11 +14198,13 @@ view_runtime_config_menu() {
         _line
         _item "1" "Xray 完整配置"
         _item "2" "Sing-box 完整配置"
+        _item "3" "Mihomo 完整配置"
         _item "0" "返回"
         read -rp "  请选择: " choice || return
         case "$choice" in
             1) show_runtime_config xray; _pause ;;
             2) show_runtime_config singbox; _pause ;;
+            3) show_runtime_config mihomo; _pause ;;
             0) return ;;
             *) _err "无效选择"; _pause ;;
         esac
@@ -14380,7 +14283,6 @@ _start_core_service() {
 start_services() {
     local failed_services=()
     rm -f "$CFG/paused" || { _err "无法清除暂停标记，服务未启动"; return 1; }
-    migrate_legacy_snell_to_singbox || { _err "Snell 迁移失败，保留原服务，请先解决预检错误"; return 1; }
     
     # 初始化数据库
     init_db
@@ -14411,6 +14313,12 @@ start_services() {
         fi
     fi
     
+    if [[ -n "$(get_mihomo_protocols)" ]]; then
+        if ! install_mihomo || ! _apply_mieru_change start; then
+            failed_services+=("vless-mihomo")
+        fi
+    fi
+
     # 4. 启动独立进程协议 (Snell v6 等闭源协议)
     local standalone_protocols=$(get_standalone_protocols)
     local ind_proto
@@ -14419,7 +14327,7 @@ start_services() {
         
         # ShadowTLS 组合协议需要先启动/重启后端服务
         case "$ind_proto" in
-            snell-shadowtls|snell-v5-shadowtls|ss2022-shadowtls)
+            ss2022-shadowtls)
                 local backend_svc="vless-${ind_proto}-backend"
                 svc enable "$backend_svc"
                 if svc status "$backend_svc" >/dev/null 2>&1; then
@@ -14522,6 +14430,10 @@ stop_services() {
         svc stop vless-singbox 2>/dev/null && stopped_services+=("vless-singbox")
     fi
 
+    if is_service_active vless-mihomo; then
+        svc stop vless-mihomo 2>/dev/null && stopped_services+=("vless-mihomo")
+    fi
+
     # 停止独立进程协议服务 (Snell 等)
     for proto in $STANDALONE_PROTOCOLS; do
         local service_name="vless-${proto}"
@@ -14531,7 +14443,7 @@ stop_services() {
     done
     
     # 停止 ShadowTLS 组合协议的后端服务
-    for backend_svc in vless-snell-shadowtls-backend vless-snell-v5-shadowtls-backend vless-ss2022-shadowtls-backend; do
+    for backend_svc in vless-ss2022-shadowtls-backend; do
         if is_service_active "$backend_svc"; then
             svc stop "$backend_svc" 2>/dev/null && stopped_services+=("$backend_svc")
         fi
@@ -15734,6 +15646,7 @@ uninstall_warp() {
 declare -A ROUTING_PRESETS=(
     [ai-intl]="geosite:category-ai-!cn"
     [singbox-ai]="rule-set:skk-ai-non-ip,rule-set:skk-ai-ip"
+    [mihomo-ai]="rule-set:skk-ai-non-ip,rule-set:skk-ai-ip"
     [openai]="geosite:openai"
     [netflix]="geosite:netflix"
     [disney]="geosite:disney"
@@ -15744,7 +15657,6 @@ declare -A ROUTING_PRESETS=(
     [telegram]="geosite:telegram"
     [google]="geosite:google"
     [ads]="geosite:category-ads-all"
-    [mihomo-instagram]="rule-set:yuu-instagram"
     [singbox-instagram]="rule-set:yuu-instagram"
 )
 
@@ -15759,6 +15671,7 @@ declare -A ROUTING_PRESETS_IP=(
 declare -A ROUTING_PRESET_NAMES=(
     [ai-intl]="GeoSite-AI-Xray专属"
     [singbox-ai]="Sukka-AI-Sing-Box专属"
+    [mihomo-ai]="Sukka-AI-Mieru专属"
     [openai]="OpenAI/ChatGPT"
     [netflix]="Netflix"
     [disney]="Disney+"
@@ -15769,7 +15682,6 @@ declare -A ROUTING_PRESET_NAMES=(
     [telegram]="Telegram"
     [google]="Google"
     [ads]="广告屏蔽"
-    [mihomo-instagram]="Instagram/INS (Snell v4/v5)"
     [singbox-instagram]="Instagram/INS (Snell v4/v5)"
 )
 
@@ -15873,9 +15785,10 @@ db_get_routing_rules() {
     jq --arg core "$core" '. as $db | [.routing_rules[]? |
         select(.type != "ai-intl" or $core == "all" or $core == "xray") |
         select(.type != "singbox-ai" or $core == "all" or $core == "singbox") |
-        select((.type != "mihomo-instagram" and .type != "singbox-instagram") or $core == "all" or $core == "mihomo" or
+        select(.type != "mihomo-ai" or $core == "all" or $core == "mihomo") |
+        select(.type != "singbox-instagram" or $core == "all" or
             ($core == "singbox" and
-             ([$db.singbox, $db.mihomo, $db.xray | . // {} | to_entries[] |
+             ([$db.singbox | . // {} | to_entries[] |
                 select(.key == "snell" or .key == "snell-v5" or .key == "snell-shadowtls" or .key == "snell-v5-shadowtls") |
                 .value | if type == "array" then .[] else . end] | length > 0)))
     ]' "$db_file" 2>/dev/null
@@ -16526,14 +16439,14 @@ gen_singbox_routing_rules() {
     local db_file="${1:-$DB_FILE}" rules instagram_domains='' instagram_inbounds='[]'
     rules=$(db_get_routing_rules singbox "$db_file") || return 1
     [[ -z "$rules" || "$rules" == "[]" ]] && return
-    if jq -e 'any(.[]; .type == "mihomo-instagram" or .type == "singbox-instagram")' <<<"$rules" >/dev/null; then
+    if jq -e 'any(.[]; .type == "singbox-instagram")' <<<"$rules" >/dev/null; then
         instagram_domains=$(_load_yuu_instagram_domains) || return 1
         instagram_inbounds=$(jq '[.singbox | to_entries[] |
             select(.key == "snell" or .key == "snell-v5" or .key == "snell-shadowtls" or .key == "snell-v5-shadowtls") |
             .key as $p | .value | (if type == "array" then .[] else . end) |
             "snell-" + $p + "-" + (.port | tostring)]' "$db_file") || return 1
         rules=$(jq --arg domains "$instagram_domains" --argjson inbounds "$instagram_inbounds" '
-            map(if .type == "mihomo-instagram" or .type == "singbox-instagram" then
+            map(if .type == "singbox-instagram" then
                 if $inbounds | length > 0 then .domains=$domains else empty end
                 else . end)' <<<"$rules") || return 1
     fi
@@ -16700,7 +16613,7 @@ gen_singbox_routing_rules() {
                 fi
             fi
         fi
-        if [[ "$rule_type" == mihomo-instagram || "$rule_type" == singbox-instagram ]]; then
+        if [[ "$rule_type" == singbox-instagram ]]; then
             result=$(jq --argjson start "$previous_count" --argjson inbounds "$instagram_inbounds" '
                 to_entries | map(if .key >= $start then .value + {inbound:$inbounds} else .value end)' <<<"$result") || return 1
         fi
@@ -17213,10 +17126,21 @@ configure_routing_rules() {
             3)
                 read -rp "  确认清空所有分流规则? [y/N]: " confirm
                 if [[ "$confirm" =~ ^[Yy]$ ]]; then
-                    local xray_rules singbox_rules
+                    local xray_rules singbox_rules mieru_rules
                     xray_rules=$(db_get_routing_rules xray | jq length)
                     singbox_rules=$(db_get_routing_rules singbox | jq length)
+                    mieru_rules=$(jq '[.routing_rules[]? | select(.type=="mihomo-ai")] | length' "$DB_FILE")
+                    local rules_snapshot
+                    rules_snapshot=$(mktemp "$CFG/.routing-clear.XXXXXX") || return 1
+                    cp -p "$DB_FILE" "$rules_snapshot" || return 1
                     db_clear_routing_rules
+                    if (( mieru_rules > 0 )) && ! _reload_ai_routing_core mihomo-ai; then
+                        cp -p "$rules_snapshot" "$DB_FILE"
+                        rm -f "$rules_snapshot"
+                        _pause
+                        return 1
+                    fi
+                    rm -f "$rules_snapshot"
                     if (( xray_rules > 0 )); then
                         _reload_ai_routing_core ai-intl || { _pause; return 1; }
                     fi
@@ -17260,10 +17184,13 @@ _add_routing_rule() {
     local singbox_protocols
     singbox_protocols=$(get_singbox_protocols) || :
     [[ -z "$singbox_protocols" ]] || _item "s" "Sukka-AI-Sing-Box专属"
+    local mieru_protocols
+    mieru_protocols=$(get_mihomo_protocols) || :
+    [[ -z "$mieru_protocols" ]] || _item "m" "Sukka-AI-Mieru专属"
     _item "d" "MyTVSuper"
-    local mihomo_protocols
-    mihomo_protocols=$(get_singbox_snell_protocols | grep -v '^snell-v6-singbox$') || :
-    [[ -z "$mihomo_protocols" ]] || _item "i" "Instagram/INS (Snell v4/v5)"
+    local snell_protocols
+    snell_protocols=$(get_singbox_snell_protocols | grep -v '^snell-v6-singbox$') || :
+    [[ -z "$snell_protocols" ]] || _item "i" "Instagram/INS (Snell v4/v5)"
     _item "c" "自定义域名"
     _item "b" "广告屏蔽 (geosite)"
     _item "a" "所有流量"
@@ -17288,9 +17215,14 @@ _add_routing_rule() {
             rule_type="singbox-ai"
             _info "分别使用 Sukka AI non_ip 与 ip 规则集，统一选择出口"
             ;;
+        m|M)
+            [[ -n "$mieru_protocols" ]] || { _warn "请先安装 Mieru 协议"; _pause; return 1; }
+            rule_type="mihomo-ai"
+            _info "Sukka AI 域名和 IP 规则共用出口，其余 Mieru 流量直连"
+            ;;
         d|D) rule_type="mytvsuper" ;;
         i|I)
-            if [[ -z "$mihomo_protocols" ]]; then
+            if [[ -z "$snell_protocols" ]]; then
                 _warn "Instagram/INS 分流需要先安装 Sing-box Snell v4/v5"
                 _pause
                 return
@@ -17385,7 +17317,7 @@ _add_routing_rule() {
 
     # AI 专属规则修改失败时恢复原数据库，与配置回滚保持一致。
     local ai_snapshot=""
-    if [[ "$rule_type" == singbox-ai || "$rule_type" == ai-intl ]]; then
+    if [[ "$rule_type" == singbox-ai || "$rule_type" == ai-intl || "$rule_type" == mihomo-ai ]]; then
         ai_snapshot=$(mktemp "$CFG/.ai-routing.XXXXXX") || return 1
         cp -p "$DB_FILE" "$ai_snapshot" || { rm -f "$ai_snapshot"; return 1; }
     fi
@@ -17416,7 +17348,7 @@ _add_routing_rule() {
     
     # Mihomo 专属规则只应用到 Mihomo，不重启其他内核。
     _info "更新代理配置..."
-    if [[ "$rule_type" == singbox-ai || "$rule_type" == ai-intl ]]; then
+    if [[ "$rule_type" == singbox-ai || "$rule_type" == ai-intl || "$rule_type" == mihomo-ai ]]; then
         if ! _reload_ai_routing_core "$rule_type"; then
             cp -p "$ai_snapshot" "$DB_FILE" || { _err "数据库恢复失败，备份保留: $ai_snapshot"; return 1; }
             rm -f "$ai_snapshot"
@@ -17424,7 +17356,7 @@ _add_routing_rule() {
             return 1
         fi
         rm -f "$ai_snapshot"
-    elif [[ "$rule_type" == "mihomo-instagram" || "$rule_type" == singbox-instagram ]]; then
+    elif [[ "$rule_type" == singbox-instagram ]]; then
         _regenerate_singbox_routing_config || { _pause; return 1; }
     else
         _regenerate_proxy_configs || { _pause; return 1; }
@@ -17494,12 +17426,12 @@ _del_routing_rule() {
         local del_id="${rule_ids[$((del_choice-1))]}" del_type
         del_type=$(printf '%s\n' "$rules" | jq -r --arg id "$del_id" '.[] | select(.id == $id) | .type')
         local ai_snapshot=""
-        if [[ "$del_type" == singbox-ai || "$del_type" == ai-intl ]]; then
+        if [[ "$del_type" == singbox-ai || "$del_type" == ai-intl || "$del_type" == mihomo-ai ]]; then
             ai_snapshot=$(mktemp "$CFG/.ai-routing.XXXXXX") || return 1
             cp -p "$DB_FILE" "$ai_snapshot" || { rm -f "$ai_snapshot"; return 1; }
         fi
         db_del_routing_rule "$del_id"
-        if [[ "$del_type" == singbox-ai || "$del_type" == ai-intl ]]; then
+        if [[ "$del_type" == singbox-ai || "$del_type" == ai-intl || "$del_type" == mihomo-ai ]]; then
             if ! _reload_ai_routing_core "$del_type"; then
                 cp -p "$ai_snapshot" "$DB_FILE" || { _err "数据库恢复失败，备份保留: $ai_snapshot"; return 1; }
                 rm -f "$ai_snapshot"
@@ -17507,10 +17439,10 @@ _del_routing_rule() {
                 return 1
             fi
             rm -f "$ai_snapshot"
-        elif [[ "$del_type" == "mihomo-instagram" || "$del_type" == singbox-instagram ]]; then
-            local mihomo_protocols
-            mihomo_protocols=$(get_singbox_snell_protocols) || :
-            if [[ -n "$mihomo_protocols" ]]; then
+        elif [[ "$del_type" == singbox-instagram ]]; then
+            local snell_protocols
+            snell_protocols=$(get_singbox_snell_protocols) || :
+            if [[ -n "$snell_protocols" ]]; then
                 _regenerate_singbox_routing_config || { _pause; return 1; }
             fi
         else
@@ -17524,6 +17456,10 @@ _del_routing_rule() {
 # AI 预设仅重载其所属核心。
 _reload_ai_routing_core() {
     case "$1" in
+        mihomo-ai)
+            [[ -n "$(get_mihomo_protocols)" ]] || return 0
+            _apply_mieru_change reload
+            ;;
         singbox-ai)
             [[ -n "$(get_singbox_protocols)" ]] || return 0
             _regenerate_singbox_routing_config
@@ -17547,6 +17483,9 @@ _regenerate_proxy_configs() {
     local singbox_protocols=$(get_singbox_protocols)
     if [[ -n "$singbox_protocols" ]]; then
         _regenerate_singbox_routing_config || return 1
+    fi
+    if [[ -n "$(get_mihomo_protocols)" ]]; then
+        _apply_mieru_change reload || return 1
     fi
 
 }
@@ -20604,8 +20543,7 @@ show_all_protocols_info() {
         
         local xray_protocols=$(get_xray_protocols)
         local singbox_protocols=$(get_singbox_protocols)
-        local mihomo_protocols=$(get_pending_mihomo_protocols)
-        local legacy_snell_protocols=$(get_legacy_snell_display_protocols)
+        local mihomo_protocols=$(get_mihomo_protocols)
         local standalone_protocols=$(get_standalone_protocols)
         local all_protocols=()
         local idx=1
@@ -20649,24 +20587,10 @@ show_all_protocols_info() {
         fi
         
         if [[ -n "$mihomo_protocols" ]]; then
-            echo -e "  ${Y}旧 Mihomo 节点 (迁移待完成):${NC}"
+            echo -e "  ${Y}Mihomo 协议 (Mieru):${NC}"
             for protocol in $mihomo_protocols; do
                 local port
                 port=$(db_protocol_configs "mihomo" "$protocol" | jq -r '.port // empty' | tr '\n' ',' | sed 's/,$//')
-                if [[ -n "$port" ]]; then
-                    echo -e "    ${G}$idx${NC}) $(get_protocol_name "$protocol") - 端口: ${G}$port${NC}"
-                    all_protocols+=("$protocol")
-                    ((idx++))
-                fi
-            done
-            echo ""
-        fi
-
-        if [[ -n "$legacy_snell_protocols" ]]; then
-            echo -e "  ${Y}Snell 旧版服务 (迁移待完成):${NC}"
-            for protocol in $legacy_snell_protocols; do
-                local port
-                port=$(db_protocol_configs "xray" "$protocol" | jq -r '.port // empty' | tr '\n' ',' | sed 's/,$//')
                 if [[ -n "$port" ]]; then
                     echo -e "    ${G}$idx${NC}) $(get_protocol_name "$protocol") - 端口: ${G}$port${NC}"
                     all_protocols+=("$protocol")
@@ -20734,8 +20658,7 @@ show_all_share_links() {
     
     local xray_protocols=$(get_xray_protocols)
     local singbox_protocols=$(get_singbox_protocols)
-    local mihomo_protocols=$(get_pending_mihomo_protocols)
-    local legacy_snell_protocols=$(get_legacy_snell_display_protocols)
+    local mihomo_protocols=$(get_mihomo_protocols)
     local standalone_protocols=$(get_standalone_protocols)
     local has_links=false
     
@@ -20750,14 +20673,22 @@ show_all_share_links() {
     master_port=$(_get_master_port "")
     
     # 遍历所有协议生成链接
-    for protocol in $xray_protocols $singbox_protocols $mihomo_protocols $legacy_snell_protocols $standalone_protocols; do
+    for protocol in $xray_protocols $singbox_protocols $mihomo_protocols $standalone_protocols; do
         local core cfg_stream
         core=$(protocol_subscription_db_core "$protocol")
         cfg_stream=$(db_protocol_configs "$core" "$protocol") || continue
         [[ -z "$cfg_stream" ]] && continue
         
         echo -e "  ${Y}$(get_protocol_name $protocol)${NC}"
-        
+        if [[ "$protocol" == mieru ]]; then
+            while IFS= read -r cfg; do
+                printf '  - '
+                gen_mieru_client_proxy "${ipv4:-$ipv6}" "$cfg" "${country_code}-Mieru-$(jq -r .port <<<"$cfg")"
+            done <<<"$cfg_stream"
+            has_links=true
+            continue
+        fi
+
         while IFS= read -r cfg; do
             [[ -z "$cfg" ]] && continue
             
@@ -21026,6 +20957,14 @@ show_single_protocol_info() {
         _warn "未检测到可用的连接地址，客户端配置中的服务器地址需要手动填写"
     fi
     
+    if [[ "$protocol" == mieru ]]; then
+        printf '  传输: %s\n  用户名: %s\n  密码: %s\n' "$(jq -r .transport <<<"$cfg")" "$username" "$password"
+        printf '\n  Mihomo 客户端节点（添加到 proxies）：\n  - '
+        gen_mieru_client_proxy "$config_ip" "$cfg" "${country_code}-Mieru-${port}"
+        _line
+        return 0
+    fi
+
     case "$protocol" in
         vless|vless-singbox)
             local security_mode=$(echo "$cfg" | jq -r '.security_mode // "reality"')
@@ -21650,7 +21589,7 @@ manage_protocol_services() {
 show_protocols_overview() {
     local xray_protocols=$(get_xray_protocols)
     local singbox_protocols=$(get_singbox_protocols)
-    local mihomo_protocols=$(get_pending_mihomo_protocols)
+    local mihomo_protocols=$(get_mihomo_protocols)
     local standalone_protocols=$(get_standalone_protocols)
     
     echo -e "  ${C}已安装协议概览${NC}"
@@ -21701,7 +21640,7 @@ show_protocols_overview() {
     fi
     
     if [[ -n "$mihomo_protocols" ]]; then
-        echo -e "  ${Y}旧 Mihomo 节点 (迁移待完成):${NC}"
+        echo -e "  ${Y}Mihomo 协议 (Mieru):${NC}"
         for protocol in $mihomo_protocols; do
             local ports
             ports=$(db_protocol_configs "mihomo" "$protocol" | jq -r '.port // empty')
@@ -21766,6 +21705,14 @@ show_services_status() {
         fi
     fi
     
+    if [[ -n "$(get_mihomo_protocols)" ]]; then
+        if svc status vless-mihomo >/dev/null 2>&1; then
+            printf '  ● Mihomo / Mieru 服务 - 运行中\n'
+        else
+            printf '  ● Mihomo / Mieru 服务 - 已停止\n'
+        fi
+    fi
+
     # 独立进程协议服务状态 (Snell 等)
     local standalone_protocols=$(get_standalone_protocols)
     for protocol in $standalone_protocols; do
@@ -21844,50 +21791,6 @@ select_port_to_uninstall() {
     fi
 }
 
-# 返回单个迁移前 Snell 协议实际拥有的旧服务（含 ShadowTLS 后端）。
-_legacy_snell_protocol_services() {
-    case "$1" in
-        snell) printf '%s\n' vless-snell ;;
-        snell-v5) printf '%s\n' vless-snell-v5 ;;
-        snell-shadowtls) printf '%s\n' vless-snell-shadowtls vless-snell-shadowtls-backend ;;
-        snell-v5-shadowtls) printf '%s\n' vless-snell-v5-shadowtls vless-snell-v5-shadowtls-backend ;;
-        *) return 1 ;;
-    esac
-}
-
-# 旧 .xray Snell 的端口删除不能触碰 Mihomo。最后一个端口才停止并删除
-# 该协议自己的旧前端/后端服务和配置，绝不清理其他遗留协议或外部 ShadowTLS。
-_uninstall_legacy_snell_protocol() {
-    local protocol="$1" selected_port="$2" service_name remaining
-    [[ "$(protocol_active_db_core "$protocol")" == xray ]] || return 1
-
-    if [[ "$selected_port" == all ]]; then
-        db_del xray "$protocol" || return 1
-    else
-        db_remove_port xray "$protocol" "$selected_port" || return 1
-    fi
-    remaining=$(db_protocol_configs xray "$protocol" | jq -r '.port // empty')
-    if [[ -n "$remaining" ]]; then
-        _ok "协议 $protocol 还有其他端口实例在运行"
-        return 0
-    fi
-
-    rm -f "$CFG/${protocol}.join"
-    while IFS= read -r service_name; do
-        [[ -z "$service_name" ]] && continue
-        svc stop "$service_name" 2>/dev/null
-        svc disable "$service_name" 2>/dev/null
-        rm -f "$SYSTEMD_DIR/${service_name}.service" "$OPENRC_DIR/$service_name"
-    done <<<"$(_legacy_snell_protocol_services "$protocol")"
-    case "$protocol" in
-        snell) rm -f "$CFG/snell.conf" ;;
-        snell-v5) rm -f "$CFG/snell-v5.conf" ;;
-        snell-shadowtls) rm -f "$CFG/snell-shadowtls.conf" ;;
-        snell-v5-shadowtls) rm -f "$CFG/snell-v5-shadowtls.conf" ;;
-    esac
-    [[ "$DISTRO" == alpine ]] || systemctl daemon-reload >/dev/null 2>&1 || return 1
-}
-
 # 卸载指定协议
 uninstall_specific_protocol() {
     local installed=$(get_installed_protocols)
@@ -21932,14 +21835,12 @@ uninstall_specific_protocol() {
     
     _info "卸载 $selected_protocol..."
     
-    if is_singbox_snell_protocol "$selected_protocol" && [[ "$core" == mihomo ]]; then
-        _err "该节点尚未迁移，请先完成 Snell 迁移；旧服务与数据保持原状"
-        return 1
-    elif is_singbox_snell_protocol "$selected_protocol" && [[ "$core" == xray ]]; then
-        _uninstall_legacy_snell_protocol "$selected_protocol" "$SELECTED_PORT" || {
-            _err "旧版 Snell 配置更新失败，未执行卸载"
-            return 1
-        }
+    if [[ "$selected_protocol" == mieru ]]; then
+        _apply_mieru_change remove "$SELECTED_PORT" '{}' || return 1
+        [[ ! -f "$CFG/sub.info" && ! -d "$CFG/subscription" ]] || generate_sub_files || return 1
+        _ok "Mieru 指定端口已卸载"
+        _pause
+        return 0
     elif is_singbox_snell_protocol "$selected_protocol"; then
         _apply_singbox_snell_change remove "$SELECTED_PORT" '{}' "$selected_protocol" || {
             _err "Sing-box 配置更新失败，未执行卸载"
@@ -22124,11 +22025,7 @@ uninstall_specific_protocol() {
         
         # 删除配置文件
         case "$selected_protocol" in
-            snell) rm -f "$CFG/snell.conf" ;;
-            snell-v5) rm -f "$CFG/snell-v5.conf" ;;
             snell-v6) rm -f "$CFG/snell-v6.conf" "$SNELL_V6_INSTALLED_VERSION_FILE" ;;
-            snell-shadowtls) rm -f "$CFG/snell-shadowtls.conf" ;;
-            snell-v5-shadowtls) rm -f "$CFG/snell-v5-shadowtls.conf" ;;
             ss2022-shadowtls) rm -f "$CFG/ss2022-shadowtls-backend.json" ;;
         esac
         
@@ -22475,13 +22372,14 @@ select_protocol() {
     _item "13" "AnyTLS"
     _item "14" "TUIC v5"
     _item "15" "NaïveProxy"
+    _item "16" "Mieru ${D}(Mihomo，TCP/UDP)${NC}"
     _item "0" "返回"
     echo ""
     echo -e "  ${D}提示: 5/6 使用 8443 端口时，3/4 可作为回落共用${NC}"
     echo ""
     
     while true; do
-        read -rp "  选择协议 [0-15]: " choice
+        read -rp "  选择协议 [0-16]: " choice
         case $choice in
             0) SELECTED_PROTOCOL=""; return 1 ;;
             1) select_vless_mode || return 1; break ;;
@@ -22499,6 +22397,7 @@ select_protocol() {
             13) SELECTED_PROTOCOL="anytls"; break ;;
             14) SELECTED_PROTOCOL="tuic"; break ;;
             15) SELECTED_PROTOCOL="naive"; break ;;
+            16) SELECTED_PROTOCOL="mieru"; break ;;
             *) _err "无效选择" ;;
         esac
     done
@@ -22589,7 +22488,7 @@ do_install_server() {
             svc stop "$service_name" 2>/dev/null
             
             # ShadowTLS 组合协议：还需要停止后端服务
-            if [[ "$protocol" == "snell-shadowtls" || "$protocol" == "snell-v5-shadowtls" || "$protocol" == "ss2022-shadowtls" ]]; then
+            if [[ "$protocol" == "ss2022-shadowtls" ]]; then
                 local backend_svc="${BACKEND_NAME[$protocol]}"
                 [[ -n "$backend_svc" ]] && svc stop "$backend_svc" 2>/dev/null
             fi
@@ -22599,11 +22498,7 @@ do_install_server() {
             
             # 删除配置文件
             case "$protocol" in
-                snell) rm -f "$CFG/snell.conf" ;;
-                snell-v5) rm -f "$CFG/snell-v5.conf" ;;
                 snell-v6) rm -f "$CFG/snell-v6.conf" "$SNELL_V6_INSTALLED_VERSION_FILE" ;;
-                snell-shadowtls) rm -f "$CFG/snell-shadowtls.conf" ;;
-                snell-v5-shadowtls) rm -f "$CFG/snell-v5-shadowtls.conf" ;;
                 ss2022-shadowtls) rm -f "$CFG/ss2022-shadowtls-backend.json" ;;
             esac
             
@@ -22712,6 +22607,12 @@ do_install_server() {
         fi
     fi
 
+    if [[ "$protocol" == mieru ]]; then
+        _install_mieru_interactive
+        local mieru_result=$?
+        _pause
+        return "$mieru_result"
+    fi
     install_deps || { _err "依赖安装失败"; _pause; return 1; }
     
     # 根据协议安装对应软件
@@ -24130,7 +24031,11 @@ show_status() {
     # 一次 jq 调用，输出各核心协议键、路由数和端口映射。
     # 兼容数组和对象两种格式：数组提取所有端口用|分隔，对象直接取端口。
     local db_parsed
-    db_parsed=$(jq -r '
+    db_parsed=$(jq -r --arg xray "$XRAY_PROTOCOLS $STANDALONE_PROTOCOLS" \
+        --arg singbox "$SINGBOX_PROTOCOLS" --arg mihomo "$MIHOMO_PROTOCOLS" '
+        .xray = ((.xray // {}) | with_entries(select(.key as $p | $xray | split(" ") | index($p)))) |
+        .singbox = ((.singbox // {}) | with_entries(select(.key as $p | $singbox | split(" ") | index($p)))) |
+        .mihomo = ((.mihomo // {}) | with_entries(select(.key as $p | $mihomo | split(" ") | index($p)))) |
         "XRAY:" + ((.xray // {}) | keys | join(",")) +
         " SINGBOX:" + ((.singbox // {}) | keys | join(",")) +
         " MIHOMO:" + ((.mihomo // {}) | keys | join(",")) +
@@ -24206,6 +24111,9 @@ show_status() {
     [[ "$xray_running" == "true" ]] && running_protocols=$xray_count
     [[ "$singbox_running" == "true" ]] && running_protocols=$((running_protocols + singbox_count))
     running_protocols=$((running_protocols + standalone_running))
+    if [[ ",$mihomo_keys," == *",mieru,"* ]] && svc status vless-mihomo >/dev/null 2>&1; then
+        running_protocols=$((running_protocols + 1))
+    fi
     
     if is_paused; then
         status_icon="${Y}⏸${NC}"; status_text="${Y}已暂停${NC}"
@@ -25717,6 +25625,10 @@ gen_clash_sub() {
             local proxy=""
             
             case "$protocol" in
+            mieru)
+                name="${country_code}-Mieru-${port}-${ip_suffix}"
+                [[ -z "$server_ip" ]] || proxy="  - $(gen_mieru_client_proxy "$server_ip" "$cfg" "$name")"
+                ;;
             vless|vless-singbox)
                 [[ -n "$server_ip" ]] && proxy="  - name: \"$name\"
     type: vless
@@ -28012,11 +27924,16 @@ show_service_logs() {
         ((idx++))
     fi
     
-    # 独立进程协议及迁移前 .xray 中的 Snell v4/v5 旧服务。
-    local standalone_protocols legacy_snell_protocols
+    if [[ -n "$(get_mihomo_protocols)" ]]; then
+        printf '  %s) Mihomo / Mieru 服务日志\n' "$idx"
+        proto_array+=("mihomo")
+        idx=$((idx+1))
+    fi
+
+    # 独立进程协议。
+    local standalone_protocols
     standalone_protocols=$(get_standalone_protocols)
-    legacy_snell_protocols=$(get_legacy_snell_protocols)
-    for proto in $standalone_protocols $legacy_snell_protocols; do
+    for proto in $standalone_protocols; do
         local proto_name=$(get_protocol_name $proto)
         echo -e "  ${G}$idx${NC}) $proto_name 服务日志"
         proto_array+=("$proto")
@@ -28042,6 +27959,14 @@ show_service_logs() {
     local proc_name=""
     
     case "$selected" in
+        mihomo)
+            service_name="vless-mihomo"
+            proc_name="vless-mihomo"
+            if [[ "$DISTRO" == alpine ]]; then
+                [[ ! -r "$MIHOMO_LOG_FILE" ]] || tail -n 50 "$MIHOMO_LOG_FILE"
+                return
+            fi
+            ;;
         xray)
             service_name="vless-reality"
             proc_name="xray"
@@ -28050,19 +27975,11 @@ show_service_logs() {
             service_name="vless-singbox"
             proc_name="sing-box"
             ;;
-        snell)
-            service_name="vless-snell"
-            proc_name="snell-server"
-            ;;
-        snell-v5)
-            service_name="vless-snell-v5"
-            proc_name="snell-server-v5"
-            ;;
         snell-v6)
             service_name="vless-snell-v6"
             proc_name="snell-server-v6"
             ;;
-        snell-shadowtls|snell-v5-shadowtls|ss2022-shadowtls)
+        ss2022-shadowtls)
             service_name="vless-${selected}"
             proc_name="shadow-tls"
             ;;
@@ -28116,7 +28033,7 @@ _select_protocol_for_users() {
     local proto_array=()
     while IFS= read -r proto; do
         [[ -z "$proto" ]] && continue
-        is_singbox_snell_protocol "$proto" && continue
+        { is_singbox_snell_protocol "$proto" || [[ "$proto" == mieru ]]; } && continue
         local core="xray"
         db_exists "singbox" "$proto" && core="singbox"
         local user_count=$(db_count_users "$core" "$proto")
@@ -28550,7 +28467,7 @@ _add_user() {
     local proto_name=$(get_protocol_name "$proto")
     
     # 检查是否为独立协议（不支持多用户）
-    if is_standalone_protocol "$proto" || is_singbox_snell_protocol "$proto"; then
+    if is_standalone_protocol "$proto" || is_singbox_snell_protocol "$proto" || [[ "$proto" == mieru ]]; then
         echo ""
         _err "$proto_name 为独立协议，不支持多用户管理"
         _info "该协议使用配置文件中的固定密钥，无需添加用户"
@@ -31030,9 +30947,6 @@ main_menu() {
     init_log  # 初始化日志
     init_db   # 初始化 JSON 数据库
     db_migrate_to_multiuser  # 迁移旧的单用户配置到多用户格式
-    if ! migrate_legacy_snell_to_singbox; then
-        _warn "Snell v4/v5 自动迁移未完成，旧服务已保留或恢复"
-    fi
     ensure_singbox_runtime_consistency 2>/dev/null || true
 
     # 自动更新系统脚本 (确保 vless 命令始终是最新版本)

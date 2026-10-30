@@ -205,7 +205,7 @@ jq '.balancer_groups=[{name:"pool",strategy:"leastPing",nodes:["landing"]}] |
       {type:"ads",outbound:"block",domains:"geosite:category-ads-all",ip_version:"as_is"},
       {type:"custom",outbound:"direct",domains:"v4.example",ip_version:"ipv4_only"},
       {type:"custom",outbound:"direct",domains:"v6.example",ip_version:"ipv6_only"},
-      {type:"mihomo-instagram",outbound:"chain:missing",domains:"rule-set:yuu-instagram",ip_version:"as_is"}
+      {type:"singbox-instagram",outbound:"chain:missing",domains:"rule-set:yuu-instagram",ip_version:"as_is"}
     ]' "$DB_FILE" >"$TMP/db"; mv "$TMP/db" "$DB_FILE"
 generate_singbox_config
 check '[.route.rule_set[].tag] == ["geoip-cn","geoip-telegram","geosite-category-ads-all","geosite-cn","geosite-telegram"]'

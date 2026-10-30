@@ -12,7 +12,7 @@ wget -O vless-server.sh https://raw.githubusercontent.com/mikuuu3981/surge/main/
 vless
 ```
 
-查看完整配置：进入“协议服务管理 → 查看运行配置文件”，选择 Xray 或 Sing-box。脚本按服务进程的启动参数查找配置，完整输出磁盘文件；服务停止时明确标注默认配置。显示内容包含原始凭据，磁盘文件也可能与进程已经载入的配置不同。
+查看完整配置：进入“协议服务管理 → 查看运行配置文件”，选择 Xray、Sing-box 或 Mihomo。脚本按服务进程的启动参数查找配置，完整输出磁盘文件；服务停止时明确标注默认配置。显示内容包含原始凭据，磁盘文件也可能与进程已经载入的配置不同。
 
 ## 脚本更新渠道
 
@@ -61,19 +61,43 @@ Sing-box 版与其他 Sing-box 协议共用 `vless-singbox` 服务及 `/etc/vles
 
 **REALITY 防偷流量限速仅适用于 Xray。** Sing-box 版不写入 `reality_fallback_limits` 或 Xray 的 `limitFallbackUpload` / `limitFallbackDownload` 字段。
 
+## Mieru 与 Mihomo
+
+安装协议菜单选择 **16 → Mieru**，设置端口、用户名、密码及 TCP/UDP 传输。脚本安装 Mihomo 官方稳定版，并先检查其是否支持 Mieru 服务端；测试使用的版本为 **v1.19.33**。Mieru 不需要证书、SNI 或 REALITY 密钥。服务端与客户端的 `transport` 必须一致；TCP 和 UDP 两种传输都支持代理 TCP/UDP 流量。请在系统及云防火墙放行所选端口对应的传输协议。
+
+- Mieru 使用独立的 `vless-mihomo` 服务、`/usr/local/bin/vless-mihomo` 和 `/etc/vless-reality/mihomo.yaml`，数据库键为 `.mihomo.mieru`。配置采用 JSON 语法（合法 YAML），凭据始终保存为字符串。
+- 支持多个端口、按端口覆盖或卸载，每个端口独立设置账号密码和传输。首版每端口使用一个账号，暂不接入用户管理、配额和用户流量统计。
+- “查看配置”和“所有分享链接”显示可直接加入 `proxies` 的 Mihomo 节点；Clash/Mihomo 订阅也包含全部 Mieru 端口。通用 Base64、Surge 订阅不包含 Mieru，请使用支持 Mieru 的 Mihomo 客户端。
+- 在 **分流管理 → 添加分流规则 → m（Sukka-AI-Mieru专属）** 中选择 AI 出口。使用 Sukka 的 [AI 域名规则](https://ruleset.skk.moe/Clash/non_ip/ai.txt) 和 [AI IP 规则](https://ruleset.skk.moe/Clash/ip/ai.txt)，包含 AI 语音服务的地址段；两份规则共用出口，其余流量直连。服务端开启 HTTP/TLS/QUIC 域名嗅探，保持原始目标地址。
+- 仅应用 `mihomo-ai` 规则；Xray、Sing-box 的 AI 规则及其他全局规则不会进入 Mieru。支持 ALL、仅 IPv4、仅 IPv6，IP 版本条件与 AI 规则相交。添加或删除此规则只更新 Mihomo。
+- AI 出口支持直连、拦截、WARP（WGCF/官方 SOCKS5）以及已有的 SOCKS5、HTTP、Shadowsocks、Trojan、Hysteria2、VLESS TCP/WS/REALITY 节点。官方 WARP SOCKS5 的 UDP 保持直连。不支持的出口参数、`via_warp` 和负载均衡组会明确报错并保留原配置。
+- 规则缓存位于 `/etc/vless-reality/ruleset/mihomo-skk-ai-*.txt`，配置重建时刷新超过 24 小时的文件；下载或校验失败使用有效旧缓存，无有效缓存则拒绝更新。完整保留 IP 集中的 `IP-ASN` 规则，首次使用时 Mihomo 还需从 GitHub 下载 ASN 数据库到配置目录。Mihomo 核心下载必须通过官方 Release SHA-256 校验；“核心版本管理 → 5”可更新最新稳定版或指定正式版本。
+- 节点变更、分流更新及核心更新先校验候选配置，重启或监听检查失败时恢复原配置及运行状态。Mieru 与 Sing-box Snell 独立管理，卸载一方保留另一方的记录、配置和服务。
+
+Mieru 安装及更新会写入 `/etc/vless-reality`、`/usr/local/bin` 和 systemd/OpenRC 服务目录，重启会短暂影响所有 Mieru 入站。Mieru 与其他核心可在不同端口并存。
+
+参考：[Mihomo Mieru 入站文档](https://wiki.metacubex.one/config/inbound/listeners/mieru/) · [Mieru 出站文档](https://wiki.metacubex.one/config/proxies/mieru/)
+
+安全验证（仅临时目录、模拟服务；真实流量仅监听回环地址，不安装服务或修改防火墙）：
+
+```bash
+bash tests/test-mieru.sh
+# 可选：真实核心配置校验及 TCP/UDP 传输、UDP 转发、AI 域名/IP/嗅探分流测试
+VLESS_TEST_MIHOMO_BIN=/path/to/mihomo bash tests/test-mieru.sh
+```
+
 ## Snell 与 Sing-box
 
 - Snell v4/v5/v6 统一由 Sing-box v1.14.0+ 提供，与 HY2/TUIC/AnyTLS 共用 `vless-singbox` 服务。每个端口可独立使用不同的 PSK 和协议版本。
 - Snell v4/v5 的服务端配置统一使用 `version: 5`，分享链接和 Surge 订阅仍保留所选的 `version=4/5`。这是 Sing-box 的协议兼容方式；不支持 Snell v5 的 QUIC 代理模式。
 - Snell+ShadowTLS 使用 Sing-box 内置 ShadowTLS v3 接入 Snell；安装 Snell v6 时仍可选择 **Sing-box（默认）** 或 **Surge 官方**。已有官方安装不会自动迁移，两种实现可使用不同端口同时运行。
-- Sing-box 版使用 `/etc/vless-reality/singbox.json`。支持多个端口，重复安装可添加或覆盖指定端口，卸载也按端口处理。v6 支持 `default` / `unshaped` / `unsafe-raw` 模式，PSK 沿用脚本的 16–255 位字母数字限制；迁移 v4/v5 时保留原凭据。暂不提供 Snell 多用户、用户限额和用户流量统计。
+- Sing-box 版使用 `/etc/vless-reality/singbox.json`。支持多个端口，重复安装可添加或覆盖指定端口，卸载也按端口处理。v6 支持 `default` / `unshaped` / `unsafe-raw` 模式，PSK 沿用脚本的 16–255 位字母数字限制；v4/v5 配置保留对包含标点的 PSK 的支持。暂不提供 Snell 多用户、用户限额和用户流量统计。
 - Sing-box 版直接复用“分流管理”的现有共享规则，包括预设 GeoSite/GeoIP、自定义域名/IP、广告及访问限制、IPv4/IPv6 匹配、直连、WARP、链式代理及现有负载均衡，不另写 Snell 专属 DNS。新核心配置使用 `domain_resolver`，无需依赖旧 `domain_strategy` 弃用开关。
 - 官方版继续使用独立的 `vless-snell-v6` 服务和 `/etc/vless-reality/snell-v6.conf`，保留原有 DNS 选择。默认使用官方 `v6.0.0` 正式版下载链接（[官方发布说明](https://kb.nssurge.com/surge-knowledge-base/release-notes/snell)），已核对 amd64/aarch64 安装包与 RC2 的 SHA-256 一致；GitHub 镜像未同步时也会使用正式版。
 - Surge 订阅中的 Snell v6 节点名称包含实现和端口，客户端 `mode` 与服务端一致；TFO 选择只控制客户端参数。Sing-box 节点变更先校验候选配置，重启/监听检查失败则回滚数据库、配置及服务状态；分流更新失败保留原运行配置。存在 Snell 入站时，核心更新拒绝降级至 v1.14.0 以下。
-- 旧版 Mihomo 及更早独立服务中的 Snell v4/v5 节点迁移到 Sing-box，保留端口、PSK 和 ShadowTLS 参数。迁移先校验候选配置，切换失败自动回滚；成功后清理脚本托管的 Mihomo 资源。ShadowTLS 的 Snell 后端仅绑定回环地址。
-- 暂停服务时延后迁移；已安装的 Sing-box 版本不足时，先通过核心管理升级再重试。无法等价迁移的旧分流或负载均衡配置会在停服前报错，保留旧节点和服务。
+- Snell v4/v5 仅管理 `.singbox` 中的记录，ShadowTLS 的 Snell 后端仅绑定回环地址。旧 Mihomo／独立版 v4/v5 的安装、管理和自动迁移支持已移除；仍使用这些部署时，请先用保留迁移能力的旧版脚本完成迁移，再升级。本次代码清理不会自动删除服务器上的旧文件、服务或数据库记录。
 - WARP 支持 WGCF 与官方 SOCKS5 模式；官方模式的 UDP 保持直连。GeoSite/GeoIP 首次使用需要从 GitHub 下载规则库，之后每 24 小时更新。
-- Instagram/INS 分流迁至 Sing-box，沿用 [Yuu-rules 域名列表](https://github.com/Yuu518/Yuu-rules/blob/rule-set/mihomo/geosite/instagram.list)，仅匹配 Snell v4/v5（含 ShadowTLS）入站。规则列表缓存 24 小时，更新失败时使用已有缓存；不会扩大到 HY2/TUIC/AnyTLS 或 Snell v6。
+- Instagram/INS 分流使用 `singbox-instagram`，沿用 [Yuu-rules 域名列表](https://github.com/Yuu518/Yuu-rules/blob/rule-set/mihomo/geosite/instagram.list)，仅匹配 Snell v4/v5（含 ShadowTLS）入站。规则列表缓存 24 小时，更新失败时使用已有缓存；不会扩大到 HY2/TUIC/AnyTLS 或 Snell v6。旧 `mihomo-instagram` 规则键已停止支持，升级前请删除旧规则并重新添加 `singbox-instagram`，即使节点已经迁到 Sing-box 也需要处理。
 - AI 分流分为 `GeoSite-AI-Xray专属`（原 `ai-intl`，仅 Xray）与 `Sukka-AI-Sing-Box专属`（`singbox-ai`，仅 Sing-box，有 Sing-box 协议时显示 `s` 选项）。Sukka 分别使用 [non_ip](https://ruleset.skk.moe/sing-box/non_ip/ai.json) 和 [ip](https://ruleset.skk.moe/sing-box/ip/ai.json) 两份完整规则集，共用所选出口；IPv4/IPv6 限制与规则集匹配条件相交。源文件缓存到 `/etc/vless-reality/ruleset-src/`，独立编译到 `ruleset/`，配置重建时刷新超过 24 小时的缓存；更新失败使用有效旧缓存，无有效缓存则配置生成失败。添加或删除 AI 规则仅重载对应核心。
 - Sing-box 服务端在 `route.rules` 首位统一添加 `{"action":"sniff"}`，从 HTTP Host、TLS SNI 或 QUIC 嗅探域名后执行分流，覆盖所有共享入站；客户端无需修改，不改写原始目标地址。
 - “重启所有服务”先生成并校验配置，再由服务管理器逐个重启；不再预先停止全部代理。Sing-box 重启或监听检查失败时恢复旧配置及运行状态，错误会显示在终端；只有主动停止服务才设置“已暂停”标记。
@@ -89,9 +113,9 @@ bash tests/test-singbox-vless-install.sh
 bash tests/test-singbox-vless-uninstall.sh
 # Snell 多版本、多端口、共享分流、升级保护与失败回滚
 bash tests/test-singbox-snell.sh
-# v4/v5、ShadowTLS 及旧数据库迁移
-bash tests/test-singbox-snell-migration.sh
-# Instagram 域名规则、旧规则兼容与入站隔离
+# v4/v5、内置 ShadowTLS、多端口及与 Mieru 的资源隔离
+bash tests/test-singbox-snell-v45.sh
+# Instagram 域名规则、候选配置及入站隔离
 bash tests/test-singbox-instagram.sh
 # AI 核心/出口隔离、完整源编译、缓存刷新回退与菜单/重载隔离
 bash tests/test-singbox-ai.sh
@@ -107,11 +131,11 @@ bash tests/test-service-restart.sh
 VLESS_TEST_SINGBOX_BIN=/path/to/sing-box bash tests/test-singbox-vless.sh
 # 可选：已有 Sing-box 1.14+ 的真实配置校验及回环 TCP/UDP 测试（需要 Python 3）
 VLESS_TEST_SINGBOX_BIN=/path/to/sing-box bash tests/test-singbox-snell.sh
-# 可选：真实迁移配置校验与 ShadowTLS 握手测试（还需 OpenSSL）
-VLESS_TEST_SINGBOX_BIN=/path/to/sing-box bash tests/test-singbox-snell-migration.sh
+# 可选：真实 v4/v5 配置校验与 ShadowTLS 握手测试（还需 OpenSSL）
+VLESS_TEST_SINGBOX_BIN=/path/to/sing-box bash tests/test-singbox-snell-v45.sh
 ```
 
-测试使用临时目录和模拟服务；规则集使用本地测试数据，不下载规则库。真实核心流量测试只监听回环地址，不安装服务、不改防火墙。Snell 安装和迁移会写入 `/etc/vless-reality`、`/usr/local/bin` 和 systemd/OpenRC 服务目录；节点变更、迁移及核心升级会短暂重启所有 Sing-box 入站，请在维护窗口操作。
+测试使用临时目录和模拟服务；规则集使用本地测试数据，不下载规则库。真实核心流量测试只监听回环地址，不安装服务、不改防火墙。Snell 安装会写入 `/etc/vless-reality`、`/usr/local/bin` 和 systemd/OpenRC 服务目录；节点变更及核心升级会短暂重启所有 Sing-box 入站，请在维护窗口操作。
 
 REALITY 防偷流量说明：
 

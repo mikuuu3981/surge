@@ -139,7 +139,7 @@ fixture() {
     fi
     generate_singbox_config >"$TMP/fixture-output" 2>&1
     if db_exists singbox snell-v6-singbox; then regenerate_singbox_snell_join_info; fi
-    regenerate_legacy_snell_join_info
+    regenerate_singbox_snell_v45_join_info
     regenerate_singbox_vless_join_info
     printf '%s\n' server >"$CFG/role"
     printf '%s\n' old-systemd-unit >"$SYSTEMD_DIR/vless-singbox.service"

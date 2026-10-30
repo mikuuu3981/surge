@@ -25,11 +25,7 @@ systemctl() { printf 'unexpected systemctl: %s\n' "$*" >&2; exit 90; }
 rc-service() { printf 'unexpected rc-service: %s\n' "$*" >&2; exit 91; }
 install_singbox() { printf 'unexpected install\n' >&2; exit 92; }
 RUNNING=true
-FAIL_MIGRATION=false FAIL_GENERATE=false FAIL_RESTART=false FAIL_HEALTH=false FAIL_SERVICE=false
-migrate_legacy_snell_to_singbox() {
-    printf 'migrate|%s\n' "$RUNNING" >>"$TMP/events"
-    [[ "$FAIL_MIGRATION" == false ]]
-}
+FAIL_GENERATE=false FAIL_RESTART=false FAIL_HEALTH=false FAIL_SERVICE=false
 create_singbox_service() {
     printf 'create-service|%s\n' "$RUNNING" >>"$TMP/events"
     [[ "$FAIL_SERVICE" == false ]]
@@ -67,7 +63,7 @@ stop_services() {
 }
 fixture() {
     RUNNING=true
-    FAIL_MIGRATION=false FAIL_GENERATE=false FAIL_RESTART=false FAIL_HEALTH=false FAIL_SERVICE=false
+    FAIL_GENERATE=false FAIL_RESTART=false FAIL_HEALTH=false FAIL_SERVICE=false
     rm -f "$CFG/paused"
     printf '%s\n' '{"fixture":"old"}' >"$CFG/singbox.json"
     cp "$CFG/singbox.json" "$TMP/old.json"
@@ -94,10 +90,9 @@ jq -e '.fixture=="new"' "$CFG/singbox.json" >/dev/null
 grep -q '所有服务已重启' "$TMP/output"
 printf '%s\n' 'ok - restart validates while running, restarts through the service manager and clears stale pause state'
 
-for failure in migration generate service; do
+for failure in generate service; do
     fixture
     case "$failure" in
-        migration) FAIL_MIGRATION=true ;;
         generate) FAIL_GENERATE=true ;;
         service) FAIL_SERVICE=true ;;
     esac
@@ -105,7 +100,7 @@ for failure in migration generate service; do
     failed_restart
     if grep -Eq '^(start|restart)\|vless-singbox$' "$TMP/events"; then exit 1; fi
 done
-printf '%s\n' 'ok - migration, configuration and service-definition failures leave the running core untouched'
+printf '%s\n' 'ok - configuration and service-definition failures leave the running core untouched'
 
 for failure in restart health; do
     fixture
